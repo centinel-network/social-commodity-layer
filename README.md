@@ -1,6 +1,6 @@
 # Centinel Network Node
 
-Welcome to the **Centinel Network** project! This repository contains the core node client (`satocialist_client`), advanced cryptographic fuzzers, and a proprietary UDP-based peer-to-peer transport layer.
+Welcome to the **Centinel Network** project! This repository contains the core node client (`satocialist_client`), advanced cryptographic fuzzers and a proprietary UDP-based peer-to-peer transport layer.
 
 > **⚠️ Platform Support Notice:**
 > The Centinel Network codebase is written in highly portable C/C++ and is inherently designed to be cross-platform (supporting Linux, Windows, etc.). However, due to current limited testing resources, this repository and deployment guide are **designed and tested exclusively for macOS**. If you are on Linux or Windows, the code should compile, but your mileage may vary. We highly welcome community contributions to validate and document execution on other operating systems!
