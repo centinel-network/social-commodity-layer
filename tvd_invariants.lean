@@ -2,6 +2,7 @@
   ==============================================================================
   Satocialist Protocol: Abstract Lean Model of Total Variation Distance (TVD)
   ==============================================================================
+
   File: tvd_invariants.lean
   Module: Satocialist.Quantum.TVD
   Compiler: Lean 4 (v4.3.0 or compatible standard distribution)
