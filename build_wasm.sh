@@ -2,6 +2,7 @@
 # ==============================================================================
 # Satocialist Protocol: Containerized WebAssembly Build & Deployment Script
 # ==============================================================================
+#
 # File: build_wasm.sh
 # Architecture Role: Builds the Dockerized WebAssembly toolchain image
 #   (centinel-wasm-builder) from Dockerfile.wasm, extracts the compiled
