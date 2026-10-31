@@ -2,6 +2,7 @@
   ==============================================================================
   Proof-of-Symmetry (PoS²): Abstract Economic & Sybil-Predicate Bounds
   ==============================================================================
+
   File: coalition.lean
   Module: Satocialist.Coalition
   Compiler: Lean 4 (v4.3.0 or compatible standard distribution)
