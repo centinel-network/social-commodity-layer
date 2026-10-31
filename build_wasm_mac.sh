@@ -2,6 +2,7 @@
 # ==============================================================================
 # Satocialist Protocol: Local macOS WebAssembly Build & Cross-Compilation Script
 # ==============================================================================
+#
 # File: build_wasm_mac.sh
 # Architecture Role: Manages native local compilation on macOS (Apple Silicon /
 #   Intel x86_64) without requiring Docker daemon virtualization.
