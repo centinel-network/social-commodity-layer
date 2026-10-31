@@ -1,0 +1,76 @@
+# ==============================================================================
+# Satocialist Protocol: WebAssembly Cross-Compilation Environment
+# ==============================================================================
+# File: Dockerfile.wasm
+# Architecture Role: Cross-compiles native C cryptographic engines and RPC wire
+#   framing utilities into WebAssembly bytecode (libscl_rpc.wasm) and its
+#   corresponding JavaScript runtime glue (libscl_rpc.js) via Emscripten.
+#
+# Target Specifications:
+# - SDK Version: Emscripten emsdk 3.1.50
+# - Target Architecture: wasm32-unknown-emscripten (generic 32-bit linear memory)
+# - Memory Growth: Enabled (-sALLOW_MEMORY_GROWTH=1)
+# - Threading Constraints: Single-threaded WebAssembly execution (no-threads)
+#   with asynchronous dispatch delegated to HTML5 WebWorkers.
+# ==============================================================================
+
+FROM emscripten/emsdk:3.1.50 AS wasm-builder
+
+# Install host compilation prerequisites
+RUN apt-get update && apt-get install -y git cmake python3 build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+# ==============================================================================
+# STEP 1: Cross-Compile OpenSSL 1.1.1w for WebAssembly (32-bit generic, no-asm)
+# ==============================================================================
+WORKDIR /build
+RUN git clone --depth 1 --branch OpenSSL_1_1_1w https://github.com/openssl/openssl.git && \
+    cd openssl && \
+    emconfigure ./Configure linux-generic32 no-asm no-threads no-engine no-hw no-shared --prefix=/opt/wasm && \
+    emmake make -j$(nproc) build_generated && \
+    emmake make -j$(nproc) libcrypto.a libssl.a && \
+    emmake make install_sw
+
+# ==============================================================================
+# STEP 2: Cross-Compile LZ4 Compression Library for WebAssembly
+# ==============================================================================
+WORKDIR /build
+RUN git clone --depth 1 https://github.com/lz4/lz4.git && \
+    cd lz4 && \
+    emmake make -j$(nproc) lib && \
+    mkdir -p /opt/wasm/include /opt/wasm/lib && \
+    cp lib/lz4.h /opt/wasm/include/ && \
+    cp lib/liblz4.a /opt/wasm/lib/
+
+# ==============================================================================
+# STEP 3: Cross-Compile Open Quantum Safe Library (liboqs) v0.11.0 for WebAssembly
+# ==============================================================================
+WORKDIR /build
+RUN git clone --depth 1 --branch 0.11.0 https://github.com/open-quantum-safe/liboqs.git && \
+    cd liboqs && \
+    mkdir build && cd build && \
+    emcmake cmake -DOQS_USE_OPENSSL=ON \
+                  -DOPENSSL_ROOT_DIR=/opt/wasm \
+                  -DOPENSSL_INCLUDE_DIR=/opt/wasm/include \
+                  -DOPENSSL_CRYPTO_LIBRARY=/opt/wasm/lib/libcrypto.a \
+                  -DOPENSSL_SSL_LIBRARY=/opt/wasm/lib/libssl.a \
+                  -DBUILD_SHARED_LIBS=OFF \
+                  -DOQS_OPT_TARGET=generic \
+                  -DCMAKE_INSTALL_PREFIX=/opt/wasm .. && \
+    emmake make -j$(nproc) install
+
+# ==============================================================================
+# STEP 4: Compile Centinel Network WebAssembly Module (libscl_rpc.wasm)
+# ==============================================================================
+WORKDIR /app
+COPY . .
+RUN mkdir -p /app/wasm/dummy_include && \
+    mkdir build_wasm && cd build_wasm && \
+    emcmake cmake .. \
+        -DWASM_OPENSSL_INCLUDE_DIR=/opt/wasm/include \
+        -DWASM_OPENSSL_LIB=/opt/wasm/lib/libcrypto.a \
+        -DWASM_LZ4_INCLUDE_DIR=/opt/wasm/include \
+        -DWASM_LZ4_LIB=/opt/wasm/lib/liblz4.a \
+        -DWASM_OQS_INCLUDE_DIR=/opt/wasm/include \
+        -DWASM_OQS_LIB=/opt/wasm/lib/liboqs.a && \
+    emmake make libscl_rpc -j$(nproc)
