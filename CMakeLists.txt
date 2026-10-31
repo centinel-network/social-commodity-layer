@@ -1,6 +1,7 @@
 # ==============================================================================
 # Satocialist Protocol: Master CMake Build Configuration
 # ==============================================================================
+#
 # File: CMakeLists.txt
 # Architecture Role: Orchestrates cross-platform compilation of the native node
 #   daemon (satocialist_client), shared RPC library (libscl_rpc), libFuzzer
