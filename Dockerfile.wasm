@@ -1,6 +1,7 @@
 # ==============================================================================
 # Satocialist Protocol: WebAssembly Cross-Compilation Environment
 # ==============================================================================
+#
 # File: Dockerfile.wasm
 # Architecture Role: Cross-compiles native C cryptographic engines and RPC wire
 #   framing utilities into WebAssembly bytecode (libscl_rpc.wasm) and its
