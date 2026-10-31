@@ -2,6 +2,7 @@
   ==============================================================================
   Satocialist Protocol: Abstract Lean Model of Ledger Invariants
   ==============================================================================
+
   File: invariants.lean
   Module: Satocialist
   Compiler: Lean 4 (v4.3.0 or compatible standard distribution)
