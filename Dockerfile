@@ -1,6 +1,7 @@
 # ==============================================================================
 # Satocialist Protocol: Production Multi-Stage Container Recipe
 # ==============================================================================
+#
 # File: Dockerfile
 # Architecture Role: Provisions a deterministic, isolated container image for
 #   the native validator node daemon (satocialist_client).
