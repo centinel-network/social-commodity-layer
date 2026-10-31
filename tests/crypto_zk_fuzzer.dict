@@ -1,0 +1,338 @@
+# ==============================================================================
+# LibFuzzer / AFL Dictionary for Satocialist Post-Quantum & ZK Cryptography
+# Target: tests/crypto_zk_fuzzer.c & common/crypto/crypto.c
+# ==============================================================================
+
+# High-Frequency Fuzzing Discovery (Uses: 74124)
+fuzz_token_newline_highbit="\x0A\x80\x00\x00\x00\x00\x00\x00"
+
+# ------------------------------------------------------------------------------
+# 1. Cryptographic Domain Separation Tags & Global Seeds
+# ------------------------------------------------------------------------------
+seed_bdlop_rho="SCL_CENTINEL_LATTICE_BDLOP_V1_SEED"
+seed_prf_crs="SCL_GLOBAL_CRS_SEED_FOR_PRF_MATRIX_v1"
+seed_prf_keygen="SparsePRFKey"
+seed_hyper_pow="SCL_HYPER_POW"
+tag_val_utxo="SCL_VAL_UTXO_"
+tag_val_utxo_0="SCL_VAL_UTXO_0"
+tag_val_utxo_1="SCL_VAL_UTXO_1"
+tag_dkg_epoch="DKG_EPOCH_"
+tag_dkg_epoch_0="DKG_EPOCH_0"
+tag_dkg_epoch_1="DKG_EPOCH_1"
+
+# HKDF Label Prefixes
+label_flight3="SCL flight3 key"
+label_final="SCL final key"
+label_key_deriv="SCL Key Derivation"
+label_salt="SCL Salt"
+label_handshake_salt="SCL Handshake Salt"
+label_rpc_siphash="SCL_RPC_SipHash"
+label_rpc_info="RPC_Checksum_Key"
+
+# ------------------------------------------------------------------------------
+# 2. Lattice Arithmetic Parameters & Moduli (Dilithium / Module-SIS / BDLOP)
+# ------------------------------------------------------------------------------
+# Prime Modulus Q = 8,380,417 (0x007FE001)
+mod_q_be="\x00\x7F\xE0\x01"
+mod_q_le="\x01\xE0\x7F\x00"
+
+# Q - 1 = 8,380,416 (0x007FE000)
+mod_q_minus_1_be="\x00\x7F\xE0\x00"
+mod_q_minus_1_le="\x00\xE0\x7F\x00"
+
+# Half Modulus (Q - 1) / 2 = 4,190,208 (0x003FF000)
+mod_half_q_be="\x00\x3F\xF0\x00"
+mod_half_q_le="\x00\xF0\x3F\x00"
+
+# Gamma1 = 2^19 = 524,288 (0x00080000)
+gamma1_be="\x00\x08\x00\x00"
+gamma1_le="\x00\x00\x08\x00"
+
+# 2 * Gamma1 = 1,048,576 (0x00100000)
+two_gamma1_be="\x00\x10\x00\x00"
+two_gamma1_le="\x00\x00\x10\x00"
+
+# Alpha (Dilithium5) = 2 * Gamma2 = 523,776 (0x0007FE00)
+alpha_std_be="\x00\x07\xFE\x00"
+alpha_std_le="\x00\xFE\x07\x00"
+
+# Alpha Alternate = 190,464 (0x0002E800)
+alpha_alt_be="\x00\x02\xE8\x00"
+alpha_alt_le="\x00\xE8\x02\x00"
+
+# Decomposition Base 2^D = 2^13 = 8,192 (0x00002000)
+two_pow_d_be="\x00\x00\x20\x00"
+two_pow_d_le="\x00\x20\x00\x00"
+
+# BDLOP Multi-Limb Shift = 2^21 = 2,097,152 (0x00200000)
+limb_shift_21_be="\x00\x20\x00\x00"
+limb_shift_21_le="\x00\x00\x20\x00"
+
+# 2^21 - 1 = 2,097,151 (0x001FFFFF)
+limb_mask_21_be="\x00\x1F\xFF\xFF"
+limb_mask_21_le="\xFF\xFF\x1F\x00"
+
+# PRF_P Modulus Scale = 256 (0x00000100)
+prf_p_be="\x00\x00\x01\x00"
+prf_p_le="\x00\x01\x00\x00"
+
+# ------------------------------------------------------------------------------
+# 3. Cryptographic Bounds, Weights & Structural Dimensions
+# ------------------------------------------------------------------------------
+# Tau = 60 (Challenge Hamming Weight)
+param_tau_be="\x00\x00\x00\x3C"
+
+# Omega = 75 (Max Hint Weight)
+param_omega_be="\x00\x00\x00\x4B"
+
+# PRF_HAMMING = 250 (Ternary Key Weight)
+param_hamming_prf_be="\x00\x00\x00\xFA"
+
+# ZK_KAPPA = 219 (Number of Stern Repetitions)
+param_zk_kappa_be="\x00\x00\x00\xDB"
+
+# Ring Degree N = 256
+param_ring_deg_be="\x00\x00\x01\x00"
+
+# Dilithium Matrix Dimensions K=8, L=7
+param_k_8="\x08"
+param_l_7="\x07"
+
+# Standard ZK Proof Length Bounds (128 bytes, 4096 bytes, 4000000 bytes)
+proof_len_128_be="\x00\x00\x00\x80"
+proof_len_4096_be="\x00\x00\x10\x00"
+proof_len_max_be="\x00\x3D\x09\x00"
+
+# ------------------------------------------------------------------------------
+# 4. Economic Constants & State Boundaries (Big-Endian)
+# ------------------------------------------------------------------------------
+# Subunits Per Coin = 160,000,000 (0x09896800)
+subunits_per_coin_be="\x00\x00\x00\x00\x09\x89\x68\x00"
+
+# 10 SCL Max Block Reward = 1,600,000,000 (0x5F5E1000)
+reward_10_scl_be="\x00\x00\x00\x00\x5F\x5E\x10\x00"
+
+# 50,000 SCL Standard Stake = 8,000,000,000,000 (0x0746A5288000)
+stake_50k_scl_be="\x00\x00\x07\x46\xA5\x28\x80\x00"
+
+# Max Supply Subunits = 2,560,000,000,000,000 (0x0009184E72A00000)
+max_total_subunits_be="\x00\x09\x18\x4E\x72\xA0\x00\x00"
+
+# Fee Numerator (Pi * 10^15) = 3,141,592,653,589,793 (0x000B2B44A7E00121)
+fee_numerator_be="\x00\x0B\x2B\x44\xA7\xE0\x01\x21"
+
+# Normal Fee Denominator = 10^17 (0x016345785D8A0000)
+fee_denom_normal_be="\x01\x63\x45\x78\x5D\x8A\x00\x00"
+
+# ------------------------------------------------------------------------------
+# 5. Wire Framing Headers, Opcodes & Status Codes
+# ------------------------------------------------------------------------------
+# Packet Flags
+flag_long_header="\xC0"
+flag_short_header="\x40"
+flag_fragmented="\x20"
+flag_retry="\x10"
+
+# RPC Version
+rpc_version_1="\x01"
+
+# RPC Operational Flags
+rpc_flag_signed="\x01"
+rpc_flag_paginated="\x02"
+rpc_flag_compressed="\x04"
+rpc_flag_all="\x07"
+
+# RPC Method IDs (16-bit Big-Endian)
+rpc_method_get_registry="\x00\x00"
+rpc_method_get_balance="\x00\x01"
+rpc_method_get_block="\x00\x02"
+rpc_method_submit_tx="\x00\x03"
+rpc_method_get_audit="\x00\x04"
+rpc_method_get_valuations="\x00\x05"
+rpc_method_get_recent_txs="\x00\x06"
+rpc_method_get_transaction="\x00\x07"
+rpc_method_get_chain_info="\x00\x08"
+rpc_method_sync_wallet_keys="\x00\x09"
+
+# RPC Status Codes (16-bit Big-Endian)
+rpc_status_ok="\x00\x00"
+rpc_status_bad_version="\x00\x01"
+rpc_status_unauthorized="\x00\x02"
+rpc_status_bad_method="\x00\x03"
+rpc_status_invalid_args="\x00\x04"
+rpc_status_checksum_err="\x00\x05"
+rpc_status_rate_limited="\xFF\xFF"
+
+# Blockchain Operation Types (1-byte)
+op_submit_valuation="\x00"
+op_mint_coin="\x01"
+op_transfer_pointer="\x02"
+op_stake="\x03"
+op_unstake="\x04"
+op_redeem_centinel="\x05"
+op_claim_validation="\x06"
+
+# Transport L4 Multiplexing Frames
+frame_ping="\x01"
+frame_ack="\x02"
+frame_new_cid="\x04"
+frame_path_challenge="\x05"
+frame_path_response="\x06"
+frame_stream="\x08"
+frame_max_data="\x10"
+frame_datagram="\x30"
+
+# ------------------------------------------------------------------------------
+# 6. SipHash-2-4 Initial State Constants
+# ------------------------------------------------------------------------------
+siphash_c0="\x73\x6f\x6d\x65\x70\x73\x65\x75"
+siphash_c1="\x64\x6f\x72\x61\x6e\x64\x6f\x6d"
+siphash_c2="\x6c\x79\x67\x65\x6e\x65\x72\x61"
+siphash_c3="\x74\x65\x64\x62\x79\x74\x65\x73"
+
+# ------------------------------------------------------------------------------
+# 7. Integer Arithmetic Extremes & Boundary Offsets (Little & Big-Endian)
+# ------------------------------------------------------------------------------
+# 64-bit Integer Boundaries
+uint64_zero="\x00\x00\x00\x00\x00\x00\x00\x00"
+uint64_one_le="\x01\x00\x00\x00\x00\x00\x00\x00"
+uint64_max_le="\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF"
+uint64_max_minus_1_le="\xFE\xFF\xFF\xFF\xFF\xFF\xFF\xFF"
+uint64_byte_shifted_08="\x00\x01\x00\x00\x00\x00\x00\x00"
+uint64_byte_shifted_56="\x00\x00\x00\x00\x00\x00\x00\x01"
+
+# 32-bit Integer Boundaries
+uint32_zero="\x00\x00\x00\x00"
+uint32_one_le="\x01\x00\x00\x00"
+uint32_two_le="\x02\x00\x00\x00"
+uint32_four_le="\x04\x00\x00\x00"
+uint32_seven_le="\x07\x00\x00\x00"
+uint32_eight_le="\x08\x00\x00\x00"
+uint32_nine_le="\x09\x00\x00\x00"
+uint32_eleven_le="\x0B\x00\x00\x00"
+uint32_max_le="\xFF\xFF\xFF\xFF"
+uint32_minus_1_le="\xFE\xFF\xFF\xFF"
+uint32_minus_11_le="\xF5\xFF\xFF\xFF"
+uint32_minus_17_le="\xEF\xFF\xFF\xFF"
+uint32_minus_27_le="\xE5\xFF\xFF\xFF"
+uint32_minus_28_le="\xE4\xFF\xFF\xFF"
+
+# 16-bit Boundary Tokens
+uint16_one_le="\x01\x00"
+uint16_four_le="\x04\x00"
+uint16_seven_le="\x07\x00"
+uint16_nine_le="\x09\x00"
+uint16_twenty_two_le="\x16\x00"
+uint16_max_le="\xFF\xFF"
+
+# ------------------------------------------------------------------------------
+# 8. Modulo Arithmetic Offsets, Inverse Moduli & Shift Deltas
+# ------------------------------------------------------------------------------
+# Half-Q Arithmetic Boundaries ((Q-1)/2 ± {1, 2})
+mod_half_q_plus1_le="\x01\xF0\x3F\x00"
+mod_half_q_minus1_le="\xFF\xEF\x3F\x00"
+mod_half_q_plus2_le="\x02\xF0\x3F\x00"
+mod_half_q_inv_shift="\x01\x3F\xF0\x01"
+
+# Modulus Q Boundary Offsets & Inverses (Q ± {1, 2})
+mod_q_inv_be="\xFF\x3E\xF0\x01"
+mod_q_inv_le="\xFF\x3E\xF0\x00"
+mod_q_limb_bound_be="\xFE\xFF\x1F\x00"
+mod_q_signed_delta="\xFF\xFE\x03\x00"
+mod_ntt_zeta_offset="\x00\xCA\x01\x00"
+
+# Dilithium & BDLOP Bitmask Perturbations
+limb_mask_negated_le="\xFE\xC0\x0F\xFF"
+limb_mask_inverted_le="\xFF\x0F\xC0\xFF"
+limb_mask_extended_le="\xFE\x0F\xC0\xFF"
+gamma2_scaled_bound="\x00\x10\xC0\xFF"
+
+# ------------------------------------------------------------------------------
+# 9. Serialization Lengths, Pointers & Protocol Framing Deltas
+# ------------------------------------------------------------------------------
+# Buffer Length Prefixes (32-bit & 64-bit Little-Endian)
+len_prefix_14_le="\x0E\x00\x00\x00\x00\x00\x00\x00"
+len_prefix_28_le="\x1C\x00\x00\x00\x00\x00\x00\x00"
+len_prefix_40_le="\x28\x00\x00\x00"
+len_prefix_91_le="\x5B\x00\x00\x00\x00\x00\x00\x00"
+
+# Protocol Subunit Scales & Economic Offsets (Little-Endian)
+subunits_coin_le="\x00\x68\x89\x09\x00\x00\x00\x00"
+reward_10_scl_le="\x00\x10\x5E\x5F\x00\x00\x00\x00"
+stake_50k_scl_le="\x00\x80\x28\xA5\x46\x07\x00\x00"
+fee_denom_offset_le="\x00\x00\x8A\x5D\x78\x45\x63\x01"
+
+# Transport & Multiplexing Stream Tags
+stream_tag_p2p_le="\x01\x08\x00\x00"
+stream_tag_sync_le="\x01\x1B\x01\x08"
+stream_tag_data_le="\x00\x04\x44\x51"
+token_z_suffix="\x00\x00\x00\x00\x00\x00\x00Z"
+token_semicolon_tilde=";~s\x00"
+
+# ------------------------------------------------------------------------------
+# 10. Empirical High-Frequency Tokens
+# ------------------------------------------------------------------------------
+token_kyber512="Kyber512"
+token_kyber51="Kyber51"
+token_classic="Classic-"
+token_cmp_lt_paren="\x3C\x29\x32\x00"
+token_f6_shifted="\xF6\x00\x00\x00\x00\x00\x00\x00"
+token_ff_c0_0f_ff="\xFF\xC0\x0F\xFF"
+token_u64_four="\x04\x00\x00\x00\x00\x00\x00\x00"
+token_u64_top_3="\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x03"
+token_u64_a8="\xA8\x00\x00\x00\x00\x00\x00\x00"
+token_u64_fd="\x00\x00\x00\x00\x00\x00\x00\xFD"
+token_u64_f1="\x00\x00\x00\x00\x00\x00\x00\xF1"
+token_b9_b0_3e="\xB9\xB0\x3E\x00"
+token_u32_0e="\x01\x00\x00\x0E"
+token_u32_38="\x01\x00\x00\x38"
+token_u32_1a="\x1A\x00\x00\x00"
+token_01_3a_e8_82="\x01\x3A\xE8\x82"
+token_00_20_58_64="\x00\x20\x58\x64"
+token_ff_07_00_00="\xFF\x07\x00\x00"
+token_uh_ec_ff="\x55\x68\xEC\xFF"
+token_u64_three="\x03\x00\x00\x00\x00\x00\x00\x00"
+token_b3_fd_02_00="\xB3\xFD\x02\x00"
+token_u64_top_a7="\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xA7"
+token_3e_ba_c1_ff="\x3E\xBA\xC1\xFF"
+token_ff_e3_ac_0f="\xFF\xE3\xAC\x0F"
+token_00_ef_52_db="\x00\xEF\x52\xDB"
+token_81_08_bb_ff="\x81\x08\xBB\xFF"
+token_dilithium5="Dilithium5"
+token_u64_19="\x19\x00\x00\x00\x00\x00\x00\x00"
+token_ff_ff_45_ad="\xFF\xFF\x45\xAD"
+token_b4_31_05_00="\xB4\x31\x05\x00"
+token_ff_07="\xFF\x07"
+token_u64_01_f5="\x01\x00\x00\x00\x00\x00\x00\xF5"
+token_ff_ff_3e_d5="\xFF\xFF\x3E\xD5"
+token_u64_20_0a="\x20\x0A\x00\x00\x00\x00\x00\x00"
+token_ff_1f_d3_c5="\xFF\x1F\xD3\xC5"
+token_u64_0d="\x00\x00\x00\x00\x00\x00\x00\x0D"
+token_fe_d2_5a_0b="\xFE\xD2\x5A\x0B"
+token_96_9e_c6_ff="\x96\x9E\xC6\xFF"
+token_fe_c7_33_36="\xFE\xC7\x33\x36"
+token_0e_70_f3_ff="\x0E\x70\xF3\xFF"
+token_00_07_76_55="\x00\x07\x76\x55"
+token_00_03_ff_00="\x00\x03\xFF\x00"
+token_ff_0e_a7_90="\xFF\x0E\xA7\x90"
+token_u64_two="\x02\x00\x00\x00\x00\x00\x00\x00"
+token_u64_f3="\xF3\x00\x00\x00\x00\x00\x00\x00"
+token_fe_c3_ed_5d="\xFE\xC3\xED\x5D"
+token_ff_11_f0_53="\xFF\x11\xF0\x53"
+token_u64_a7="\xA7\x00\x00\x00\x00\x00\x00\x00"
+token_u64_top_0e="\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x0E"
+token_u64_ten="\x0A\x00\x00\x00\x00\x00\x00\x00"
+token_ff_73_01_00="\xFFs\x01\x00"
+token_u64_01_06="\x01\x00\x00\x00\x00\x00\x00\x06"
+token_d7_16_02_00="\xD7\x16\x02\x00"
+token_zero_64_lt="\x00\x00\x00\x00\x00\x00\x00<"
+token_01_17="\x01\x17"
+token_fuzz_lattice_bound="O\x01\x15\xBC\xFD\xBA1_B\x00\x00\x002?\xF0\x01\xB7\xF0\x01\x15\xBC\xFD\xBA_B\x00\x00\x002\x00\x07\x0A"
+token_u64_f7="\xF7\x00\x00\x00\x00\x00\x00\x00"
+token_u64_46="F\x00\x00\x00\x00\x00\x00\x00"
+token_dilithium3="Dilithium3"
+token_u64_01_20="\x01\x00\x00\x00\x00\x00 \x00"
+token_u64_f5="\xF5\x00\x00\x00\x00\x00\x00\x00"
+token_de_65_07_00="\xDEe\x07\x00"
+token_centinetic2="\xBC\xB3\xA0\xB6\xB1\xBA\xAFI\x00\x10^_\x00\x00\x00\x00\x00\x00CENTINETIC2_ ["
+token_u64_00_20="\x00 \x00\x00\x00\x00\x00\x00"
