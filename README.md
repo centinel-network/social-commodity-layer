@@ -108,9 +108,91 @@ Ensure your project directory looks like this:
 project_root/
 ├── CMakeLists.txt
 ├── Dockerfile
+├── Dockerfile.wasm
+├── build_wasm.sh
+├── build_wasm_mac.sh
 ├── satocialist.conf
+│
+├── tests/
+│   ├── benchmark_tests.c
+│   ├── test_rpc_pipelines.c
+│   ├── test_coalition_resistance.c
+│   ├── unit_tests.c
+│   ├── test_quantum_tvd.c
+│
 ├── common/
+│   ├── constants.h
+│   ├── types.h
+│   ├── utils.h
+│   ├── utils.c
+│   │
+│   ├── user/
+│   │   ├── user.c
+│   │   └── user.h
+│   │
+│   ├── blockchain/
+│   │   ├── database.c
+│   │   ├── database.h
+│   │   ├── blockchain.c
+│   │   ├── blockchain.h
+│   │   ├── hash_table.c
+│   │   ├── hash_table.h
+│   │   ├── mmr.c
+│   │   └── mmr.h
+│   │
+│   ├── network/
+│   │   ├── protocol.c
+│   │   ├── protocol.h
+│   │   ├── queue.c
+│   │   ├── queue.h
+│   │   ├── network.c
+│   │   ├── network.h
+│   │   ├── rpc.h
+│   │   ├── rpc.c
+│   │   ├── scl_rpc_ffi.c
+│   │   ├── scl_rpc_ffi_export.h
+│   │   ├── websocket_bridge.c
+│   │   ├── websocket_bridge.h
+│   │   └── quantum_tvd_rpc.c
+│   │
+│   ├── crypto/
+│   │   ├── crypto.c
+│   │   ├── crypto.h
+│   │   ├── quantum_qsim.cpp
+│   │   ├── quantum_qsim.h
+│   │   ├── quantum_tvd.h
+│   │   └── quantum_tvd.cpp
+│   │
+│   └── consensus/
+│       ├── consensus.c
+│       └── consensus.h
+│
 └── client/
+    ├── client.c
+    │
+    ├── ui/
+    │   ├── client_aux.c
+    │   ├── client_aux.h
+    │   ├── wasm_bindings.c
+    │   ├── auditor.worker.js
+    │   ├── auditor_client.js
+    │   ├── mmr_canvas_renderer.js
+    │   ├── explorer_app.js
+    │   ├── index.html
+    │   ├── SCL_Architecture_Validation_Report.html
+    │   └── SCL_Simulation_Specification.html
+    │
+    ├── network/
+    │   ├── client_network.c
+    │   └── client_network.h
+    │
+    ├── state/
+    │   ├── client_state.c
+    │   └── client_state.h
+    │
+    └── core/
+        ├── game_state.c
+        └── game_state.h
 ```
 
 ### Build Steps:
