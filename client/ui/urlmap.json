@@ -1,0 +1,24 @@
+{
+  "creationTimestamp": "2026-09-30T14:35:39.088-07:00",
+  "defaultService": "https://www.googleapis.com/compute/v1/projects/centinel-network/global/backendServices/scl-ws-backend",
+  "fingerprint": "06YN9cNTcfM=",
+  "hostRules": [
+    {
+      "hosts": [
+        "explore.centinel.network",
+        "centinel.network"
+      ],
+      "pathMatcher": "ui-matcher"
+    }
+  ],
+  "id": "266573071007104581",
+  "kind": "compute#urlMap",
+  "name": "scl-ws-map",
+  "pathMatchers": [
+    {
+      "defaultService": "https://www.googleapis.com/compute/v1/projects/centinel-network/global/backendBuckets/scl-ui-backend-bucket",
+      "name": "ui-matcher"
+    }
+  ],
+  "selfLink": "https://www.googleapis.com/compute/v1/projects/centinel-network/global/urlMaps/scl-ws-map"
+}
