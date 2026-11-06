@@ -3587,7 +3587,15 @@ int apply_block(State *state, Block *block) {
         if (block_buffer) {
             int ser_len = process_block_data(block, block_buffer, NULL, true);
             if (ser_len > 0) {
-                scl_db_put_block(block->block_number, block_buffer, (size_t)ser_len);
+                if (scl_db_put_block(block->block_number, block_buffer, (size_t)ser_len) != 0) {
+                    /* Fail-stop: the RAM tip was already advanced above; running
+                     * ahead of a failed write is what makes the chain "revert"
+                     * to an earlier height after the next restart. */
+                    fprintf(stderr, "[Consensus] FATAL: persisting block %llu failed. Aborting to keep RAM and disk consistent.\n",
+                            (unsigned long long)block->block_number);
+                    free(block_buffer);
+                    abort();
+                }
             }
             free(block_buffer);
         }
@@ -3738,7 +3746,11 @@ int apply_block(State *state, Block *block) {
 
     // Atomically finalize or rollback libmdbx transaction based on execution outcome
     if (success == 0) {
-        scl_db_commit_block_txn(); // Commit the DB transaction atomically
+        if (scl_db_commit_block_txn() != 0) {
+            fprintf(stderr, "[Consensus] FATAL: DB commit failed for block %llu. Aborting to keep RAM and disk consistent.\n",
+                    (unsigned long long)block->block_number);
+            abort();
+        }
     } else {
         scl_db_abort_block_txn();
     }
@@ -4844,21 +4856,23 @@ int handle_block_proposal(State *state, const Message *msg, struct sockaddr_stor
         pthread_mutex_lock(&state->mutex);
         if (!state->in_blockchain_sync) {
             bool is_better_chain = false;
-            bool is_explicit_fork = false;
             if (block->block_number > local_current_block_number + 1) {
                 is_better_chain = true;
             } else if (block->block_number == local_current_block_number + 1) {
                 if (memcmp(block->prev_block_hash, local_current_block_hash, COIN_ID_LEN) < 0) {
                     is_better_chain = true;
-                    is_explicit_fork = true;
                 }
             }
 
             if (is_better_chain) {
-                fprintf(stderr, "[Consensus] Peer's branch is longer or has a better hash at the same height. Triggering sync to catch up.\n");
+                fprintf(stderr, "[Consensus] Peer's branch competes at the next height. Triggering non-destructive sync to evaluate it.\n");
                 state->in_blockchain_sync = 1;
                 pthread_mutex_unlock(&state->mutex);
-                trigger_async_sync(state, sender_pubkey, is_explicit_fork);
+                /* Never force: a forced sync rolls the local chain back to the
+                 * last checkpoint (up to BLOCKS_PER_DAY-1 blocks) BEFORE the
+                 * peer's chain has been proven better. A hash comparison at the
+                 * same height is not such proof. */
+                trigger_async_sync(state, sender_pubkey, false);
             } else {
                 pthread_mutex_unlock(&state->mutex);
                 fprintf(stderr, "[Consensus] Our local branch has a better hash. Ignoring peer's fork.\n");
@@ -5061,7 +5075,9 @@ void handle_msg_block_approved(State *state, Block *block, uint8_t *sender_pubke
                 if (!state->in_blockchain_sync) {
                     state->in_blockchain_sync = 1;
                     pthread_mutex_unlock(&state->mutex);
-                    trigger_async_sync(state, sender_pubkey, true);
+                    /* Equal height is not proof of a better chain: sync WITHOUT
+                     * the forced checkpoint rollback (see blockchain_sync_worker). */
+                    trigger_async_sync(state, sender_pubkey, false);
                 } else {
                     pthread_mutex_unlock(&state->mutex);
                 }
