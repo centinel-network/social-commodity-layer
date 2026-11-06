@@ -528,6 +528,34 @@ int mmr_update_leaf_with_proof(MMR *mmr, const uint8_t *coin_id, uint64_t old_su
     return 0;
 }
 
+/* H-4 fix: local-trust peak update. Rewrites the leaf digest and rehashes every
+ * ancestor from THIS node's own child digests — peer-supplied MMRProof path hashes
+ * are never consulted, so a remote peer cannot define the state root. */
+int mmr_update_leaf_local(MMR *mmr, const uint8_t *coin_id, uint64_t old_subunits, uint64_t new_subunits) {
+    if (!mmr || !coin_id) return -1;
+
+    ssize_t leaf_idx = mmr_get_leaf_position(mmr, coin_id, old_subunits);
+    if (leaf_idx < 0) return -1;
+
+    uint8_t new_hash[COIN_ID_LEN];
+    hash_leaf(coin_id, new_subunits, new_hash);
+
+    if (!is_zeroed(mmr->nodes[leaf_idx].hash, COIN_ID_LEN)) {
+        memcpy(mmr->nodes[leaf_idx].hash, new_hash, COIN_ID_LEN);
+    }
+
+    size_t curr = (size_t)leaf_idx;
+    while (mmr->nodes[curr].parent != -1) {
+        size_t parent_idx = (size_t)mmr->nodes[curr].parent;
+        ssize_t left = mmr->nodes[parent_idx].left_child;
+        ssize_t right = mmr->nodes[parent_idx].right_child;
+        if (left < 0 || right < 0) return -1;
+        hash_node(mmr->nodes[left].hash, mmr->nodes[right].hash, mmr->nodes[parent_idx].hash);
+        curr = parent_idx;
+    }
+    return 0;
+}
+
 void mmr_prune(MMR *mmr) {
     if (!mmr || mmr->count == 0) return;
 
