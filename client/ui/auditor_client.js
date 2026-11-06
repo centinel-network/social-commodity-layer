@@ -454,6 +454,10 @@ class SclAuditorClient {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
+        if (this.pollInterval) {
+            clearInterval(this.pollInterval);
+            this.pollInterval = null;
+        }
         if (this.socket) {
             this.socket.onopen = null;
             this.socket.onmessage = null;
@@ -471,6 +475,7 @@ class SclAuditorClient {
         try {
             this.socket = new WebSocket(this.wsUrl);
             this.socket.binaryType = 'arraybuffer';
+            const socketRef = this.socket;
 
             this.socket.onopen = () => {
                 this.reconnectAttempts = 0; // Reset backoff counter on success
@@ -479,6 +484,10 @@ class SclAuditorClient {
                 this.lastValuationsResponseTime = Date.now();
                 this.lastBalanceResponseTime = Date.now();
                 this._trySyncNodeWallet();
+                // The load balancer may have switched backends: drop any rollback debounce
+                if (this.worker) {
+                    this.worker.postMessage({ type: 'RESET_ROLLBACK_STATE' });
+                }
                 this.requestRecentTransactions(0);
                 this.requestChainInfo();
                 this.requestValuations();
@@ -507,6 +516,7 @@ class SclAuditorClient {
             this.socket.onmessage = (event) => this._handleIncomingFrame(event);
 
             this.socket.onclose = () => {
+                if (this.socket !== socketRef) return; // stale socket from a superseded pipeline
                 this._logStatus('PIPELINE DISCONNECTED');
                 if (this.pollInterval) {
                     clearInterval(this.pollInterval);
