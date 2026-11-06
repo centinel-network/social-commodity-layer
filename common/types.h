@@ -335,6 +335,7 @@ typedef struct SclUnackedPacket {
     size_t bytes_in_flight;           /** Serialized wire byte size contributing to network congestion volume. */
     bool is_datagram;                 /** When true, dropped on loss; when false, retransmitted on loss. */
     bool is_fec_protected;            /** When true, grants an additional 1/2 RTT timeout margin before loss declaration. */
+    uint8_t retransmit_count;         /** Reliable-stream retransmission attempts for this packet (storm circuit-breaker). */
     uint64_t delivered_at_tx;         /** BBRv3: Cumulative bytes delivered at the moment this packet was sent. */
     uint64_t delivered_time_at_tx;    /** BBRv3: Monotonic timestamp at the moment this packet was sent. */
     uint8_t *raw_packet;              /** Heap-allocated copy of unencrypted stream payload for retransmission. */
@@ -463,6 +464,7 @@ typedef struct __attribute__((aligned(64))) SclConnection {
         uint8_t hypergraph_puzzle_base[32];            /** 32-byte puzzle seed for secondary Proof-of-Work challenge. */
         bool is_untrusted_sync;                        /** True if connection is non-staked initial block download peer. */
         _Atomic(uint64_t) last_rx_time;                /** Timestamp in milliseconds of most recent packet arrival. */
+        _Atomic(uint32_t) aead_fail_streak;            /** Consecutive AEAD authentication failures (session-divergence circuit-breaker). */
         _Atomic(int) ref_count;                        /** Lock-free reference counter governing object reclamation. */
         _Atomic(bool) is_processing;                   /** Spin-lock preventing concurrent worker processing of one context. */
         bool use_relay;                                /** True if traffic must encapsulate via blind TURN-like relay. */
