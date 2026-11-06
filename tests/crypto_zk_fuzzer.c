@@ -875,8 +875,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                     }
 
                     size_t aead_ct_len = 0, aead_pt_len = 0;
-                    if (encrypt_aead_packet(aes_key, packet_num, msg_data, msg_data_len, ct_out, &aead_ct_len) == 0) {
-                        decrypt_aead_packet(aes_key, packet_num, ct_out, aead_ct_len, pt_out, &aead_pt_len);
+                    if (encrypt_aead_packet(aes_key, packet_num, msg_data, msg_data_len, ct_out, &aead_ct_len, NULL, 0) == 0) {
+                        decrypt_aead_packet(aes_key, packet_num, ct_out, aead_ct_len, pt_out, &aead_pt_len, NULL, 0);
                     }
                 }
                 arena_reset(enc_mark);
