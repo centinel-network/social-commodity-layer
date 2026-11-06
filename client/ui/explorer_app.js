@@ -726,7 +726,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Default Node Coordinates & Persistent Testnet Wallet Initialization
     const host = window.location.hostname || 'localhost';
     const isLocal = ['localhost', '127.0.0.1'].includes(host);
-    const wsHost = isLocal ? 'localhost:5554' : 'node.centinel.network';
+    const wsHost = isLocal ? 'localhost:5554' : (window.SCL_BRIDGE_HOST || 'node.centinel.network');
     const defaultWsUrl = (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + wsHost;
     if (nodeUrlInput) nodeUrlInput.value = defaultWsUrl;
 
@@ -735,16 +735,15 @@ document.addEventListener('DOMContentLoaded', () => {
     client = new SclAuditorClient(nodeUrlInput.value, 'auditor.worker.js');
     window.client = client;
 
-    // Retain canonical testnet wallet across reconnects and refreshes to prevent seed toggling
-    const savedTestnetPubkey = localStorage.getItem('scl_testnet_pubkey') || '';
-    const savedTestnetPrivkey = localStorage.getItem('scl_testnet_privkey') || '';
+    /* H-3 fix: the testnet keypair is held in memory for the session only. Every
+     * blank 'Connect Node' re-loads it live from the seed node; the identity is kept
+     * stable across seeds and restarts by the shared testnet_identity_<port>.dat file
+     * on the node side, so localStorage persistence is no longer needed. */
+    localStorage.removeItem('scl_testnet_privkey');
+    localStorage.removeItem('scl_testnet_pubkey');
     if (prfKeyInput) prfKeyInput.value = '';
-    if (walletPubkeyInput) walletPubkeyInput.value = savedTestnetPubkey;
-    if (walletPrivkeyInput) walletPrivkeyInput.value = savedTestnetPrivkey;
-    if (savedTestnetPubkey) {
-        const pkBytes = _hexToBytes(savedTestnetPubkey, 2592);
-        if (pkBytes) client.setTargetPubkey(pkBytes);
-    }
+    if (walletPubkeyInput) walletPubkeyInput.value = '';
+    if (walletPrivkeyInput) walletPrivkeyInput.value = '';
 
     // Always present the Wallet State Configuration panel open by default on reload
     if (collapsibleContainer && toggleKeysBtn) {
@@ -926,7 +925,7 @@ document.addEventListener('DOMContentLoaded', () => {
             blockHeight: window.lastKnownChainHeight ?? 0,
             totalSubunits: window.systemMetrics.totalSubunits || 0,
             totalStaked: window.lastKnownTotalStaked || 0,
-            committeeCount: window.lastKnownCommitteeCount ?? 0,
+            committeeCount: window.lastKnownCommitteeCount ?? window.lastStableCommitteeCount ?? 0,
             activeDkgSessions: 0,
             lastDkgEpoch: window.lastKnownDkgEpoch || 0
         };
@@ -1943,12 +1942,12 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!window.knownPubkeysSet) window.knownPubkeysSet = new Set();
             window.knownPubkeysSet.add(nodePubkeyHex);
             const nodePubkeyBytes = _hexToBytes(nodePubkeyHex, 2592);
-            // Auto-bind on first connection and persist so reconnects through the GCP load balancer stay consistent
+            /* Auto-bind on blank fields (testnet convenience preserved). Session-memory
+             * only; the shared testnet identity file keeps the served key stable. */
             if (nodePubkeyBytes && (!walletPubkeyInput || !walletPubkeyInput.value.trim())) {
                 client.rawDilithiumPubkey = nodePubkeyBytes;
                 client.setTargetPubkey(nodePubkeyBytes);
                 if (walletPubkeyInput) walletPubkeyInput.value = nodePubkeyHex;
-                localStorage.setItem('scl_testnet_pubkey', nodePubkeyHex);
             }
         }
 
@@ -1956,9 +1955,11 @@ document.addEventListener('DOMContentLoaded', () => {
             const nodePrivkeyBytes = _hexToBytes(nodePrivkeyHex, 4864);
             if (nodePrivkeyBytes && !nodePrivkeyBytes.every(b => b === 0)) {
                 if (!walletPrivkeyInput || !walletPrivkeyInput.value.trim()) {
+                    /* H-3 fix: held in memory for this session only. The served key is the
+                     * disposable testnet identity (never the operator/staking key) and is
+                     * never written to localStorage. */
                     client.rawDilithiumKey = nodePrivkeyBytes;
                     if (walletPrivkeyInput) walletPrivkeyInput.value = nodePrivkeyHex;
-                    localStorage.setItem('scl_testnet_privkey', nodePrivkeyHex);
                     hotSwapCredentials();
                 }
             }
@@ -1975,12 +1976,30 @@ document.addEventListener('DOMContentLoaded', () => {
             totalFeesValEl.textContent = '¢' + formatScl(Number(totalFees) / 160000000, 4);
         }
 
+        /* Active-Node stability fix: a new count is committed only after it repeats
+         * across two consecutive live polls, so a single backend behind the GCP load
+         * balancer cannot make the badge drift. window.pendingCommitteeCount holds
+         * the unconfirmed reading. */
+        if (committeeCount !== window.lastStableCommitteeCount) {
+            if (window.pendingCommitteeCount === committeeCount) {
+                window.lastStableCommitteeCount = committeeCount;
+                window.pendingCommitteeCount = null;
+            } else {
+                window.pendingCommitteeCount = committeeCount;
+            }
+        } else {
+            window.pendingCommitteeCount = null;
+        }
+        const stableCommitteeCount = (window.lastStableCommitteeCount !== undefined)
+            ? window.lastStableCommitteeCount
+            : committeeCount;
+
         const activeNodesEl = document.getElementById('active-nodes-val');
         if (activeNodesEl) {
-            activeNodesEl.textContent = committeeCount;
+            activeNodesEl.textContent = stableCommitteeCount;
         }
 
-        updateDkgBeacon(committeeCount, activeDkgSessions, lastDkgEpoch);
+        updateDkgBeacon(stableCommitteeCount, activeDkgSessions, lastDkgEpoch);
 
         /* TVD tracks consensus, not the wall clock. A new block or a new DKG
          * epoch is the only reason to ask for another certificate. */
@@ -2001,7 +2020,7 @@ document.addEventListener('DOMContentLoaded', () => {
          * values instead of zeroing the height and freezing the node badge. */
         window.lastKnownChainHeight = blockHeight;
         window.lastKnownTotalStaked = totalStaked;
-        window.lastKnownCommitteeCount = committeeCount;
+        window.lastKnownCommitteeCount = (window.lastStableCommitteeCount !== undefined) ? window.lastStableCommitteeCount : committeeCount;
         window.lastKnownDkgEpoch = lastDkgEpoch;
 
         const now = Date.now();
@@ -2176,11 +2195,16 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         const utxoValEl = document.getElementById('decrypted-utxo-val');
-        if (utxoValEl) {
-            if (utxoValidations !== undefined && utxoValidations !== null) {
-            window.privateUtxoBalance = utxoValidations;
-            utxoValEl.textContent = Number(window.privateUtxoBalance).toLocaleString('en-US');
+        if (utxoValEl && utxoValidations !== undefined && utxoValidations !== null) {
+            const recentSubmission = window.lastValuationSubmissionAt &&
+                (Date.now() - window.lastValuationSubmissionAt) < 8000;
+            if (recentSubmission && utxoValidations > (window.privateUtxoBalance || 0)) {
+                /* UTXO-stat stability fix: the node has not applied our burn yet; do not
+                 * let the pre-burn echo reset the locally decremented tally. */
+            } else {
+                window.privateUtxoBalance = utxoValidations;
             }
+            utxoValEl.textContent = Number(window.privateUtxoBalance || 0).toLocaleString('en-US');
         }
 
         updateGlobalValidations();
@@ -4174,6 +4198,15 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (spentIdx !== -1) {
                         window.loadedUTXOs.splice(spentIdx, 1);
                     }
+                }
+
+                /* UTXO-stat stability fix: remember the submission instant and reflect the
+                 * burn locally so 'Audited UTXO Validations' steps down instead of resetting. */
+                window.lastValuationSubmissionAt = Date.now();
+                window.privateUtxoBalance = (window.loadedUTXOs || []).reduce((sum, u) => sum + (u.amount || 0), 0);
+                const utxoStatEl = document.getElementById('decrypted-utxo-val');
+                if (utxoStatEl) {
+                    utxoStatEl.textContent = Number(window.privateUtxoBalance).toLocaleString('en-US');
                 }
 
                 client.generateCentinelProof({
