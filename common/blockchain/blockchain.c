@@ -1618,7 +1618,7 @@ int initiate_unstake(User *user, State *state) {
  * @details
  * Partitions input pointers into transfer, fee (`spent = 2`), and change outputs. Marks original input
  * pointers as `spent = 1` in memory and disk database. Deducts fees from parent coins in O(1) time
- * and updates state MMR peaks cryptographically using client inclusion proofs without tree rebuilds.
+ * and updates state MMR peaks cryptographically from LOCAL digests only (peer-supplied proof paths are never trusted).
  * Rollback occurs atomically if any step fails.
  *
  * @param[in,out] bc Pointer to Blockchain state container.
@@ -1642,6 +1642,7 @@ int update_transfer_state(Blockchain *bc, Pointer *input_pointers, MMRProof *pro
         fprintf(stderr, "[Blockchain] Invalid parameters in update_transfer_state\n");
         return 0;
     }
+    (void)proofs;  /* H-4 fix: proofs intentionally unused; verified by caller, MMR update rehashes from local digests. Kept for API stability. */
 
     Pointer *added_pointers = malloc(num_inputs * sizeof(Pointer) * 2);  // Allow for splits
     uint8_t (*added_pointer_ids)[COIN_ID_LEN] = malloc(num_inputs * COIN_ID_LEN * 2);
@@ -1825,10 +1826,9 @@ int update_transfer_state(Blockchain *bc, Pointer *input_pointers, MMRProof *pro
                 }
                 scl_db_put_coin(parent_coin->coin_id, parent_coin);
                 
-                // Cryptographically update the MMR Peak using the client's inclusion proof, completely eliminating O(N^2) memory rebuilds
-                if (proofs) {
-                    mmr_update_leaf_with_proof(bc->mmr, parent_coin->coin_id, old_sub, parent_coin->remaining_subunits, &proofs[i]);
-                }
+                /* H-4 fix: rehash the peak from LOCAL sibling digests only — the
+                 * client's proof path is never trusted to define the state root. */
+                mmr_update_leaf_local(bc->mmr, parent_coin->coin_id, old_sub, parent_coin->remaining_subunits);
             }
         }
     }
