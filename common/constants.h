@@ -480,6 +480,8 @@
 #define SCL_PACKET_THRESHOLD 32
 /** @brief Numerator for time-loss detection threshold (9/8 * SRTT). */
 #define SCL_TIME_THRESHOLD_NUM 9
+/** @brief Maximum reliable-stream retransmission attempts per packet before the connection is reset (storm circuit-breaker). */
+#define SCL_MAX_STREAM_RETRANSMITS 10
 /** @brief Denominator for time-loss detection threshold (9/8 * SRTT). */
 #define SCL_TIME_THRESHOLD_DEN 8
 
@@ -736,6 +738,10 @@
 
 /** @brief Maximum duration of peer inactivity in seconds before declaring connection dead (60 seconds). */
 #define MAX_PEER_SILENCE_TIME 60
+/** @brief Maximum consecutive AEAD authentication failures tolerated on one connection before it is killed and re-handshaken. */
+#define SCL_MAX_CONSECUTIVE_AEAD_FAILURES 3
+/** @brief A peer only counts toward the consensus quorum base if it produced verified traffic within this window. */
+#define SCL_QUORUM_LIVENESS_MS 45000
 /** @brief Cadence in seconds for dispatching keepalive ping queries to connected peers (15 seconds). */
 #define LIVENESS_CHECK_INTERVAL 15
 
