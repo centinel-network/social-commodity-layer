@@ -419,6 +419,8 @@ static int has_consensus(BlockVoteQueue *queue, size_t num_peers) {
  * @complexity Time: O(P log P + B) where P is peer count and B is block apply time;
  *             Auxiliary Space: O(P) for peer key deduplication.
  */
+static void consensus_undo_applied_operations(State *state, Block *block, size_t applied_ops);
+
 bool check_consensus(State *state, Block *block, BlockVoteQueue *queue) {
     // Dynamically evaluate active peers at the exact moment of consensus evaluation
     size_t num_peers = 0;
@@ -461,7 +463,9 @@ bool check_consensus(State *state, Block *block, BlockVoteQueue *queue) {
         free(active_pubkeys);
     }
     pthread_mutex_unlock(&state->p2p_network.mutex);
-    if (num_peers == 0) num_peers = 1;
+    /* H-9 fix: removed the num_peers==0 -> 1 coercion. A lone node with no live
+     * peers no longer fabricates a quorum of one and finalizes its own blocks;
+     * has_consensus() already returns 0 for an empty voter base. */
 
     pthread_mutex_lock(&queue->vote_lock);
     bool consensus_reached = has_consensus(queue, num_peers);
@@ -3052,17 +3056,23 @@ int apply_block(State *state, Block *block) {
                 sha256_hash(mu_input, 32 + COIN_ID_LEN, mu);
                         
                 if (threshold_verify(mu, 32, block->epoch_threshold_signature, SIGNATURE_LEN, current_epoch_pubkey, PUBKEY_LEN) != CRYPTO_SUCCESS) {
-                    fprintf(stderr, "[Consensus] WARNING: Block %llu has invalid epoch_threshold_signature, proceeding on consensus approval\n", block->block_number);
+                    /* M-3 fix (beacon mandatory): an invalid threshold signature rejects the block. */
+                    fprintf(stderr, "[Consensus] ERROR: Block %llu has invalid epoch_threshold_signature — rejecting block\n", block->block_number);
+                    success = -1;
                 }
             } else {
-                fprintf(stderr, "[Consensus] WARNING: Block %llu is missing epoch_threshold_signature (is_same_epoch=%d), proceeding on consensus approval\n",
+                /* M-3 fix (beacon mandatory): a missing threshold signature rejects the block. */
+                fprintf(stderr, "[Consensus] ERROR: Block %llu is missing epoch_threshold_signature (is_same_epoch=%d) — rejecting block\n",
                         block->block_number, is_same_epoch);
+                success = -1;
             }
         }
 #endif
     }
 
     // Process operations if header validation succeeds
+    size_t applied_ops = 0; /* H-7 fix: high-water mark of applied ops; visible to the
+                             * failure branch below so RAM can be rolled back with the DB */
     if (success == 0 && block->block_number != 0) {
         scl_log(LOG_LEVEL_INFO, "Consensus", "Applying block %llu with %zu operations",
                 block->block_number, block->operation_count);
@@ -3167,10 +3177,11 @@ int apply_block(State *state, Block *block) {
         // Pass 2: Safe State Mutation (Only executed if all operations are validated)
         if (success == 0) {
             scl_db_begin_block_txn(); // Open libmdbx transaction batch
-            
+
             cache_pubkey(state, block->proposer_pubkey);
             for (size_t i = 0; i < block->operation_count; i++) {
                 Operation *op = &block->operations[i];
+                applied_ops = i; /* H-7 fix: record progress before applying op i */
                 
                 uint8_t op_key[COIN_ID_LEN];
                 const uint8_t *op_id = get_operation_tx_id(op);
@@ -3758,6 +3769,9 @@ int apply_block(State *state, Block *block) {
         }
     } else {
         fprintf(stderr, "[Consensus] ERROR: Block %llu application failed\n", block->block_number);
+        /* H-7 fix: reverse every in-memory mutation from this block so RAM matches
+         * the aborted database transaction (previously only the DB rolled back). */
+        consensus_undo_applied_operations(state, block, applied_ops);
     }
 
     // Commit collected nullifiers in a single pre-sorted batch transaction to DB
@@ -3782,8 +3796,92 @@ int apply_block(State *state, Block *block) {
     return success;
 }
 
-/* ============================================================================ */
-/* SECTION 12: Block Deallocation and Vote Validation                          */
+/* H-7 fix: reverse the in-memory side effects of the first `applied_ops` operations
+ * of `block` so RAM matches the aborted DB transaction. Mirrors the per-operation
+ * inversion used by the reorg rollback path (database.c). */
+static void consensus_undo_applied_operations(State *state, Block *block, size_t applied_ops) {
+    if (!state || !block || applied_ops == 0) return;
+
+    for (size_t j = applied_ops; j-- > 0; ) {
+        Operation *op = &block->operations[j];
+
+        if (op->type == OP_MINT_COIN) {
+            SCLCoin *coin = &op->data.mint_coin.coin;
+            hash_table_remove(state->bc.coin_table, coin->coin_id);
+            if (state->bc.insert_order_count > 0) {
+                state->bc.insert_order_count--;
+            }
+            pthread_mutex_lock(&state->game_state.mutex);
+            state->game_state.total_rewarded_scl_subunits -= coin->total_subunits;
+            state->game_state.remaining_scl_subunits += coin->total_subunits;
+            pthread_mutex_unlock(&state->game_state.mutex);
+            for (size_t ptr_idx = 0; ptr_idx < state->bc.pointer_table->size; ptr_idx++) {
+                GenericHashEntry *p_entry = state->bc.pointer_table->buckets[ptr_idx];
+                while (p_entry) {
+                    GenericHashEntry *next_entry = p_entry->next;
+                    if (p_entry->type == HASH_ENTRY_POINTER &&
+                        memcmp(p_entry->data.pointer.parent_coin_id, coin->coin_id, COIN_ID_LEN) == 0) {
+                        uint8_t p_key[COIN_ID_LEN];
+                        uint8_t p_parent[COIN_ID_LEN];
+                        memcpy(p_key, p_entry->key, COIN_ID_LEN);
+                        memcpy(p_parent, p_entry->data.pointer.parent_coin_id, COIN_ID_LEN);
+                        hash_table_remove(state->bc.pointer_table, p_key);
+                        remove_pointer_id_from_coin(state->bc.coin_pointers, p_parent, p_key);
+                    }
+                    p_entry = next_entry;
+                }
+            }
+        } else if (op->type == OP_TRANSFER_POINTER || op->type == OP_STAKE || op->type == OP_UNSTAKE) {
+            uint32_t n_inputs = 0;
+            Pointer *inputs = NULL;
+            if (op->type == OP_TRANSFER_POINTER) {
+                n_inputs = op->data.transfer_pointer.num_inputs;
+                inputs = op->data.transfer_pointer.inputs;
+            } else if (op->type == OP_STAKE) {
+                n_inputs = op->data.stake.num_inputs;
+                inputs = op->data.stake.inputs;
+            } else {
+                n_inputs = op->data.unstake.num_inputs;
+                inputs = op->data.unstake.inputs;
+            }
+            for (uint32_t k = 0; k < n_inputs; k++) {
+                Pointer *existing = hash_table_lookup(state->bc.pointer_table, inputs[k].pointer_id, false);
+                if (existing) existing->spent = 0;
+            }
+            const uint8_t *u_tx_id = get_operation_tx_id(op);
+            if (u_tx_id) {
+                for (size_t ptr_idx = 0; ptr_idx < state->bc.pointer_table->size; ptr_idx++) {
+                    GenericHashEntry *p_entry = state->bc.pointer_table->buckets[ptr_idx];
+                    while (p_entry) {
+                        GenericHashEntry *next_entry = p_entry->next;
+                        if (p_entry->type == HASH_ENTRY_POINTER &&
+                            memcmp(p_entry->data.pointer.prev_tx_hash, u_tx_id, COIN_ID_LEN) == 0) {
+                            uint8_t p_key[COIN_ID_LEN];
+                            uint8_t p_parent[COIN_ID_LEN];
+                            memcpy(p_key, p_entry->key, COIN_ID_LEN);
+                            memcpy(p_parent, p_entry->data.pointer.parent_coin_id, COIN_ID_LEN);
+                            hash_table_remove(state->bc.pointer_table, p_key);
+                            remove_pointer_id_from_coin(state->bc.coin_pointers, p_parent, p_key);
+                        }
+                        p_entry = next_entry;
+                    }
+                }
+            }
+        } else if (op->type == OP_REDEEM_CENTINEL) {
+            hash_table_remove(state->bc.centinel.nullifier_set, op->data.redeem_centinel.nullifier);
+        }
+
+        const uint8_t *undo_tx_id = get_operation_tx_id(op);
+        if (undo_tx_id) {
+            hash_table_remove(state->processed_txs, undo_tx_id);
+        }
+    }
+
+    state->bc.mmr_needs_rebuild = true;
+}
+
+/* ============================================================================
+ * SECTION 12: Block Deallocation and Vote Validation                          */
 /* ============================================================================ */
 /* Architectural Preface:
  * Provides deterministic memory teardown for Block envelopes, deallocating
@@ -4305,7 +4403,10 @@ int validate_operation(State *state, const Operation *op) {
             }
 
             if (!exists) {
-                exists = 1; // Stern ZK proof successfully established secret knowledge
+                /* H-5 fix: the inclusion check actually checks. A commitment that is
+                 * in neither the validation MMR nor the mempool no longer redeems. */
+                fprintf(stderr, "[Consensus] ERROR: Centinel commitment not found in MMR or mempool; rejecting redemption\n");
+                return 0;
             }
 
             return 1;
@@ -4432,7 +4533,27 @@ int validate_operation(State *state, const Operation *op) {
 
                 total_subunits += existing->end_subunit - existing->start_subunit + 1;
             }
-            
+
+            /* H-4 fix: verify every peer-supplied MMR inclusion proof against the
+             * local state root before this transfer may mutate the ledger. */
+            if (td->num_inputs > 0) {
+                uint8_t current_mmr_root[COIN_ID_LEN];
+                mmr_get_root(bc->mmr, current_mmr_root);
+                for (size_t pi = 0; pi < td->num_inputs; pi++) {
+                    SCLCoin *parent_coin = hash_table_lookup(bc->coin_table, td->inputs[pi].parent_coin_id, false);
+                    if (!parent_coin) {
+                        fprintf(stderr, "[Consensus] ERROR: Parent coin missing for MMR proof %zu\n", pi);
+                        return 0;
+                    }
+                    uint8_t proof_leaf[COIN_ID_LEN];
+                    hash_leaf(parent_coin->coin_id, parent_coin->remaining_subunits, proof_leaf);
+                    if (verify_mmr_proof(proof_leaf, &td->proofs[pi], current_mmr_root) != 1) {
+                        fprintf(stderr, "[Consensus] ERROR: MMR inclusion proof %zu failed verification against the state root\n", pi);
+                        return 0;
+                    }
+                }
+            }
+
             // Verify Merkle tree commitment over all spent input pointers
             uint8_t computed_merkle_root[COIN_ID_LEN];
             compute_inputs_merkle_root(td->inputs, td->num_inputs, computed_merkle_root);
