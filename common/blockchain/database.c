@@ -724,6 +724,11 @@ int scl_db_rollback_state_to_checkpoint(State *state, uint64_t checkpoint_height
         if (scl_db_get_block(h, &ser_block, &ser_len) == 0) {
             Block *b = calloc(1, sizeof(Block));
             if (b && deserialize_block(b, ser_block, ser_len) == 0) {
+                uint8_t (*rb_nullifiers)[NULLIFIER_LEN] = NULL;
+                size_t rb_nullifier_count = 0;
+                if (b->operation_count > 0) {
+                    rb_nullifiers = calloc((size_t)b->operation_count, NULLIFIER_LEN);
+                }
                 for (size_t i = b->operation_count; i-- > 0; ) {
                     Operation *op = &b->operations[i];
 
@@ -776,12 +781,24 @@ int scl_db_rollback_state_to_checkpoint(State *state, uint64_t checkpoint_height
                         }
                     } else if (op->type == OP_REDEEM_CENTINEL) {
                         hash_table_remove(state->bc.centinel.nullifier_set, op->data.redeem_centinel.nullifier);
+                        if (rb_nullifiers && rb_nullifier_count < (size_t)b->operation_count) {
+                            memcpy(rb_nullifiers[rb_nullifier_count++], op->data.redeem_centinel.nullifier, NULLIFIER_LEN);
+                        }
                     }
 
                     const uint8_t *tx_id = get_operation_tx_id(op);
                     if (tx_id) {
                         hash_table_remove(state->processed_txs, tx_id);
                     }
+                }
+
+                /* Persist the inversion: nullifiers spent in rolled-back blocks
+                 * must leave the disk set, or re-applying the replacement chain
+                 * fails forever on "Nullifier already spent (Disk hit)" in
+                 * validate_operation, pinning the node at the checkpoint height. */
+                if (rb_nullifiers) {
+                    scl_db_delete_nullifiers_batch(rb_nullifiers, rb_nullifier_count);
+                    free(rb_nullifiers);
                 }
 
                 uint8_t b_hash[COIN_ID_LEN];
@@ -1176,6 +1193,26 @@ int scl_db_write_nullifiers_batch(uint8_t (*nullifiers)[NULLIFIER_LEN], size_t c
     }
     fflush(nullifiers_file);
     return 0;
+#endif
+}
+
+int scl_db_delete_nullifiers_batch(uint8_t (*nullifiers)[NULLIFIER_LEN], size_t count) {
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && !defined(SCL_UNIT_TEST)
+    return 0;
+#endif
+    if (count == 0) return 0;
+
+#ifdef USE_MDBX
+    MDBX_txn *txn = NULL;
+    if (mdbx_txn_begin(db_env, NULL, 0, &txn) != MDBX_SUCCESS) return -1;
+
+    for (size_t i = 0; i < count; i++) {
+        MDBX_val key = { (void*)nullifiers[i], NULLIFIER_LEN };
+        mdbx_del(txn, nullifiers_dbi, &key, NULL);
+    }
+    return (mdbx_txn_commit(txn) == MDBX_SUCCESS) ? 0 : -1;
+#else
+    return 0; // Flat-file fallback append-only (mirrors scl_db_delete_blocks_after)
 #endif
 }
 
