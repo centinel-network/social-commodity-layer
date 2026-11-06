@@ -42,6 +42,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include "crypto.h"
 #include "network.h"
 #include "constants.h"
@@ -967,12 +968,17 @@ int create_peer_wallet(PeerWallet *pw) {
  */
 int save_user_wallet(const UserWallet *uw, const char *filepath) {
     if (!uw || !filepath) return -1;
+#if !defined(_WIN32)
+    /* Race-free fix: create the file with 0600 from the very first inode, then
+     * re-assert via the descriptor — no pathname race, no world-readable window. */
+    int fd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return -1;
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { close(fd); return -1; }
+    (void)fchmod(fd, 0600);
+#else
     FILE *f = fopen(filepath, "wb");
     if (!f) return -1;
-    
-    // Ensure restrictive file permissions for private keys on Unix systems
-#ifndef _WIN32
-    chmod(filepath, 0600);
 #endif
     // Serialize Dilithium public key, Dilithium private key, and PRF key
     fwrite(uw->dilithium_pubkey, 1, DILITHIUM_PUBKEY_LEN, f);
@@ -4677,6 +4683,13 @@ crypto_error_t generate_zk_prf_proof(uint8_t *proof, size_t *proof_len,
         return CRYPTO_ERROR_INVALID_PARAM;
     }
 
+    /* Stack-overflow fix: fs_input has room for PRF_L (128) bytes of PRF input;
+     * anything larger must never reach the fixed 192-byte staging buffer. */
+    if (input_len > PRF_L) {
+        arena_reset(fn_mark);
+        return CRYPTO_ERROR_INVALID_PARAM;
+    }
+
     // 1. Decoupled CRS Matrix Generation
     polyvec_t A_vec;
     if (polyvec_init_arena(&A_vec, PRF_K) != CRYPTO_SUCCESS) {
@@ -5012,6 +5025,13 @@ int zk_prf_verify(const uint8_t *proof, size_t proof_len,
     size_t fn_mark = arena_mark();
     
     if (!proof || !seed || !prf_input || input_len == 0 || !y) {
+        arena_reset(fn_mark);
+        return CRYPTO_ERROR_INVALID_PARAM;
+    }
+
+    /* Stack-overflow fix: fs_input has room for PRF_L (128) bytes of PRF input;
+     * anything larger must never reach the fixed 192-byte staging buffer. */
+    if (input_len > PRF_L) {
         arena_reset(fn_mark);
         return CRYPTO_ERROR_INVALID_PARAM;
     }
@@ -5621,9 +5641,10 @@ int derive_labeled_key(const uint8_t *shared_secret, const char *label, uint8_t 
  * @complexity Time: O(plaintext_len), Space: O(1) stack context.
  */
 int encrypt_aead_packet(const uint8_t *aes_key, uint64_t packet_num, const uint8_t *plaintext,
-                        size_t plaintext_len, uint8_t *ciphertext, size_t *ciphertext_len) {
+                        size_t plaintext_len, uint8_t *ciphertext, size_t *ciphertext_len,
+                        const uint8_t *aad, size_t aad_len) {
 #if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && !defined(SCL_UNIT_TEST)
-    (void)aes_key; (void)packet_num;
+    (void)aes_key; (void)packet_num; (void)aad; (void)aad_len;
     if (!plaintext || !ciphertext || !ciphertext_len || plaintext_len > MAX_MESSAGE_SIZE) return -1;
     memcpy(ciphertext, plaintext, plaintext_len);
     memset(ciphertext + plaintext_len, 0x42, 16);
@@ -5641,6 +5662,16 @@ int encrypt_aead_packet(const uint8_t *aes_key, uint64_t packet_num, const uint8
     EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);
     EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL);
     EVP_EncryptInit_ex(ctx, NULL, NULL, aes_key, iv);
+
+    /* H-1 fix: bind the packet header + fragment metadata (all bytes preceding the
+     * ciphertext) as AAD so on-path splicing into wrong reassembly slots fails. */
+    if (aad && aad_len > 0) {
+        int aad_out = 0;
+        if (EVP_EncryptUpdate(ctx, NULL, &aad_out, aad, aad_len) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return -1;
+        }
+    }
 
     int len = 0;
     EVP_EncryptUpdate(ctx, ciphertext, &len, plaintext, plaintext_len);
@@ -5679,10 +5710,13 @@ int encrypt_aead_packet(const uint8_t *aes_key, uint64_t packet_num, const uint8
  * @complexity Time: O(ciphertext_len), Space: O(1) stack context.
  */
 int decrypt_aead_packet(const uint8_t *aes_key, uint64_t packet_num, const uint8_t *ciphertext,
-                        size_t ciphertext_len, uint8_t *plaintext, size_t *plaintext_len) {
+                        size_t ciphertext_len, uint8_t *plaintext, size_t *plaintext_len,
+                        const uint8_t *aad, size_t aad_len) {
 #if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && !defined(SCL_UNIT_TEST)
     (void)packet_num;
     (void)aes_key;
+    (void)aad;
+    (void)aad_len;
     if (!ciphertext || !plaintext || !plaintext_len) return -1;
     if (ciphertext_len < 16 || (ciphertext_len - 16) > MAX_MESSAGE_SIZE) return -1;
     *plaintext_len = ciphertext_len - 16;
@@ -5732,6 +5766,16 @@ int decrypt_aead_packet(const uint8_t *aes_key, uint64_t packet_num, const uint8
         fprintf(stderr, "[Crypto] ERROR: Failed to set key and IV\n");
         EVP_CIPHER_CTX_free(ctx);
         return -1;
+    }
+
+    /* H-1 fix: verify the AAD (header + fragment metadata) exactly as bound by the sender. */
+    if (aad && aad_len > 0) {
+        int aad_out = 0;
+        if (EVP_DecryptUpdate(ctx, NULL, &aad_out, aad, aad_len) != 1) {
+            fprintf(stderr, "[Crypto] ERROR: AAD authentication failed\n");
+            EVP_CIPHER_CTX_free(ctx);
+            return -1;
+        }
     }
 
     // Decrypt data
