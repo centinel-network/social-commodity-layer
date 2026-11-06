@@ -677,6 +677,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     fuzz_conn->tx_dispatched_data = 0;
     memcpy(fuzz_conn->current_aes_gcm_key, dummy_aes_key, 32);
     memcpy(fuzz_conn->flight3_aes_gcm_key, expected_flight3_key, 32);
+    memcpy(fuzz_conn->rx_aes_gcm_key, dummy_aes_key, 32);
+    memcpy(fuzz_conn->rx_flight3_aes_gcm_key, expected_flight3_key, 32);
     memset(fuzz_conn->rpc_siphash_key, 0x42, 16);
     atomic_store(&fuzz_conn->rpc_token_budget, 1000000);
     atomic_store(&fuzz_conn->last_rpc_token_refill, get_time_ms());
@@ -950,7 +952,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             memcpy(raw_packet + 1 + SCL_CID_LEN, &pn_be, 8);
 
             size_t ct_len = 0;
-            encrypt_aead_packet(fuzz_conn->current_aes_gcm_key, pkt_num - 1, payload_to_encrypt, payload_to_encrypt_len, raw_packet + SCL_HEADER_MIN_LEN, &ct_len);
+            encrypt_aead_packet(fuzz_conn->current_aes_gcm_key, pkt_num - 1, payload_to_encrypt, payload_to_encrypt_len, raw_packet + SCL_HEADER_MIN_LEN, &ct_len, raw_packet, SCL_HEADER_MIN_LEN);
             raw_len = SCL_HEADER_MIN_LEN + ct_len;
 
             uint32_t head = atomic_load_explicit(&fuzz_conn->l5_rx_queue.head, memory_order_relaxed);
@@ -991,7 +993,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 memcpy(raw_packet + SCL_HEADER_MIN_LEN + 10, &fi_be, 2);
 
                 size_t ct_len = 0;
-                encrypt_aead_packet(fuzz_conn->current_aes_gcm_key, pkt_num - 1, payload_to_encrypt, payload_to_encrypt_len, raw_packet + SCL_HEADER_MIN_LEN + 12, &ct_len);
+                encrypt_aead_packet(fuzz_conn->current_aes_gcm_key, pkt_num - 1, payload_to_encrypt, payload_to_encrypt_len, raw_packet + SCL_HEADER_MIN_LEN + 12, &ct_len, raw_packet, SCL_HEADER_MIN_LEN + 12);
                 raw_len = SCL_HEADER_MIN_LEN + 12 + ct_len;
 
                 uint32_t head = atomic_load_explicit(&fuzz_conn->l5_rx_queue.head, memory_order_relaxed);
@@ -1065,7 +1067,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             memcpy(raw_packet + 1 + SCL_CID_LEN, &pn_be, 8);
 
             size_t ct_len = 0;
-            encrypt_aead_packet(fuzz_conn->current_aes_gcm_key, pkt_num - 1, ctrl_frame, ctrl_frame_len, raw_packet + SCL_HEADER_MIN_LEN, &ct_len);
+            encrypt_aead_packet(fuzz_conn->current_aes_gcm_key, pkt_num - 1, ctrl_frame, ctrl_frame_len, raw_packet + SCL_HEADER_MIN_LEN, &ct_len, raw_packet, SCL_HEADER_MIN_LEN);
             raw_len = SCL_HEADER_MIN_LEN + ct_len;
 
             uint32_t head = atomic_load_explicit(&fuzz_conn->l5_rx_queue.head, memory_order_relaxed);
