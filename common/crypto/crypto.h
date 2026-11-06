@@ -216,7 +216,8 @@ int derive_labeled_key(const uint8_t *shared_secret, const char *label, uint8_t 
  * @complexity Time: O(plaintext_len), Space: O(1).
  */
 int encrypt_aead_packet(const uint8_t *aes_key, uint64_t packet_num, const uint8_t *plaintext,
-                        size_t plaintext_len, uint8_t *ciphertext, size_t *ciphertext_len);
+                        size_t plaintext_len, uint8_t *ciphertext, size_t *ciphertext_len,
+                        const uint8_t *aad, size_t aad_len);
 
 /**
  * @brief Decrypts an authenticated AEAD packet using an implicit packet-number nonce.
@@ -232,7 +233,8 @@ int encrypt_aead_packet(const uint8_t *aes_key, uint64_t packet_num, const uint8
  * @complexity Time: O(ciphertext_len), Space: O(1).
  */
 int decrypt_aead_packet(const uint8_t *aes_key, uint64_t packet_num, const uint8_t *ciphertext,
-                        size_t ciphertext_len, uint8_t *plaintext, size_t *plaintext_len);
+                        size_t ciphertext_len, uint8_t *plaintext, size_t *plaintext_len,
+                        const uint8_t *aad, size_t aad_len);
 
 /**
  * @brief Evaluates 64-bit SipHash-2-4 over an input byte slice.
