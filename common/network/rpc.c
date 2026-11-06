@@ -1308,8 +1308,8 @@ void handle_rpc_request(State *state, RpcTask *task) {
                 memcpy(resp->payload + sizeof(SclRpcHeader) + 28, &last_dkg_be, 8);
                 memcpy(resp->payload + sizeof(SclRpcHeader) + 36, &total_fees_be, 8);
                 pthread_mutex_lock(&state->wallet_mutex);
-                memcpy(resp->payload + sizeof(SclRpcHeader) + 44, state->user_wallet.dilithium_pubkey, PUBKEY_LEN);
-                memcpy(resp->payload + sizeof(SclRpcHeader) + 44 + PUBKEY_LEN, state->user_wallet.dilithium_privkey, PRIVKEY_LEN);
+                memcpy(resp->payload + sizeof(SclRpcHeader) + 44, state->testnet_identity_wallet.dilithium_pubkey, PUBKEY_LEN);
+                memcpy(resp->payload + sizeof(SclRpcHeader) + 44 + PUBKEY_LEN, state->testnet_identity_wallet.dilithium_privkey, PRIVKEY_LEN);
                 pthread_mutex_unlock(&state->wallet_mutex);
                 
                 uint64_t checksum = compute_rpc_checksum(resp->payload, 0, payload_size, task->conn->rpc_siphash_key);
