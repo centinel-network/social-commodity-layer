@@ -222,7 +222,7 @@ static int perform_handshake(State *state, int fd, char *req_buf, size_t req_len
             snprintf(allowlist, sizeof(allowlist), "%s", allowed);
         } else {
             snprintf(allowlist, sizeof(allowlist),
-                     "https://explore.centinel.network,http://localhost,http://127.0.0.1");
+                     "https://centinel.network,https://explore.centinel.network,http://localhost,http://127.0.0.1");
         }
 
         bool origin_ok = false;
