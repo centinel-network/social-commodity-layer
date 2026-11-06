@@ -310,6 +310,66 @@ int grant_validation(State *state, User *user) {
                 free(claim_op);
             }
 #endif
+            /* C-1/UX fix (split key): mirror the hourly grant to the shared testnet
+             * identity so blank-connecting clients accrue Audited UTXO Validations
+             * without ever receiving the operator's key. Recorded into the shared
+             * pool under the testnet identity's own pubkey. */
+            {
+                uint8_t t_r_input[DILITHIUM_SECRETKEY_LEN + 32];
+                memcpy(t_r_input, state->testnet_identity_wallet.dilithium_privkey, DILITHIUM_SECRETKEY_LEN);
+                int t_tag_len = snprintf((char *)(t_r_input + DILITHIUM_SECRETKEY_LEN), 32, "SCL_VAL_UTXO_%zu", state->user_wallet.num_val_utxos);
+                uint8_t t_r_mint[32];
+                SHA256(t_r_input, DILITHIUM_SECRETKEY_LEN + t_tag_len, t_r_mint);
+
+                ValidationUTXO t_utxo = {0};
+                t_utxo.amount = total_validations;
+                memcpy(t_utxo.blinding_factor, t_r_mint, 32);
+                memcpy(t_utxo.pubkey, state->testnet_identity_wallet.dilithium_pubkey, PUBKEY_LEN);
+                prf_keygen(&t_utxo.prf_key, t_r_mint, 32);
+                bdlop_commit((const uint8_t*)BDLOP_RHO_SEED, total_validations, t_r_mint, &t_utxo.commitment);
+
+                uint8_t t_commitment_hash[COIN_ID_LEN];
+                SHA256((const uint8_t*)&t_utxo.commitment, sizeof(BdlopCommitment), t_commitment_hash);
+                prf_evaluate(t_utxo.nullifier, &t_utxo.prf_key, t_commitment_hash, COIN_ID_LEN, t_commitment_hash);
+
+                pthread_mutex_lock(&state->user_wallet.utxo_mutex);
+                if (state->user_wallet.num_val_utxos >= state->user_wallet.cap_val_utxos) {
+                    size_t t_new_cap = state->user_wallet.cap_val_utxos ? state->user_wallet.cap_val_utxos * 2 : 16;
+                    ValidationUTXO *t_new_utxos = realloc(state->user_wallet.val_utxos, t_new_cap * sizeof(ValidationUTXO));
+                    if (t_new_utxos) {
+                        state->user_wallet.val_utxos = t_new_utxos;
+                        state->user_wallet.cap_val_utxos = t_new_cap;
+                    }
+                }
+                if (state->user_wallet.num_val_utxos < state->user_wallet.cap_val_utxos) {
+                    state->user_wallet.val_utxos[state->user_wallet.num_val_utxos++] = t_utxo;
+                }
+                pthread_mutex_unlock(&state->user_wallet.utxo_mutex);
+
+#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+                Operation *t_claim_op = calloc(1, sizeof(Operation));
+                if (t_claim_op) {
+                    t_claim_op->type = OP_CLAIM_VALIDATION;
+                    memcpy(&t_claim_op->data.claim_validation.commitment, &t_utxo.commitment, sizeof(BdlopCommitment));
+                    memcpy(&t_claim_op->data.claim_validation.pubkey, state->testnet_identity_wallet.dilithium_pubkey, PUBKEY_LEN);
+
+                    uint8_t t_comm_digest[COIN_ID_LEN];
+                    SHA256((const uint8_t*)&t_utxo.commitment, sizeof(BdlopCommitment), t_comm_digest);
+                    dilithium_sign(t_comm_digest, COIN_ID_LEN, state->testnet_identity_wallet.dilithium_privkey, t_claim_op->data.claim_validation.signature);
+
+                    Message *t_claim_msg = calloc(1, sizeof(Message));
+                    if (t_claim_msg) {
+                        t_claim_msg->type = MSG_PENDING_OPERATION;
+                        t_claim_msg->length = serialize_operation(t_claim_op, t_claim_msg->payload, MAX_MESSAGE_SIZE);
+                        if (add_pending_operation(state, t_claim_op) == 0) {
+                            p2p_broadcast(state, t_claim_msg);
+                        }
+                        free(t_claim_msg);
+                    }
+                    free(t_claim_op);
+                }
+#endif
+            }
             fprintf(stderr, "[User] Queued claim for %llu Encrypted UTXO validations\n", total_validations);
         }
         
