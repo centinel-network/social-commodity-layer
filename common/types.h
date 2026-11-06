@@ -406,8 +406,10 @@ typedef struct __attribute__((aligned(64))) SclConnection {
 
     /* --- 4. Cryptographic Session State --- */
     struct __attribute__((aligned(64))) {
-        uint8_t current_aes_gcm_key[32];               /** 256-bit symmetric AES-GCM session key for 1-RTT traffic. */
-        uint8_t flight3_aes_gcm_key[32];               /** 256-bit intermediate key encrypting Flight 3 handshake slabs. */
+        uint8_t current_aes_gcm_key[32];               /** 256-bit AES-GCM key encrypting OUR outbound 1-RTT traffic (per-direction; H-1 fix). */
+        uint8_t flight3_aes_gcm_key[32];               /** 256-bit AES-GCM key encrypting OUR outbound Flight 3 handshake slabs (per-direction; H-1 fix). */
+        uint8_t rx_aes_gcm_key[32];                    /** 256-bit AES-GCM key decrypting PEER-originated 1-RTT traffic (per-direction; H-1 fix). */
+        uint8_t rx_flight3_aes_gcm_key[32];            /** 256-bit AES-GCM key decrypting PEER Flight 3 handshake slabs (per-direction; H-1 fix). */
         uint8_t ephemeral_kyber_pubkey[KYBER_PUBKEY_LEN];   /** Ephemeral Kyber-512 public key for forward secrecy. */
         uint8_t ephemeral_kyber_privkey[KYBER_SECRETKEY_LEN];/** Ephemeral Kyber-512 private key (wiped post-handshake). */
         uint8_t handshake_token[64];                   /** Anti-amplification token reflecting server stateless cookie. */
@@ -1767,6 +1769,7 @@ typedef struct State {
         User *users;                                   /** Pre-allocated array of User structures. */
         size_t user_count;                             /** Active user count in `users`. */
         UserWallet user_wallet;                        /** Master wallet state of the local node operator. */
+        UserWallet testnet_identity_wallet;            /** Disposable testnet identity served to blank-connect clients — never the operator/staking key (C-1 fix). */
         Queue submission_queue;                        /** Queue serializing local valuation proposals. */
         _Atomic(uint64_t) scheduled_consumed_subunits; /** Subunits locked in pending outbound liquid transfers. */
         _Atomic(uint64_t) scheduled_staked_subunits;   /** Subunits locked in pending outbound unstaking requests. */
