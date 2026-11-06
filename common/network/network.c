@@ -8903,9 +8903,22 @@ struct SclTransportShim* scl_userspace_shim_create(const char *ip, int port) {
     // Disable OS-level IP fragmentation to ensure exact SCL_MAX_UDP_PAYLOAD MTU enforcement.
     // Prevents silent AEAD framing corruption on restrictive consumer network routes.
 #if defined(__linux__)
-    int pmtu = IP_PMTUDISC_DO;
-    if (setsockopt(state->udp_socket, IPPROTO_IP, IP_MTU_DISCOVER, &pmtu, sizeof(pmtu)) < 0) {
-        fprintf(stderr, "[Shim] WARNING: setsockopt IP_MTU_DISCOVER failed\n");
+    if (domain == AF_INET6) {
+        /* Dual-stack socket: IPV6_MTU_DISCOVER governs native IPv6 sends, while
+         * IP_MTU_DISCOVER still configures the IPv4 path used by v4-mapped sends. */
+        int pmtu6 = IPV6_PMTUDISC_DO;
+        if (setsockopt(state->udp_socket, IPPROTO_IPV6, IPV6_MTU_DISCOVER, &pmtu6, sizeof(pmtu6)) < 0) {
+            fprintf(stderr, "[Shim] WARNING: setsockopt IPV6_MTU_DISCOVER failed\n");
+        }
+        int pmtu4 = IP_PMTUDISC_DO;
+        if (setsockopt(state->udp_socket, IPPROTO_IP, IP_MTU_DISCOVER, &pmtu4, sizeof(pmtu4)) < 0) {
+            fprintf(stderr, "[Shim] WARNING: setsockopt IP_MTU_DISCOVER failed\n");
+        }
+    } else {
+        int pmtu = IP_PMTUDISC_DO;
+        if (setsockopt(state->udp_socket, IPPROTO_IP, IP_MTU_DISCOVER, &pmtu, sizeof(pmtu)) < 0) {
+            fprintf(stderr, "[Shim] WARNING: setsockopt IP_MTU_DISCOVER failed\n");
+        }
     }
 #elif defined(_WIN32)
     DWORD dont_frag = 1;
@@ -8913,7 +8926,18 @@ struct SclTransportShim* scl_userspace_shim_create(const char *ip, int port) {
         fprintf(stderr, "[Shim] WARNING: setsockopt IP_DONTFRAGMENT failed\n");
     }
 #elif defined(__APPLE__) || defined(__FreeBSD__)
-    if (domain == AF_INET) {
+    if (domain == AF_INET6) {
+        /* IPV6_DONTFRAG is not exported by all BSD SDKs (notably Apple's), and
+         * native IPv6 never fragments datagrams at or below the 1280-byte
+         * minimum MTU (SCL_MAX_UDP_PAYLOAD is 1232), so a missing macro is a
+         * safe no-op. Compile the option only where the SDK defines it. */
+#ifdef IPV6_DONTFRAG
+        int dont_frag6 = 1;
+        if (setsockopt(state->udp_socket, IPPROTO_IPV6, IPV6_DONTFRAG, &dont_frag6, sizeof(dont_frag6)) < 0) {
+            fprintf(stderr, "[Shim] WARNING: setsockopt IPV6_DONTFRAG failed\n");
+        }
+#endif
+    } else {
         int dont_frag = 1;
         if (setsockopt(state->udp_socket, IPPROTO_IP, IP_DONTFRAG, &dont_frag, sizeof(dont_frag)) < 0) {
             fprintf(stderr, "[Shim] WARNING: setsockopt IP_DONTFRAG failed\n");
