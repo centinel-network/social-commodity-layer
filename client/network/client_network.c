@@ -83,7 +83,12 @@ static void *blockchain_sync_worker(void *arg) {
         scl_db_rollback_state_to_checkpoint(args->state, checkpoint_height, fork_height);
 
         args->state->current_block_number = checkpoint_height;
-        args->state->bc.sync_epoch = checkpoint_height;
+        args->state->bc.sync_epoch = checkpoint_height + 1;
+        /* Un-gate block proposal: the liveness target must follow the deliberate
+         * head reset. Otherwise current < network_target_block_number blocks every
+         * proposer gate (consensus.c, client.c watchdog) until a process restart -
+         * the exact "frozen until nodes are restarted" symptom. */
+        args->state->network_target_block_number = checkpoint_height;
         
         if (checkpoint_height == 0) {
             // Re-create and apply standard genesis block if rolled back to zero
