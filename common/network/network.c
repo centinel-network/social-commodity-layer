@@ -928,7 +928,7 @@ void scl_l4_detect_lost_packets(SclConnection *conn, uint64_t now, State *state,
                             memcpy(tx_buf + SCL_HEADER_MIN_LEN, to_process->raw_packet + SCL_HEADER_MIN_LEN, 76);
                             
                             size_t out_len_frag = 0;
-                            encrypt_aead_packet(conn->flight3_aes_gcm_key, new_pkt_num, to_process->raw_packet + SCL_HEADER_MIN_LEN + 76, chunk, tx_buf + SCL_HEADER_MIN_LEN + 76, &out_len_frag);
+                            encrypt_aead_packet(conn->flight3_aes_gcm_key, new_pkt_num, to_process->raw_packet + SCL_HEADER_MIN_LEN + 76, chunk, tx_buf + SCL_HEADER_MIN_LEN + 76, &out_len_frag, tx_buf, SCL_HEADER_MIN_LEN + 76);
                             
                             size_t total_sent_retrans = SCL_HEADER_MIN_LEN + 76 + out_len_frag;
                             commit_tx_buffer_relayed(conn, tx_token, total_sent_retrans, &conn->current_path);
@@ -947,7 +947,7 @@ void scl_l4_detect_lost_packets(SclConnection *conn, uint64_t now, State *state,
                             memcpy(tx_buf + SCL_HEADER_MIN_LEN, to_process->raw_packet + SCL_HEADER_MIN_LEN, 12);
                                         
                             size_t out_len_frag = 0;
-                            encrypt_aead_packet(conn->current_aes_gcm_key, new_pkt_num, to_process->raw_packet + SCL_HEADER_MIN_LEN + 12, chunk, tx_buf + SCL_HEADER_MIN_LEN + 12, &out_len_frag);
+                            encrypt_aead_packet(conn->current_aes_gcm_key, new_pkt_num, to_process->raw_packet + SCL_HEADER_MIN_LEN + 12, chunk, tx_buf + SCL_HEADER_MIN_LEN + 12, &out_len_frag, tx_buf, SCL_HEADER_MIN_LEN + 12);
                                         
                             size_t total_sent_retrans = SCL_HEADER_MIN_LEN + 12 + out_len_frag;
                             commit_tx_buffer_relayed(conn, tx_token, total_sent_retrans, &conn->current_path);
@@ -979,7 +979,7 @@ void scl_l4_detect_lost_packets(SclConnection *conn, uint64_t now, State *state,
                             memcpy(tx_buf + 1 + SCL_CID_LEN, &pn_be, 8);
                                                                 
                             size_t out_len = 0;
-                            encrypt_aead_packet(conn->current_aes_gcm_key, new_pkt_num, to_process->raw_packet + SCL_HEADER_MIN_LEN, chunk, tx_buf + SCL_HEADER_MIN_LEN, &out_len);
+                            encrypt_aead_packet(conn->current_aes_gcm_key, new_pkt_num, to_process->raw_packet + SCL_HEADER_MIN_LEN, chunk, tx_buf + SCL_HEADER_MIN_LEN, &out_len, tx_buf, SCL_HEADER_MIN_LEN);
                                                                 
                             size_t total_sent_retrans = SCL_HEADER_MIN_LEN + out_len;
                             commit_tx_buffer_relayed(conn, tx_token, total_sent_retrans, &conn->current_path);
@@ -1394,7 +1394,7 @@ void send_l4_ack(SclConnection *conn, uint64_t acked_pkt, uint64_t rx_time) {
         memcpy(tx_buf + 1 + SCL_CID_LEN, &pn_be, 8);
 
         size_t out_len;
-        encrypt_aead_packet(conn->current_aes_gcm_key, new_pkt_num, payload, payload_len, tx_buf + SCL_HEADER_MIN_LEN, &out_len);
+        encrypt_aead_packet(conn->current_aes_gcm_key, new_pkt_num, payload, payload_len, tx_buf + SCL_HEADER_MIN_LEN, &out_len, tx_buf, SCL_HEADER_MIN_LEN);
 
         free(payload);
         global_shim->commit_tx_buffer(global_shim, tx_token, SCL_HEADER_MIN_LEN + out_len, conn->cid, &conn->current_path);
@@ -1443,7 +1443,7 @@ void generate_stateless_token(const uint8_t *node_secret, const uint8_t *shared_
     
     uint8_t ciphertext[64];
     size_t ct_len;
-    encrypt_aead_packet(derived_key, random_iv, shared_secret, KYBER_SHARED_SECRET_LEN, ciphertext, &ct_len);
+    encrypt_aead_packet(derived_key, random_iv, shared_secret, KYBER_SHARED_SECRET_LEN, ciphertext, &ct_len, NULL, 0);
     
     // Wire encoding: Expiry(8) || RandomIV(8) || Ciphertext+Tag(48) = 64 bytes
     memcpy(token_out, &expiry, 8);
@@ -1485,7 +1485,7 @@ int verify_stateless_token(const uint8_t *node_secret, const uint8_t *token_in, 
     SHA256(key_input, sizeof(key_input), derived_key);
     
     size_t pt_len;
-    if (decrypt_aead_packet(derived_key, random_iv, token_in + 16, 48, shared_secret_out, &pt_len) != 0) {
+    if (decrypt_aead_packet(derived_key, random_iv, token_in + 16, 48, shared_secret_out, &pt_len, NULL, 0) != 0) {
         return -1;
     }
     return (pt_len == KYBER_SHARED_SECRET_LEN) ? 0 : -1;
@@ -1871,6 +1871,8 @@ void scl_connection_destroy_now(SclConnection *conn) {
     // Cryptographically wipe secret keys
     explicit_bzero(conn->current_aes_gcm_key, 32);
     explicit_bzero(conn->flight3_aes_gcm_key, 32);
+    explicit_bzero(conn->rx_aes_gcm_key, 32);
+    explicit_bzero(conn->rx_flight3_aes_gcm_key, 32);
     explicit_bzero(conn->ephemeral_kyber_privkey, KYBER_SECRETKEY_LEN);
 
     // Update global accounting counters
