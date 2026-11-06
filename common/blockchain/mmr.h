@@ -260,6 +260,20 @@ int verify_mmr_proof(const uint8_t *leaf_hash, const MMRProof *proof, const uint
 int mmr_update_leaf_with_proof(MMR *mmr, const uint8_t *coin_id, uint64_t old_subunits, uint64_t new_subunits, const MMRProof *proof);
 
 /**
+ * @brief Updates a leaf balance and its ancestors using LOCAL tree digests only.
+ *
+ * @details H-4 fix: rehashes the leaf-to-peak path from the node's own child
+ * digests; peer-supplied MMRProof path hashes can never define the apex.
+ *
+ * @param[in,out] mmr Pointer to @ref MMR structure.
+ * @param[in] coin_id 32-byte coin identifier of the leaf being updated.
+ * @param[in] old_subunits Previous subunit balance used to locate the leaf index.
+ * @param[in] new_subunits Updated subunit balance to commit into the leaf.
+ * @return 0 on success; -1 if the leaf cannot be located or the tree is inconsistent.
+ */
+int mmr_update_leaf_local(MMR *mmr, const uint8_t *coin_id, uint64_t old_subunits, uint64_t new_subunits);
+
+/**
  * @brief Prunes finalized historical non-peak nodes from memory and disk storage.
  *
  * @details
