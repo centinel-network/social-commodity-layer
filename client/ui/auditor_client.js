@@ -473,7 +473,10 @@ class SclAuditorClient {
         this.manualDisconnect = false;
 
         try {
-            this.socket = new WebSocket(this.wsUrl);
+            // H-2 fix: the SCL402 bearer token rides as the second WebSocket subprotocol
+            // entry (browsers cannot set Authorization headers on upgrades).
+            const bridgeToken = (typeof window !== 'undefined' && window.SCL_BRIDGE_TOKEN) ? window.SCL_BRIDGE_TOKEN : '';
+            this.socket = bridgeToken ? new WebSocket(this.wsUrl, ['SCL402', bridgeToken]) : new WebSocket(this.wsUrl);
             this.socket.binaryType = 'arraybuffer';
             const socketRef = this.socket;
 
