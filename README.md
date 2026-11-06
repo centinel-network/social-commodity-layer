@@ -1,6 +1,6 @@
 # Centinel Network Node
 
-Welcome to the **Centinel Network** project! This repository contains the core node client (`satocialist_client`), advanced cryptographic fuzzers and a proprietary UDP-based peer-to-peer transport layer.
+Welcome to the **Centinel Network** project! This repository contains the core node client (`satocialist_client`), advanced cryptographic fuzzers, and a proprietary UDP-based peer-to-peer transport layer.
 
 > **⚠️ Platform Support Notice:**
 > The Centinel Network codebase is written in highly portable C/C++ and is inherently designed to be cross-platform (supporting Linux, Windows, etc.). However, due to current limited testing resources, this repository and deployment guide are **designed and tested exclusively for macOS**. If you are on Linux or Windows, the code should compile, but your mileage may vary. We highly welcome community contributions to validate and document execution on other operating systems!
@@ -73,25 +73,49 @@ docker build -t satocialist-node .
 ```
 
 ### 2. Run the Container
-The transport protocol operates heavily over UDP, so you must expose the configured port as a UDP port.
+
+The transport protocol relies heavily on UDP, so the configured port must be exposed as a UDP port.
 
 ```bash
 docker run -d \
   --name satocialist-bootstrap \
   -p 5555:5555/udp \
+  -p 5554:5554/tcp \
   -p 8000:8000/tcp \
   -v satocialist_data:/data/satocialist \
   satocialist-node -i 0.0.0.0 -p 5555 -l info
 ```
 
+Seed nodes that sit behind the public explorer must additionally publish the P2P UDP port (the `-p 5555:5555/udp` mapping shown above) so that seeds can dial one another, and must expose the WebSocket bridge via the following environment variables:
+
+```bash
+-e SCL_BRIDGE_BIND_PUBLIC=1 \
+-e SCL_BRIDGE_AUTH_TOKEN=<same token as window.SCL_BRIDGE_TOKEN in index.html> \
+-e SCL_BRIDGE_ALLOWED_ORIGINS=https://centinel.network,https://explore.centinel.network
+```
+
+Also, open the P2P port between the seed VMs (and to them) by creating a firewall rule:
+
+```bash
+gcloud compute firewall-rules create scl-allow-p2p \
+  --allow udp:5555 \
+  --source-ranges 0.0.0.0/0
+```
+
+Without UDP 5555 reachability, every seed remains isolated.
+
 ### 3. Tuning Host OS UDP Buffers (Crucial for Docker)
-To prevent silent packet drops during dense Distributed Key Generation (DKG) phases, ensure your host OS allows large socket buffers.
+
+To prevent silent packet drops during dense Distributed Key Generation (DKG) phases, ensure the host OS permits large socket buffers.
 
 **On macOS:**
+
 ```bash
 sudo sysctl -w kern.ipc.maxsockbuf=16777216
 ```
+
 **On Linux (if applicable):**
+
 ```bash
 sudo sysctl -w net.core.rmem_max=33554432
 sudo sysctl -w net.core.wmem_max=33554432
@@ -108,91 +132,9 @@ Ensure your project directory looks like this:
 project_root/
 ├── CMakeLists.txt
 ├── Dockerfile
-├── Dockerfile.wasm
-├── build_wasm.sh
-├── build_wasm_mac.sh
 ├── satocialist.conf
-│
-├── tests/
-│   ├── benchmark_tests.c
-│   ├── test_rpc_pipelines.c
-│   ├── test_coalition_resistance.c
-│   ├── unit_tests.c
-│   ├── test_quantum_tvd.c
-│
 ├── common/
-│   ├── constants.h
-│   ├── types.h
-│   ├── utils.h
-│   ├── utils.c
-│   │
-│   ├── user/
-│   │   ├── user.c
-│   │   └── user.h
-│   │
-│   ├── blockchain/
-│   │   ├── database.c
-│   │   ├── database.h
-│   │   ├── blockchain.c
-│   │   ├── blockchain.h
-│   │   ├── hash_table.c
-│   │   ├── hash_table.h
-│   │   ├── mmr.c
-│   │   └── mmr.h
-│   │
-│   ├── network/
-│   │   ├── protocol.c
-│   │   ├── protocol.h
-│   │   ├── queue.c
-│   │   ├── queue.h
-│   │   ├── network.c
-│   │   ├── network.h
-│   │   ├── rpc.h
-│   │   ├── rpc.c
-│   │   ├── scl_rpc_ffi.c
-│   │   ├── scl_rpc_ffi_export.h
-│   │   ├── websocket_bridge.c
-│   │   ├── websocket_bridge.h
-│   │   └── quantum_tvd_rpc.c
-│   │
-│   ├── crypto/
-│   │   ├── crypto.c
-│   │   ├── crypto.h
-│   │   ├── quantum_qsim.cpp
-│   │   ├── quantum_qsim.h
-│   │   ├── quantum_tvd.h
-│   │   └── quantum_tvd.cpp
-│   │
-│   └── consensus/
-│       ├── consensus.c
-│       └── consensus.h
-│
 └── client/
-    ├── client.c
-    │
-    ├── ui/
-    │   ├── client_aux.c
-    │   ├── client_aux.h
-    │   ├── wasm_bindings.c
-    │   ├── auditor.worker.js
-    │   ├── auditor_client.js
-    │   ├── mmr_canvas_renderer.js
-    │   ├── explorer_app.js
-    │   ├── index.html
-    │   ├── SCL_Architecture_Validation_Report.html
-    │   └── SCL_Simulation_Specification.html
-    │
-    ├── network/
-    │   ├── client_network.c
-    │   └── client_network.h
-    │
-    ├── state/
-    │   ├── client_state.c
-    │   └── client_state.h
-    │
-    └── core/
-        ├── game_state.c
-        └── game_state.h
 ```
 
 ### Build Steps:
