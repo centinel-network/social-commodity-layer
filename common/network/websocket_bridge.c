@@ -101,17 +101,23 @@ typedef struct {
  */
 static ssize_t safe_ws_write(int fd, const uint8_t *buf, size_t len) {
     size_t total_written = 0;
+    int stall_retries = 0;
     while (total_written < len) {
         ssize_t written = SCL_WRITE_SOCKET(fd, buf + total_written, len - total_written);
         if (written < 0) {
             // Wait for socket to become writable if write buffer is temporarily full
 #ifndef _WIN32
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* Bound the retry: a browser client that stops reading must not
+                 * pin this thread - and the bc.rwlock held by the GetBlock
+                 * streamer - forever. ~10s ceiling, then drop the client. */
+                if (++stall_retries > 100) return -1;
                 struct pollfd pfd;
                 pfd.fd = fd;
                 pfd.events = POLLOUT;
                 pfd.revents = 0;
                 poll(&pfd, 1, 100);
+                if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
                 continue;
             }
 #else
@@ -703,7 +709,14 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                         if (ws_buf) {
                             size_t ws_frame_len = 0;
                             if (ws_encode_frame(block_resp_buf, total_resp_len, ws_buf, ws_max, &ws_frame_len) == 0) {
-                                safe_ws_write(tcp_fd, ws_buf, ws_frame_len);
+                                if (safe_ws_write(tcp_fd, ws_buf, ws_frame_len) < 0) {
+                                    free(ws_buf);
+                                    free(block_resp_buf);
+                                    pthread_rwlock_unlock(&state->bc.rwlock);
+                                    free(resp_buf);
+                                    if (decomp_buf) free(decomp_buf);
+                                    return; /* release the chain read lock immediately on a stalled client */
+                                }
                             }
                             free(ws_buf);
                         }
