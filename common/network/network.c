@@ -293,7 +293,18 @@ uint16_t scl_count_established_nodes(State *state) {
 
         /* Ensure the socket address structure is valid and initialized.
          * Authenticated nodes with distinct post-quantum keys are always counted,
-         * including multiple instances operating on local loopback or behind the same NAT. */
+         * including multiple instances operating on local loopback or behind the same NAT.
+         *
+         * H-11 fix: an ESTABLISHED peer carrying a verified Dilithium key that differs
+         * from ours is by definition another node, so it must be counted no matter
+         * which address it is reachable on. The previous IP-only
+         * scl_sockaddr_is_self_locked() veto below dropped exactly such peers
+         * whenever an endpoint reflection had poisoned self_addrs with the other
+         * seed's IP (the documented GCP failure mode at the MSG_ENDPOINT_DISCOVERY_ACK
+         * handler), pinning the Active Node count at 1 on two-seed testnets even
+         * while the P2P link was healthy. Hairpin/self connections are still
+         * excluded: they present our own pubkey, which the memcmp against
+         * local_key above already rejects. */
         const struct sockaddr_storage *live = NULL;
         if (peer->conn->current_path.ss_family == AF_INET ||
             peer->conn->current_path.ss_family == AF_INET6) {
@@ -302,11 +313,6 @@ uint16_t scl_count_established_nodes(State *state) {
             live = &peer->addr;
         }
         if (!live || (live->ss_family != AF_INET && live->ss_family != AF_INET6)) continue;
-
-        /* Do not count self-loopback or hairpin reflections as remote peers. */
-        if (scl_sockaddr_is_self_locked(net, live) || scl_sockaddr_is_self_locked(net, &peer->addr)) {
-            continue;
-        }
 
         bool dup = false;
         for (size_t j = 0; j < uniq_count; j++) {
@@ -6795,7 +6801,15 @@ stake_z_fail:
                             (op->conn->current_path.ss_family == AF_INET ||
                              op->conn->current_path.ss_family == AF_INET6)
                                 ? &op->conn->current_path : &op->addr;
-                        if (sockaddr_storage_equal(live, &discovered_addr)) {
+                        /* H-11 fix: scl_sockaddr_is_self_locked() compares IPs only
+                         * (ephemeral NAT ports are ignored downstream), so this clash
+                         * test must be IP-only as well. The previous exact
+                         * sockaddr_storage_equal() (IP + port) let a reflection
+                         * carrying another validator's IP with a translated source
+                         * port slip through, adopting that validator's IP as one of
+                         * our own self addresses and hiding the other seed from the
+                         * Active Node count (p2p_add_peer rejection + count veto). */
+                        if (sockaddr_storage_ip_equal(live, &discovered_addr)) {
                             clashes_with_remote = true;
                             break;
                         }
