@@ -246,6 +246,12 @@ self.onmessage = function(event) {
         case 'BUILD_CHAIN_INFO':
             handleBuildChainInfo(data.requestId);
             break;
+        case 'RESET_ROLLBACK_STATE':
+            // New pipeline (possibly a different backend behind the LB): stop debouncing
+            lastBalanceData = null; balanceRollbackTime = 0;
+            lastValuationsData = null; valuationsRollbackTime = 0;
+            lastChainInfoData = null; chainInfoRollbackTime = 0;
+            break;
         case 'BUILD_GET_BLOCK':
             handleBuildGetBlock(data.requestId, data.height);
             break;
