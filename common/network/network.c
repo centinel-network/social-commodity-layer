@@ -4909,6 +4909,13 @@ epoch_z_fail:
                 for (size_t k = 0; k < net->num_known_peers; k++) {
                     if (k != matched_idx && net->known_peers[k] && net->known_peers[k]->conn == conn) {
                         net->known_peers[k]->conn = NULL;
+                        /* Release the reference this row acquired at attach time.
+                         * Every other detach site releases; missing it here leaks
+                         * the SclConnection (64 MiB of L5 rings each) and never
+                         * decrements active_connection_count, so the node exhausts
+                         * MAX_ACTIVE_CONNECTIONS and silently stops accepting or
+                         * dialing peers - the root cause of the Active Node drift. */
+                        scl_connection_release(conn);
                     }
                 }
             }
@@ -5450,9 +5457,11 @@ epoch_z_fail:
                 pthread_cond_signal(&state->blockchain_sync_cond);
             }
             
-            if (received_num > state->network_target_block_number) {
-                state->network_target_block_number = received_num;
-            }
+            /* Track the live network height (last writer wins) instead of a
+             * write-once maximum. A monotonic ratchet permanently wedges every
+             * proposal gate whenever the local head legitimately moves backwards
+             * (rollback), until the process is restarted. */
+            state->network_target_block_number = received_num;
                                                     
             pthread_mutex_lock(&state->ledger_mutex);
             bool mismatch = (received_num > state->current_block_number);
@@ -5816,28 +5825,36 @@ epoch_z_fail:
                 free_block(block);
                 break;
 #else
-                uint64_t fork_height = block->block_number;
+                uint64_t fork_height = state->current_block_number; /* invert our divergent tip, not the remote block height */
                 uint64_t checkpoint_height = 0;
                 uint8_t checkpoint_root[32] = {0};
                 
-                if (scl_db_get_highest_checkpoint(fork_height > 0 ? fork_height - 1 : 0, &checkpoint_height, checkpoint_root) == 0) {
-                    fprintf(stderr, "[Network] Sync Fork Detected at block %llu. Rolling back to Checkpoint %llu.\n", fork_height, checkpoint_height);
-                } else {
-                    fprintf(stderr, "[Network] Sync Fork Detected at block %llu. No checkpoint found, rolling back to Genesis.\n", fork_height);
-                    checkpoint_height = 0;
-                }
+                /* Walk back ONE block toward the common ancestor instead of
+                 * destroying up to BLOCKS_PER_DAY-1 blocks back to the last
+                 * checkpoint. The re-request below fetches the peer's block at
+                 * the stepped-back height; if it still mismatches, this handler
+                 * fires again and steps back further, converging exactly on the
+                 * common ancestor without wiping committed history. */
+                checkpoint_height = (fork_height > 0) ? fork_height - 1 : 0;
+                (void)checkpoint_root;
+                fprintf(stderr, "[Network] Sync Fork Detected at block %llu. Stepping back to height %llu to find the common ancestor.\n",
+                        (unsigned long long)block->block_number, (unsigned long long)checkpoint_height);
 
                 // Execute Graceful MVCC Reversion Pipeline natively using the DB Checkpoint
                 scl_db_rollback_state_to_checkpoint(state, checkpoint_height, fork_height);
 
                 state->current_block_number = checkpoint_height;
-                state->bc.sync_epoch = checkpoint_height;
+                state->bc.sync_epoch = checkpoint_height + 1;
+                state->network_target_block_number = checkpoint_height; /* un-gate proposers after the deliberate head reset */
                 
                 if (checkpoint_height == 0) {
                     memset(state->current_block_hash, 0, COIN_ID_LEN);
                     Block *genesis = malloc(sizeof(Block));
-                    *genesis = create_standard_genesis_block();
-                    apply_block(state, genesis);
+                    if (genesis) {
+                        *genesis = create_standard_genesis_block();
+                        apply_block(state, genesis);
+                        free_block(genesis);
+                    }
                 } else {
                     // Fast-load the checkpoint block to update the tip hash
                     uint8_t *ser_block = NULL;
