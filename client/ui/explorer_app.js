@@ -923,14 +923,14 @@ document.addEventListener('DOMContentLoaded', () => {
         window.hasInvariantTelemetry = true;
         console.warn('[ExplorerApp] Falling back to local cached chain info state snapshot.');
         const fallbackData = {
-            blockHeight: 0,
+            blockHeight: window.lastKnownChainHeight ?? 0,
             totalSubunits: window.systemMetrics.totalSubunits || 0,
-            totalStaked: 0,
-            committeeCount: parseInt(document.getElementById('active-nodes-val')?.textContent, 10) || 0,
+            totalStaked: window.lastKnownTotalStaked || 0,
+            committeeCount: window.lastKnownCommitteeCount ?? 0,
             activeDkgSessions: 0,
-            lastDkgEpoch: 0
+            lastDkgEpoch: window.lastKnownDkgEpoch || 0
         };
-        document.getElementById('block-height-val').textContent = fallbackData.blockHeight;
+        document.getElementById('block-height-val').textContent = Number(fallbackData.blockHeight).toLocaleString('en-US');
         document.getElementById('total-subunits-val').textContent = '¢' + formatScl(fallbackData.totalSubunits / 160000000, 0);
         document.getElementById('total-staked-val').textContent = '¢' + formatScl(fallbackData.totalStaked / 160000000, 4);
 
@@ -971,8 +971,18 @@ document.addEventListener('DOMContentLoaded', () => {
     function updateStatusBadge(displayStatus) {
         if (!statusText) return;
         statusText.textContent = displayStatus;
-        // Inherit identical styling to the TELEMETRY SYNCED badge (see syncModeEl setup)
-        statusText.className = 'status-badge status-synced';
+        /* Per-status colour coding (restores the blue WASM_LOADED badge):
+         * map the displayed token back to its underscore CSS class so
+         * 'WASM LOADED'          -> .status-wasm_loaded           (blue)
+         * 'KEYS INITIALIZED'      -> .status-keys_initialized      (blue)
+         * 'PIPELINE CONNECTED'    -> .status-pipeline_connected    (green)
+         * 'PIPELINE DISCONNECTED' -> .status-pipeline_disconnected (red)
+         * 'WORKER CREATED'        -> .status-worker_created        (purple)
+         * 'TERMINATED'            -> .status-terminated            (grey)
+         * Unknown tokens (e.g. 'ERROR') keep the neutral base badge.
+         * All rules already exist in the index.html stylesheet. */
+        const classToken = String(displayStatus || '').trim().toLowerCase().replace(/\s+/g, '_');
+        statusText.className = `status-badge status-${classToken}`;
         statusText.style.display = 'inline-block';
     }
 
@@ -1987,6 +1997,12 @@ document.addEventListener('DOMContentLoaded', () => {
         updateGlobalValidations();
 
         latestKnownBlockHeight = blockHeight;
+        /* Remember the last REAL telemetry so the watchdog fallback echoes live
+         * values instead of zeroing the height and freezing the node badge. */
+        window.lastKnownChainHeight = blockHeight;
+        window.lastKnownTotalStaked = totalStaked;
+        window.lastKnownCommitteeCount = committeeCount;
+        window.lastKnownDkgEpoch = lastDkgEpoch;
 
         const now = Date.now();
         if (now - lastBlockResponseTime > 5000 && requestedBlocks.size > 0) {
@@ -2861,6 +2877,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 client.manualDisconnect = true;
                 if (client.reconnectTimer) clearTimeout(client.reconnectTimer);
                 if (client.pollInterval) clearInterval(client.pollInterval);
+                client.socket.onopen = null;
+                client.socket.onmessage = null;
+                client.socket.onclose = null;
+                client.socket.onerror = null;
                 client.socket.close();
                 client.socket = null;
             }
