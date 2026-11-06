@@ -426,12 +426,26 @@ bool check_consensus(State *state, Block *block, BlockVoteQueue *queue) {
     const uint8_t **active_pubkeys = malloc(state->p2p_network.num_known_peers * sizeof(const uint8_t *));
     if (active_pubkeys) {
         size_t active_count = 0;
+        uint64_t now_ms = get_time_ms();
         for (size_t i = 0; i < state->p2p_network.num_known_peers; i++) {
             Peer *peer = state->p2p_network.known_peers[i];
             if (!is_zeroed(peer->peer_wallet.dilithium_pubkey, DILITHIUM_PUBKEY_LEN) &&
                 validate_dilithium_pubkey(peer->peer_wallet.dilithium_pubkey) &&
                 peer->conn && peer->conn->handshake_state == SCL_CONN_STATE_ESTABLISHED) {
-                active_pubkeys[active_count++] = peer->peer_wallet.dilithium_pubkey;
+                /* Quorum base must contain only VERIFIED-LIVE voters. A zombie
+                 * connection whose session keys diverged keeps receiving (and
+                 * silently dropping) the peer's L4 retransmission storm, which
+                 * refreshes last_rx_time and dodges the 60s silence GC while it
+                 * remains flagged ESTABLISHED. Counting such zombies inflates
+                 * ceil(num_peers * 2/3) above the reachable vote count and
+                 * wedges block finality at a fixed height until restart. Only
+                 * peers with traffic inside SCL_QUORUM_LIVENESS_MS count. */
+                uint64_t peer_last_rx = atomic_load_explicit(&peer->conn->last_rx_time, memory_order_relaxed);
+                bool peer_is_live = (peer_last_rx != 0 && now_ms >= peer_last_rx &&
+                                     (now_ms - peer_last_rx) <= SCL_QUORUM_LIVENESS_MS);
+                if (peer_is_live) {
+                    active_pubkeys[active_count++] = peer->peer_wallet.dilithium_pubkey;
+                }
             }
         }
         // Deduplicate active peer public keys to determine unique voter base
@@ -581,12 +595,22 @@ void *vote_collection_thread(void *arg) {
     const uint8_t **active_pubkeys = malloc(state->p2p_network.num_known_peers * sizeof(const uint8_t *));
     if (active_pubkeys) {
         size_t active_count = 0;
+        uint64_t now_ms = get_time_ms();
         for (size_t i = 0; i < state->p2p_network.num_known_peers; i++) {
             Peer *current_peer = state->p2p_network.known_peers[i];
             if (!is_zeroed(current_peer->peer_wallet.dilithium_pubkey, PUBKEY_LEN) &&
                 validate_dilithium_pubkey(current_peer->peer_wallet.dilithium_pubkey) &&
                 current_peer->conn && current_peer->conn->handshake_state == SCL_CONN_STATE_ESTABLISHED) {
-                active_pubkeys[active_count++] = current_peer->peer_wallet.dilithium_pubkey;
+                /* Mirror of check_consensus: the final diagnostic tally must
+                 * use the same VERIFIED-LIVE voter base, otherwise the
+                 * "%zu/%zu votes" telemetry reports an inflated requirement
+                 * that live votes can never satisfy. */
+                uint64_t peer_last_rx = atomic_load_explicit(&current_peer->conn->last_rx_time, memory_order_relaxed);
+                bool peer_is_live = (peer_last_rx != 0 && now_ms >= peer_last_rx &&
+                                     (now_ms - peer_last_rx) <= SCL_QUORUM_LIVENESS_MS);
+                if (peer_is_live) {
+                    active_pubkeys[active_count++] = current_peer->peer_wallet.dilithium_pubkey;
+                }
             }
         }
         if (active_count > 0) {
