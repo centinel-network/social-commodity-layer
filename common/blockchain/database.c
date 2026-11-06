@@ -779,6 +779,30 @@ int scl_db_rollback_state_to_checkpoint(State *state, uint64_t checkpoint_height
                                 existing->spent = 0; // Restore unspent status cleanly
                             }
                         }
+
+                        /* H-8 fix: also reverse the OUTPUT pointers this operation created
+                         * (recipient outputs, fee outputs and change pointers all carry
+                         * prev_tx_hash == this op's tx id), otherwise reorgs silently
+                         * inflate spendable supply. */
+                        const uint8_t *op_tx_id = get_operation_tx_id(op);
+                        if (op_tx_id) {
+                            for (size_t ptr_idx = 0; ptr_idx < state->bc.pointer_table->size; ptr_idx++) {
+                                GenericHashEntry *p_entry = state->bc.pointer_table->buckets[ptr_idx];
+                                while (p_entry) {
+                                    GenericHashEntry *next_entry = p_entry->next;
+                                    if (p_entry->type == HASH_ENTRY_POINTER &&
+                                        memcmp(p_entry->data.pointer.prev_tx_hash, op_tx_id, COIN_ID_LEN) == 0) {
+                                        uint8_t p_key[COIN_ID_LEN];
+                                        uint8_t p_parent[COIN_ID_LEN];
+                                        memcpy(p_key, p_entry->key, COIN_ID_LEN);
+                                        memcpy(p_parent, p_entry->data.pointer.parent_coin_id, COIN_ID_LEN);
+                                        hash_table_remove(state->bc.pointer_table, p_key);
+                                        remove_pointer_id_from_coin(state->bc.coin_pointers, p_parent, p_key);
+                                    }
+                                    p_entry = next_entry;
+                                }
+                            }
+                        }
                     } else if (op->type == OP_REDEEM_CENTINEL) {
                         hash_table_remove(state->bc.centinel.nullifier_set, op->data.redeem_centinel.nullifier);
                         if (rb_nullifiers && rb_nullifier_count < (size_t)b->operation_count) {
