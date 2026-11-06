@@ -963,9 +963,27 @@ int extract_l5_message(SclConnection *conn, State *state, const uint8_t *raw_pac
                     bloom_filter_add(global_state->hypergraph.poison_bloom_aging, conn->cid);
                     pthread_mutex_unlock(&global_state->hypergraph.lock);
                 }
+                /* Circuit-breaker: a persistent AEAD tag failure means this
+                 * connection's session keys or packet-number space have
+                 * diverged from the peer's (classic cause: the remote core
+                 * restarted or replaced this socket during a mutual-dial
+                 * collision). Dropping packets forever lets the peer's L4
+                 * retransmission storm keep refreshing last_rx_time, so the
+                 * 60s silence GC never fires, the zombie stays ESTABLISHED,
+                 * and it keeps inflating the consensus quorum base - which
+                 * is exactly how a 2-seed testnet freezes at a fixed height.
+                 * After 3 consecutive failures, kill the connection so the
+                 * event loop GCs it and the reconnect watchdog re-dials with
+                 * freshly negotiated keys. */
+                if (atomic_fetch_add_explicit(&conn->aead_fail_streak, 1, memory_order_relaxed) + 1 >= SCL_MAX_CONSECUTIVE_AEAD_FAILURES) {
+                    fprintf(stderr, "[L5] Connection failed %u consecutive AEAD authentications. Killing session for clean re-handshake.\n",
+                            (unsigned)SCL_MAX_CONSECUTIVE_AEAD_FAILURES);
+                    conn->handshake_state = SCL_CONN_STATE_NONE; // Event loop GCs it; reconnect watchdog re-dials
+                }
                 return -1; // AEAD Authentication failed. Packet dropped.
             }
         } else {
+            atomic_store_explicit(&conn->aead_fail_streak, 0, memory_order_relaxed);
             l3_payload = plaintext;
             l3_len = pt_len;
             if (conn->handshake_state == SCL_CONN_STATE_FLIGHT3_READY) {
@@ -2182,6 +2200,7 @@ void process_spsc_queue(SclConnection *conn, State *state, P2PNetwork *net, uint
                         new_conn->bdpq_deficit = 5;
                         new_conn->cwnd = SCL_MICRO_BDP_LIMIT;
                         atomic_init(&new_conn->last_rx_time, get_time_ms());
+                        atomic_init(&new_conn->aead_fail_streak, 0);
                         
                         new_conn->dynamic_replay_window_size = SCL_MIN_REPLAY_WINDOW;
                         new_conn->current_path = sender_addr;
@@ -2298,8 +2317,19 @@ void process_spsc_queue(SclConnection *conn, State *state, P2PNetwork *net, uint
                         bloom_filter_add(global_state->hypergraph.poison_bloom_aging, client_cid);
                         pthread_mutex_unlock(&global_state->hypergraph.lock);
                     }
+                    /* Same session-divergence circuit-breaker as the short-header
+                     * path: fragments of large messages (blocks, DKG shares) are
+                     * the dominant storm traffic once keys diverge. Kill the
+                     * session after repeated tag failures instead of dropping
+                     * forever while the sender retransmits into a void. */
+                    if (atomic_fetch_add_explicit(&conn->aead_fail_streak, 1, memory_order_relaxed) + 1 >= SCL_MAX_CONSECUTIVE_AEAD_FAILURES) {
+                        fprintf(stderr, "[L5] Fragment stream failed %u consecutive AEAD authentications. Killing session for clean re-handshake.\n",
+                                (unsigned)SCL_MAX_CONSECUTIVE_AEAD_FAILURES);
+                        conn->handshake_state = SCL_CONN_STATE_NONE; // Event loop GCs it; reconnect watchdog re-dials
+                    }
                     goto advance_queue;
                 }
+                atomic_store_explicit(&conn->aead_fail_streak, 0, memory_order_relaxed);
 
                 // Strictly update the sliding replay window with the decrypted fragment's packet number
                 scl_update_replay_window(conn, current_frag_pkt_num);
