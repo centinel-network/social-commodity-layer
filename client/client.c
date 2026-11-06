@@ -218,10 +218,8 @@ static void *prometheus_metrics_server(void *arg) {
         int client_fd = accept(server_fd, NULL, NULL);
         if (client_fd < 0) continue;
 
-        // Atomically snapshot network peer capacity and local ledger height
-        pthread_mutex_lock(&state->p2p_network.mutex);
-        size_t peers = state->p2p_network.num_known_peers;
-        pthread_mutex_unlock(&state->p2p_network.mutex);
+        // Snapshot network peer capacity and local ledger height
+        size_t peers = scl_count_established_nodes(state); /* live established peers, not the ever-growing address book */
         
         pthread_mutex_lock(&state->ledger_mutex);
         uint64_t height = state->current_block_number;
@@ -3225,7 +3223,13 @@ void *l5_application_engine_thread(void *arg) {
                 last_ping_time = current_time;
                 pthread_mutex_lock(&net->mutex);
                 for (size_t i = 0; i < net->num_known_peers; i++) {
+                    /* Skip zero-pubkey dial placeholders: pinging them keeps
+                     * superseded sockets alive forever (every reply refreshes
+                     * last_rx_time), making them immortal zombies that dodge the
+                     * 60s silence GC and pin the Active Node count at a stale
+                     * value while burning one admission slot each. */
                     if (net->known_peers[i] && net->known_peers[i]->conn &&
+                        !is_zeroed(net->known_peers[i]->peer_wallet.dilithium_pubkey, DILITHIUM_PUBKEY_LEN) &&
                         net->known_peers[i]->conn->handshake_state == SCL_CONN_STATE_ESTABLISHED) {
                         Message *ping = calloc(1, sizeof(Message));
                         if (ping) {
@@ -3305,8 +3309,9 @@ void *l5_application_engine_thread(void *arg) {
                         continue;
                     }
 
-                    // Only reconnect to authenticated peers, avoiding duplicate addresses
-                    if (validate_dilithium_pubkey(peer->peer_wallet.dilithium_pubkey)) {
+                    // Only reconnect to authenticated peers seen recently, avoiding duplicate addresses
+                    if (validate_dilithium_pubkey(peer->peer_wallet.dilithium_pubkey) &&
+                        (time(NULL) - peer->last_seen) < 300) {
                         if (!peer->conn || peer->conn->handshake_state == SCL_CONN_STATE_NONE) {
                             if (peer->conn) {
                                 SclConnection *old_c = peer->conn;
