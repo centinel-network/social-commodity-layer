@@ -791,7 +791,10 @@ uint64_t scl_l4_get_pto(SclConnection *conn) {
         base_pto = MAX(base_pto, conn->smoothed_rtt * 2);
     }
             
-    return base_pto * (1 << conn->pto_count); // Exponential backoff scaling
+    /* Clamp the shift: pto_count grows without bound on a link that never
+     * ACKs; shifting by >= 31 would be undefined behaviour. */
+    uint32_t pto_shift = (conn->pto_count > 16) ? 16 : conn->pto_count;
+    return base_pto * (1ULL << pto_shift); // Exponential backoff scaling
 }
 
 /**
@@ -834,6 +837,7 @@ void scl_l4_detect_lost_packets(SclConnection *conn, uint64_t now, State *state,
     SclUnackedPacket *curr = conn->unacked_head;
     SclUnackedPacket *prev = NULL;
     bool loss_detected = false;
+    bool storm_kill = false;
     
     SclUnackedPacket *retrans_head = NULL;
     SclUnackedPacket *retrans_tail = NULL;
@@ -871,6 +875,22 @@ void scl_l4_detect_lost_packets(SclConnection *conn, uint64_t now, State *state,
             if (to_process->is_datagram) {
                 if (to_process->raw_packet) free(to_process->raw_packet);
                 free(to_process);
+            } else if (to_process->retransmit_count >= SCL_MAX_STREAM_RETRANSMITS) {
+                /* Storm circuit-breaker: this reliable-stream packet has been
+                 * retransmitted SCL_MAX_STREAM_RETRANSMITS times and never ACKed.
+                 * The remote endpoint is unreachable (classically: the peer
+                 * replaced this socket during a mutual-dial collision, so our
+                 * packets land on its listener and the stateless-reset token
+                 * never reached us). Retransmitting forever pins the L4 loop,
+                 * floods the link, and starves the submission pipeline - the
+                 * "one seed stops submitting valuations" failure mode. Drop the
+                 * packet; the connection reset below lets the reconnect
+                 * watchdog dial a fresh, consistent pair. */
+                fprintf(stderr, "[L4] Stream Packet %llu exceeded %d retransmissions. Dropping packet and resetting connection.\n",
+                        (unsigned long long)to_process->packet_num, SCL_MAX_STREAM_RETRANSMITS);
+                if (to_process->raw_packet) free(to_process->raw_packet);
+                free(to_process);
+                storm_kill = true;
             } else {
                 size_t max_len = 0;
                 void *tx_token = NULL;
@@ -973,6 +993,7 @@ void scl_l4_detect_lost_packets(SclConnection *conn, uint64_t now, State *state,
                                                             
                     to_process->packet_num = new_pkt_num;
                     to_process->time_sent = now;
+                    to_process->retransmit_count++;
                     to_process->delivered_at_tx = conn->bbr_delivered;
                     to_process->delivered_time_at_tx = conn->bbr_delivered_time;
                     to_process->next = NULL;
@@ -1054,6 +1075,16 @@ void scl_l4_detect_lost_packets(SclConnection *conn, uint64_t now, State *state,
     }
     
     pthread_mutex_unlock(&conn->l4_mutex);
+
+    if (storm_kill) {
+        /* Tear the stormed-out connection down: once it leaves the CID routing
+         * table no further loss detection or egress runs for it, and the
+         * peer-table row is recycled by the 15s reconnect watchdog. */
+        conn->handshake_state = SCL_CONN_STATE_NONE;
+        if (global_shim && global_shim->unregister_connection(global_shim, conn->cid)) {
+            scl_connection_release(conn);
+        }
+    }
 }
 
 /**
@@ -1078,6 +1109,7 @@ void scl_l4_on_packet_sent(SclConnection *conn, uint64_t packet_num, size_t len,
     pkt->bytes_in_flight = len;
     pkt->is_datagram = is_datagram;
     pkt->is_fec_protected = is_fec_protected;
+    pkt->retransmit_count = 0;
     
     // BBRv3: Snapshot Delivery State
     pkt->delivered_at_tx = conn->bbr_delivered;
@@ -4806,42 +4838,32 @@ epoch_z_fail:
                     }
                     if (net->known_peers[i]->conn != conn) {
                         if (net->known_peers[i]->conn) {
-                            bool existing_established = (net->known_peers[i]->conn->handshake_state == SCL_CONN_STATE_ESTABLISHED);
-                            bool incoming_established = (conn->handshake_state == SCL_CONN_STATE_ESTABLISHED);
-
-                            uint64_t now_ms = get_time_ms();
-                            uint64_t existing_last_rx = atomic_load_explicit(&net->known_peers[i]->conn->last_rx_time, memory_order_relaxed);
-                            bool existing_stale = (now_ms > existing_last_rx && (now_ms - existing_last_rx) > 10000ULL);
-
+                            /* Mutual-dial collision resolution MUST be mirror-symmetric:
+                             * both endpoints hash the same two Dilithium pubkeys and keep the
+                             * socket pair whose INITIATOR is the hash winner.
+                             * required_pow_bits > 0 marks an initiator (dialer) context and
+                             * == 0 a responder (listener) context, so incoming_is_local is
+                             * true when the incoming connection is the one THIS node dialed
+                             * out on. The rule is order-independent: whichever socket is
+                             * "existing" vs "incoming", both sides converge on the same pair.
+                             *
+                             * The previous time-based "existing_stale" shortcut and the
+                             * hypergraph sym_weight override each evaluated LOCAL, divergent
+                             * state, so after a simultaneous redial the two seeds could keep
+                             * OPPOSITE socket pairs. Every packet then landed on a CID the
+                             * remote had just unregistered, was silently dropped, and the
+                             * sender retransmitted forever - the L4 storm that keeps one
+                             * seed's valuation proposals off the chain. Dead-socket recovery
+                             * now routes exclusively through the silence GC + the reconnect
+                             * watchdog (client.c L5 worker). */
                             bool replace_with_incoming = false;
-
-                            // Always prioritize a live, established incoming socket over an unestablished or stale dial
-                            if (incoming_established && (!existing_established || existing_stale)) {
-                                replace_with_incoming = true;
-                            } else if (!incoming_established && existing_established && !existing_stale) {
-                                replace_with_incoming = false;
-                            } else {
+                            {
                                 uint8_t hash_local[32], hash_remote[32];
                                 SHA256(net->local_peer.peer_wallet.dilithium_pubkey, DILITHIUM_PUBKEY_LEN, hash_local);
                                 SHA256(peer_dilithium, DILITHIUM_PUBKEY_LEN, hash_remote);
                                 bool local_wins = (memcmp(hash_local, hash_remote, 32) > 0);
                                 bool incoming_is_local = (conn->required_pow_bits > 0);
                                 replace_with_incoming = (incoming_is_local == local_wins);
-
-                                // 5.3 Mutual Connection Collision Resolution using LocalHypergraph
-                                pthread_mutex_lock(&state->hypergraph.lock);
-                                uint32_t sym_weight = 0;
-                                for (uint16_t e_idx = 0; e_idx < state->hypergraph.edge_count; e_idx++) {
-                                    if (memcmp(state->hypergraph.edges[e_idx].cid, conn->cid, SCL_CID_LEN) == 0 &&
-                                        state->hypergraph.edges[e_idx].edge_type == EDGE_SYMMETRY) {
-                                        sym_weight += state->hypergraph.edges[e_idx].weight;
-                                    }
-                                }
-                                pthread_mutex_unlock(&state->hypergraph.lock);
-                                
-                                if (sym_weight > 5) {
-                                    replace_with_incoming = true;
-                                }
                             }
                             
                             if (!replace_with_incoming) {
@@ -7215,6 +7237,7 @@ void scl_initiate_connection(P2PNetwork *net, const struct sockaddr_storage *add
     conn->cwnd = SCL_MICRO_BDP_LIMIT; // Spec: Start new syncing peers at micro-BDP
     conn->is_untrusted_sync = false;  // We initiated, assume trusted outbound
     atomic_init(&conn->last_rx_time, get_time_ms());
+    atomic_init(&conn->aead_fail_streak, 0);
                     
     // BBR state initialization
     conn->bbr_state = 0;              // Start in STARTUP (0 = BBR_STARTUP)
