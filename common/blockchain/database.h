@@ -199,6 +199,14 @@ int scl_db_write_nullifiers_batch(uint8_t (*nullifiers)[NULLIFIER_LEN], size_t c
  */
 bool scl_db_has_nullifier(const uint8_t *nullifier);
 
+/**
+ * @brief Deletes a batch of spent nullifiers from persistent storage during chain rollbacks.
+ * @param[in] nullifiers Array of 32-byte nullifiers to remove from disk.
+ * @param[in] count Number of entries in the array.
+ * @return 0 on success (including no-op), -1 on storage failure.
+ */
+int scl_db_delete_nullifiers_batch(uint8_t (*nullifiers)[NULLIFIER_LEN], size_t count);
+
 /* ============================================================================ */
 /* SECTION 4: DISTRIBUTED KEY GENERATION (DKG) STATE PERSISTENCE                */
 /* ============================================================================ */
