@@ -1003,6 +1003,14 @@ document.addEventListener('DOMContentLoaded', () => {
             connectBtn.className = 'btn btn-disconnect';
 
             window.hasCustomLoadedFile = false;
+            /* Reset the Active-Node badge smoothing: a fresh socket may land on a
+             * different seed behind the GCP load balancer, and the two seeds can
+             * legitimately disagree (one peered, one not). Without this reset the
+             * two-consecutive-poll rule in onChainInfoReceived keeps displaying the
+             * previous backend's committeeCount whenever connections churn faster
+             * than two polls (4s), freezing the badge on a stale count. */
+            window.lastStableCommitteeCount = undefined;
+            window.pendingCommitteeCount = null;
             // Reset synchronization tracking
             latestKnownBlockHeight = -1;
             syncedBlockHeight = -1;
@@ -4747,7 +4755,7 @@ document.addEventListener('DOMContentLoaded', () => {
         mempool_async_threshold: 50,
         metrics_port: 8000,
         websocket_port: 5554,
-        bootstrap_nodes: '136.65.1.22:5555,35.192.184.226:5555',
+        bootstrap_nodes: '136.65.1.22:5555,35.192.184.226:5555,[2600:1900:4000:5ce:0:4::]:5555,[2600:1900:4000:5ce:0:5::]:5555',
         autopilot_enabled: false,
         autopilot_valuations_per_hour: 1,
         autopilot_stake_ratio: 50
