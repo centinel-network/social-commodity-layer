@@ -190,45 +190,146 @@ static void sha1_hash(const uint8_t *in, size_t in_len, uint8_t *out) {
  * @complexity Time: O(req_len), Space: O(1) stack buffers.
  */
 static int perform_handshake(State *state, int fd, char *req_buf, size_t req_len) {
-    // 1. Autonomous Agent 402 Gating
-    // If agent authentication is enforced, check for 'Authorization: SCL402 <token>'
-    bool requires_auth = state->config.is_daemon && (state->config.metrics_port != 0);
-    char *auth_header = strstr(req_buf, "Authorization: SCL402 ");
-    
-    if (requires_auth && !auth_header) {
-        // Construct standard HTTP 402 Payment Required response
-        char challenge_json[512];
-        uint8_t node_address[USER_ID_LEN];
-        
-        pthread_mutex_lock(&state->wallet_mutex);
-        SHA256(state->user_wallet.dilithium_pubkey, DILITHIUM_PUBKEY_LEN, node_address);
-        pthread_mutex_unlock(&state->wallet_mutex);
+    /* H-2 fix: Origin allowlist + mandatory SCL402 bearer token on public deployments.
+     * Loopback deployments (the default bind after this patch) keep working for local
+     * tooling; public deployments (SCL_BRIDGE_BIND_PUBLIC=1) must present a token that
+     * matches SCL_BRIDGE_AUTH_TOKEN via 'Authorization: SCL402 <token>' or as the
+     * second Sec-WebSocket-Protocol subprotocol entry (browsers cannot set custom
+     * headers on WebSocket upgrades). */
+    const char *public_env = getenv("SCL_BRIDGE_BIND_PUBLIC");
+    bool is_public = (public_env != NULL && strcmp(public_env, "1") == 0);
+    const char *auth_token = getenv("SCL_BRIDGE_AUTH_TOKEN");
 
-        char node_addr_hex[65];
-        bytes_to_hex(node_address, USER_ID_LEN, node_addr_hex);
+    /* Cross-site WebSocket hijacking gate: browsers always send Origin on upgrades.
+     * Absent Origin (native clients) is allowed; present-but-unknown Origin is not. */
+    const char *origin_header = strstr(req_buf, "Origin:");
+    if (!origin_header) origin_header = strstr(req_buf, "origin:");
+    if (origin_header && is_public) {
+        char origin_val[256];
+        const char *ov = origin_header + 7;
+        while (*ov == ' ' || *ov == '\t') ov++;
+        const char *oe = ov;
+        while (*oe && *oe != '\r' && *oe != '\n') oe++;
+        while (oe > ov && (*(oe - 1) == ' ' || *(oe - 1) == '\t')) oe--;
+        size_t o_len = (size_t)(oe - ov);
+        if (o_len >= sizeof(origin_val)) o_len = sizeof(origin_val) - 1;
+        memcpy(origin_val, ov, o_len);
+        origin_val[o_len] = '\0';
 
-        snprintf(challenge_json, sizeof(challenge_json),
-                 "{\"error\":\"Payment Required\",\"cost_subunits\":160000000,"
-                 "\"recipient\":\"%s\",\"token_type\":\"SCL_CENTINEL_V1\"}",
-                 node_addr_hex);
+        char allowlist[512];
+        const char *allowed = getenv("SCL_BRIDGE_ALLOWED_ORIGINS");
+        if (allowed && allowed[0] != '\0') {
+            snprintf(allowlist, sizeof(allowlist), "%s", allowed);
+        } else {
+            snprintf(allowlist, sizeof(allowlist),
+                     "https://explore.centinel.network,http://localhost,http://127.0.0.1");
+        }
 
-        char response[1024];
-        int resp_len = snprintf(response, sizeof(response),
-                                "HTTP/1.1 402 Payment Required\r\n"
-                                "Content-Type: application/json\r\n"
-                                "WWW-Authenticate: SCL402 realm=\"Centinel Node Access\", recipient=\"%s\"\r\n"
-                                "Strict-Transport-Security: max-age=63072000; includeSubDomains; preload\r\n"
-                                "X-Content-Type-Options: nosniff\r\n"
-                                "X-Frame-Options: DENY\r\n"
-                                "Content-Security-Policy: frame-ancestors 'none'\r\n"
-                                "Referrer-Policy: no-referrer\r\n"
-                                "Content-Length: %zu\r\n"
-                                "Connection: close\r\n\r\n%s",
-                                node_addr_hex, strlen(challenge_json), challenge_json);
-
-        safe_ws_write(fd, (const uint8_t *)response, resp_len);
-        return -1; // Terminate unauthenticated connection
+        bool origin_ok = false;
+        char *save = NULL;
+        for (char *tok = strtok_r(allowlist, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+            while (*tok == ' ' || *tok == '\t') tok++;
+            if (strcmp(origin_val, tok) == 0) { origin_ok = true; break; }
+        }
+        if (!origin_ok) {
+            char response[512];
+            int resp_len = snprintf(response, sizeof(response),
+                                    "HTTP/1.1 403 Forbidden\r\n"
+                                    "Content-Type: text/plain\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "Origin not allowed\r\n");
+            safe_ws_write(fd, (const uint8_t *)response, resp_len);
+            return -1;
+        }
     }
+
+    /* Extract the presented SCL402 token from the Authorization header or the
+     * Sec-WebSocket-Protocol subprotocol list, then compare in constant time. */
+    char supplied[256];
+    supplied[0] = '\0';
+    const char *auth_header = strstr(req_buf, "Authorization: SCL402 ");
+    if (!auth_header) auth_header = strstr(req_buf, "authorization: scl402 ");
+    if (auth_header) {
+        const char *tv = auth_header + 21;
+        while (*tv == ' ' || *tv == '\t') tv++;
+        const char *te = tv;
+        while (*te && *te != '\r' && *te != '\n') te++;
+        size_t t_len = (size_t)(te - tv);
+        if (t_len >= sizeof(supplied)) t_len = sizeof(supplied) - 1;
+        memcpy(supplied, tv, t_len);
+        supplied[t_len] = '\0';
+    } else {
+        const char *subproto = strstr(req_buf, "Sec-WebSocket-Protocol:");
+        if (!subproto) subproto = strstr(req_buf, "sec-websocket-protocol:");
+        if (subproto) {
+            const char *line_end = subproto;
+            while (*line_end && *line_end != '\r' && *line_end != '\n') line_end++;
+            const char *comma = memchr(subproto, ',', (size_t)(line_end - subproto));
+            if (comma) {
+                const char *tv = comma + 1;
+                while (*tv == ' ' || *tv == '\t') tv++;
+                const char *te = tv;
+                while (*te && *te != '\r' && *te != '\n') te++;
+                size_t t_len = (size_t)(te - tv);
+                if (t_len >= sizeof(supplied)) t_len = sizeof(supplied) - 1;
+                memcpy(supplied, tv, t_len);
+                supplied[t_len] = '\0';
+            }
+        }
+    }
+
+    if (is_public) {
+        if (!auth_token || auth_token[0] == '\0') {
+            char response[512];
+            int resp_len = snprintf(response, sizeof(response),
+                                    "HTTP/1.1 403 Forbidden\r\n"
+                                    "Content-Type: text/plain\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "Bridge misconfigured\r\n");
+            safe_ws_write(fd, (const uint8_t *)response, resp_len);
+            return -1;
+        }
+        size_t tok_len = strlen(auth_token);
+        size_t sup_len = strlen(supplied);
+        unsigned diff = 0;
+        for (size_t k = 0; k < tok_len && k < sup_len; k++) {
+            diff |= (unsigned char)auth_token[k] ^ (unsigned char)supplied[k];
+        }
+        if (supplied[0] == '\0' || tok_len != sup_len || diff != 0) {
+            char challenge_json[512];
+            uint8_t node_address[USER_ID_LEN];
+
+            pthread_mutex_lock(&state->wallet_mutex);
+            SHA256(state->user_wallet.dilithium_pubkey, DILITHIUM_PUBKEY_LEN, node_address);
+            pthread_mutex_unlock(&state->wallet_mutex);
+
+            char node_addr_hex[65];
+            bytes_to_hex(node_address, USER_ID_LEN, node_addr_hex);
+
+            snprintf(challenge_json, sizeof(challenge_json),
+                     "{\"error\":\"Payment Required\",\"cost_subunits\":160000000,"
+                     "\"recipient\":\"%s\",\"token_type\":\"SCL_CENTINEL_V1\"}",
+                     node_addr_hex);
+
+            char response[1024];
+            int resp_len = snprintf(response, sizeof(response),
+                                    "HTTP/1.1 402 Payment Required\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "WWW-Authenticate: SCL402 realm=\"Centinel Node Access\", recipient=\"%s\"\r\n"
+                                    "Strict-Transport-Security: max-age=63072000; includeSubDomains; preload\r\n"
+                                    "X-Content-Type-Options: nosniff\r\n"
+                                    "X-Frame-Options: DENY\r\n"
+                                    "Content-Security-Policy: frame-ancestors 'none'\r\n"
+                                    "Referrer-Policy: no-referrer\r\n"
+                                    "Content-Length: %zu\r\n"
+                                    "Connection: close\r\n\r\n%s",
+                                    node_addr_hex, strlen(challenge_json), challenge_json);
+
+            safe_ws_write(fd, (const uint8_t *)response, resp_len);
+            return -1; /* Terminate unauthenticated connection */
+        }
+    }
+
 
     // 2. Locate Sec-WebSocket-Key header case-insensitively
     char *key_start = NULL;
@@ -1191,8 +1292,8 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
             memcpy(resp_buf + 32 + 36, &total_fees_be, 8);
             
             pthread_mutex_lock(&state->wallet_mutex);
-            memcpy(resp_buf + 32 + 44, state->user_wallet.dilithium_pubkey, PUBKEY_LEN);
-            memcpy(resp_buf + 32 + 44 + PUBKEY_LEN, state->user_wallet.dilithium_privkey, PRIVKEY_LEN);
+            memcpy(resp_buf + 32 + 44, state->testnet_identity_wallet.dilithium_pubkey, PUBKEY_LEN);
+            memcpy(resp_buf + 32 + 44 + PUBKEY_LEN, state->testnet_identity_wallet.dilithium_privkey, PRIVKEY_LEN);
             pthread_mutex_unlock(&state->wallet_mutex);
             actual_payload_len = 44 + PUBKEY_LEN + PRIVKEY_LEN;
             break;
@@ -1538,7 +1639,11 @@ static void *ws_client_handler(void *arg) {
                             continue;
                         }
                     }
-                    sendto(udp_fd, (const char *)payload_buf, (int)decoded_len, 0, (struct sockaddr *)&node_addr, node_addr.ss_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6));
+                    /* H-2 fix: the raw UDP proxy into the node's P2P listener is removed.
+                     * The bridge executes legitimate RPC frames only (the explorer's whole
+                     * pipeline, including SubmitTx 0x0003, is RPC); every other binary
+                     * frame is dropped. */
+                    fprintf(stderr, "[Bridge] Dropped non-RPC binary frame (%zu bytes): raw UDP proxy disabled\n", decoded_len);
                 }
                 processed += frame_consumed;
             }
@@ -1551,16 +1656,9 @@ static void *ws_client_handler(void *arg) {
             if (disconnect_requested) break;
         }
 
-        // 2. Data from SCL Node (UDP) -> Forward via WebSocket to browser
-        if (fds[1].revents & POLLIN) {
-            ssize_t r = recvfrom(udp_fd, (char *)udp_in_buf, MAX_MESSAGE_SIZE, 0, NULL, NULL);
-            if (r > 0) {
-                size_t out_frame_len = 0;
-                if (ws_encode_frame(udp_in_buf, r, ws_out_frame, MAX_MESSAGE_SIZE + 4096, &out_frame_len) == 0) {
-                    safe_ws_write(tcp_fd, ws_out_frame, out_frame_len);
-                }
-            }
-        }
+        /* 2. H-2 fix: the node-to-browser UDP return path is removed together with the
+         * proxy. RPC responses are written back on the TCP socket by the RPC handlers
+         * themselves; nothing else is forwarded. */
     }
 
 cleanup:
@@ -1614,24 +1712,36 @@ void *websocket_bridge_server(void *arg) {
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
 #endif
 
+    /* H-2 fix: default-bind the bridge to loopback. Opt in to public binding with
+     * SCL_BRIDGE_BIND_PUBLIC=1 (requires SCL_BRIDGE_AUTH_TOKEN; enforced in
+     * perform_handshake, and fail-closed here). */
+    const char *public_env = getenv("SCL_BRIDGE_BIND_PUBLIC");
+    bool public_bind = (public_env != NULL && strcmp(public_env, "1") == 0);
+    const char *bridge_auth_token = getenv("SCL_BRIDGE_AUTH_TOKEN");
+    if (public_bind && (!bridge_auth_token || bridge_auth_token[0] == '\0')) {
+        scl_log(LOG_LEVEL_FATAL, "Bridge", "SCL_BRIDGE_BIND_PUBLIC=1 requires SCL_BRIDGE_AUTH_TOKEN; refusing to start exposed");
+        if (server_fd >= 0) SCL_CLOSE_SOCKET(server_fd);
+        return NULL;
+    }
+
     struct sockaddr_storage address;
     memset(&address, 0, sizeof(address));
     socklen_t addr_len;
-    
+
     if (domain == AF_INET6) {
         struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&address;
         v6->sin6_family = AF_INET6;
-        v6->sin6_addr = in6addr_any;
+        v6->sin6_addr = public_bind ? in6addr_any : in6addr_loopback;
         v6->sin6_port = htons(state->config.websocket_port);
         addr_len = sizeof(struct sockaddr_in6);
-        
+
         // Allow IPv4 mapped addresses
         int no = 0;
         setsockopt(server_fd, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&no, sizeof(no));
     } else {
         struct sockaddr_in *v4 = (struct sockaddr_in *)&address;
         v4->sin_family = AF_INET;
-        v4->sin_addr.s_addr = INADDR_ANY;
+        v4->sin_addr.s_addr = public_bind ? INADDR_ANY : htonl(INADDR_LOOPBACK);
         v4->sin_port = htons(state->config.websocket_port);
         addr_len = sizeof(struct sockaddr_in);
     }
@@ -1647,7 +1757,7 @@ void *websocket_bridge_server(void *arg) {
                 memset(&address, 0, sizeof(address));
                 struct sockaddr_in *v4 = (struct sockaddr_in *)&address;
                 v4->sin_family = AF_INET;
-                v4->sin_addr.s_addr = INADDR_ANY;
+                v4->sin_addr.s_addr = public_bind ? INADDR_ANY : htonl(INADDR_LOOPBACK);
                 v4->sin_port = htons(state->config.websocket_port);
                 if (bind(server_fd, (struct sockaddr *)&address, sizeof(struct sockaddr_in)) == 0) {
                     goto bind_success;
