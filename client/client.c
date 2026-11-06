@@ -908,7 +908,8 @@ static void scl_update_replay_window(SclConnection *conn, uint64_t packet_num) {
  */
 int extract_l5_message(SclConnection *conn, State *state, const uint8_t *raw_packet, size_t raw_len,
                       struct sockaddr_storage *sender_addr, Message *msg,
-                      uint8_t *sender_pubkey, uint8_t *plaintext, uint64_t rx_time) {
+                      uint8_t *sender_pubkey, uint8_t *plaintext, uint64_t rx_time,
+                      bool internal_preauth) {
     /* Kept so the caller’s UDP source is not rewritten. Unused in this
      * function on purpose; dispatch and STUN read the original address. */
     (void)sender_addr;
@@ -925,11 +926,11 @@ int extract_l5_message(SclConnection *conn, State *state, const uint8_t *raw_pac
 
     // --- L2 AEAD FRAMER (SHORT_HEADER) ---
     // Allow processing if state is ESTABLISHED OR FLIGHT3_READY.
-    // ALSO allow internal synthesized disconnect signals (raw_len == 0 or flags & 0x08) to bypass the state check
-    // to ensure dead/stalled connections are properly garbage collected by the L5 Application Engine.
+    // C-2 fix: only in-process synthesized reassembly buffers (internal_preauth=true)
+    // may bypass AEAD; the 0x08 wire flag is never trusted from the network.
     if (!conn || (conn->handshake_state != SCL_CONN_STATE_ESTABLISHED &&
                   conn->handshake_state != SCL_CONN_STATE_FLIGHT3_READY &&
-                  !(conn->handshake_state == SCL_CONN_STATE_NONE && (raw_len == 0 || (flags & 0x08))))) {
+                  !(conn->handshake_state == SCL_CONN_STATE_NONE && internal_preauth))) {
         return -1;
     }
 
@@ -941,13 +942,14 @@ int extract_l5_message(SclConnection *conn, State *state, const uint8_t *raw_pac
     size_t l3_len;
     bool is_stateless_reset = false;
 
-    if (flags & 0x08) {
-        // Assembled payload is already authenticated and decrypted by L0 Ingress
+    if (internal_preauth) {
+        // In-process reassembly buffer: every fragment was individually AEAD-authenticated
+        // before reassembly, so the assembled payload is trusted plaintext (C-2 fix).
         l3_payload = payload_ptr;
         l3_len = payload_len;
     } else {
         size_t pt_len;
-        if (decrypt_aead_packet(conn->current_aes_gcm_key, packet_num, payload_ptr, payload_len, plaintext, &pt_len) != 0) {
+        if (decrypt_aead_packet(conn->rx_aes_gcm_key, packet_num, payload_ptr, payload_len, plaintext, &pt_len, raw_packet, SCL_HEADER_MIN_LEN) != 0) {
             // --- SPEC IMPLEMENTATION: Verify STATELESS_RESET ---
             if (payload_len == 16 && conn->has_stateless_reset_token) {
                 if (secure_memcmp(payload_ptr, conn->stateless_reset_token, 16) == 0) {
@@ -1183,7 +1185,7 @@ int extract_l5_message(SclConnection *conn, State *state, const uint8_t *raw_pac
     }
 
     // Send L4 ACK immediately ONLY if it was an unfragmented packet.
-    if (ack_eliciting && !(flags & 0x08)) {
+    if (ack_eliciting && !internal_preauth) { // C-2 fix: internal_preauth, not a wire flag
         send_l4_ack(conn, packet_num, rx_time);
     }
 
@@ -1250,7 +1252,7 @@ static void send_stateless_l4_ack(struct SclTransportShim *shim, const uint8_t *
     memcpy(tx_buf + 1 + SCL_CID_LEN, &pn_be, 8);
 
     size_t out_len;
-    encrypt_aead_packet(aes_key, new_pkt_num, payload, 17, tx_buf + SCL_HEADER_MIN_LEN, &out_len);
+    encrypt_aead_packet(aes_key, new_pkt_num, payload, 17, tx_buf + SCL_HEADER_MIN_LEN, &out_len, tx_buf, SCL_HEADER_MIN_LEN);
     shim->commit_tx_buffer(shim, tx_token, SCL_HEADER_MIN_LEN + out_len, client_cid, addr);
 }
 
@@ -1479,7 +1481,7 @@ void process_egress_queues(SclConnection *conn, Message *msg) {
                 memcpy(buf + 1 + SCL_CID_LEN, &pn_be, 8);
                                 
                 size_t out_len;
-                encrypt_aead_packet(conn->current_aes_gcm_key, pkt_num, payload, offset, buf + SCL_HEADER_MIN_LEN, &out_len);
+                encrypt_aead_packet(conn->current_aes_gcm_key, pkt_num, payload, offset, buf + SCL_HEADER_MIN_LEN, &out_len, buf, SCL_HEADER_MIN_LEN);
                                 
                 size_t total_sent = SCL_HEADER_MIN_LEN + out_len;
                 commit_tx_buffer_relayed(conn, token, total_sent, &target_addr);
@@ -1623,7 +1625,7 @@ void process_egress_queues(SclConnection *conn, Message *msg) {
 
                     uint8_t ciphertext_frag[SCL_MAX_CHUNK_SIZE + 16];
                     size_t out_len_frag;
-                    encrypt_aead_packet(conn->flight3_aes_gcm_key, frag_pkt_num, payload_ptr, chunk, ciphertext_frag, &out_len_frag);
+                    encrypt_aead_packet(conn->flight3_aes_gcm_key, frag_pkt_num, payload_ptr, chunk, ciphertext_frag, &out_len_frag, buf, SCL_HEADER_MIN_LEN + 76);
                             
                     memcpy(buf + SCL_HEADER_MIN_LEN + 76, ciphertext_frag, out_len_frag);
                     total_sent = SCL_HEADER_MIN_LEN + 76 + out_len_frag;
@@ -1656,7 +1658,7 @@ void process_egress_queues(SclConnection *conn, Message *msg) {
                             
                     uint8_t ciphertext_frag[SCL_MAX_CHUNK_SIZE + 16];
                     size_t out_len_frag;
-                    encrypt_aead_packet(conn->current_aes_gcm_key, frag_pkt_num, payload_ptr, chunk, ciphertext_frag, &out_len_frag);
+                    encrypt_aead_packet(conn->current_aes_gcm_key, frag_pkt_num, payload_ptr, chunk, ciphertext_frag, &out_len_frag, buf, SCL_HEADER_MIN_LEN + 12);
                         
                     memcpy(buf + SCL_HEADER_MIN_LEN + 12, ciphertext_frag, out_len_frag);
                     total_sent = SCL_HEADER_MIN_LEN + 12 + out_len_frag;
@@ -1731,7 +1733,7 @@ void process_egress_queues(SclConnection *conn, Message *msg) {
                     memcpy(buf + 1 + SCL_CID_LEN, &pn_be, 8);
                     
                     size_t out_len;
-                    encrypt_aead_packet(conn->current_aes_gcm_key, pkt_num, ping_payload, 1, buf + SCL_HEADER_MIN_LEN, &out_len);
+                    encrypt_aead_packet(conn->current_aes_gcm_key, pkt_num, ping_payload, 1, buf + SCL_HEADER_MIN_LEN, &out_len, buf, SCL_HEADER_MIN_LEN);
                     
                     size_t total_sent = SCL_HEADER_MIN_LEN + out_len;
                     global_shim->commit_tx_buffer(global_shim, token, total_sent, conn->cid, &conn->current_path);
@@ -1803,7 +1805,7 @@ void process_egress_queues(SclConnection *conn, Message *msg) {
                 memcpy(buf + 1 + SCL_CID_LEN, &pn_be, 8);
                 
                 size_t out_len;
-                encrypt_aead_packet(conn->current_aes_gcm_key, pkt_num, framed_payload, framed_len, buf + SCL_HEADER_MIN_LEN, &out_len);
+                encrypt_aead_packet(conn->current_aes_gcm_key, pkt_num, framed_payload, framed_len, buf + SCL_HEADER_MIN_LEN, &out_len, buf, SCL_HEADER_MIN_LEN);
                 
                 size_t total_sent = SCL_HEADER_MIN_LEN + out_len;
                 commit_tx_buffer_relayed(conn, token, total_sent, &conn->current_path);
@@ -1983,7 +1985,7 @@ void process_spsc_queue(SclConnection *conn, State *state, P2PNetwork *net, uint
                 }
 
                 uint8_t flight3_key[32];
-                derive_labeled_key(ss_init, "SCL flight3 key", flight3_key, 32);
+                derive_labeled_key(ss_init, "SCL flight3 key i2r", flight3_key, 32);
 
                 uint64_t raw_pkt_num;
                 memcpy(&raw_pkt_num, frame_ptr + 1 + SCL_CID_LEN, sizeof(uint64_t));
@@ -1991,7 +1993,7 @@ void process_spsc_queue(SclConnection *conn, State *state, P2PNetwork *net, uint
                 size_t enc_len = frame_len - (SCL_HEADER_MIN_LEN + 76);
                 size_t pt_len;
 
-                if (decrypt_aead_packet(flight3_key, pkt_num, frame_ptr + SCL_HEADER_MIN_LEN + 76, enc_len, decryption_buffer, &pt_len) != 0) {
+                if (decrypt_aead_packet(flight3_key, pkt_num, frame_ptr + SCL_HEADER_MIN_LEN + 76, enc_len, decryption_buffer, &pt_len, frame_ptr, SCL_HEADER_MIN_LEN + 76) != 0) {
                     if (global_state) {
                         pthread_mutex_lock(&global_state->hypergraph.lock);
                         bloom_filter_add(global_state->hypergraph.poison_bloom_aging, client_cid);
@@ -2013,7 +2015,7 @@ void process_spsc_queue(SclConnection *conn, State *state, P2PNetwork *net, uint
 
                 SclHandshakeSlot *slot = &us_state->handshake_slab->slots[target_idx];
                 uint8_t final_key[32];
-                derive_labeled_key(ss_init, "SCL final key", final_key, 32);
+                derive_labeled_key(ss_init, "SCL final key r2i", final_key, 32);
                 uint64_t slot_pkt_num = atomic_fetch_add_explicit(&slot->next_packet_num, 1, memory_order_relaxed);
 
                 if (frag_idx >= total_frags) {
@@ -2098,7 +2100,7 @@ void process_spsc_queue(SclConnection *conn, State *state, P2PNetwork *net, uint
                         synth_buf[0] |= SCL_PACKET_FLAG_SHORT_HEADER;
                         synth_buf[0] |= 0x08; // Flag pre-authenticated
 
-                        int ext = extract_l5_message(conn, state, synth_buf, slot->assembled_length, &sender_addr, in_msg, sender_pubkey, decryption_buffer, rx_time);
+                        int ext = extract_l5_message(conn, state, synth_buf, slot->assembled_length, &sender_addr, in_msg, sender_pubkey, decryption_buffer, rx_time, true);
                         if (ext > 0) crypto_verify_enqueue(state, conn, in_msg, sender_pubkey, &sender_addr);
                     }
 
@@ -2130,7 +2132,7 @@ void process_spsc_queue(SclConnection *conn, State *state, P2PNetwork *net, uint
                     
                     if (is_duplicate_f3) {
                         uint8_t final_key_dup[32];
-                        derive_labeled_key(ss_init, "SCL final key", final_key_dup, 32);
+                        derive_labeled_key(ss_init, "SCL final key r2i", final_key_dup, 32);
                         uint64_t dup_slot_pkt_num = atomic_fetch_add_explicit(&slot->next_packet_num, 1, memory_order_relaxed);
                         send_stateless_l4_ack(global_shim, client_cid, &sender_addr, final_key_dup, pkt_num, dup_slot_pkt_num);
                         
@@ -2227,7 +2229,8 @@ void process_spsc_queue(SclConnection *conn, State *state, P2PNetwork *net, uint
                             scl_connection_release(new_conn);
                             goto advance_queue;
                         }
-                        derive_labeled_key(ss_init_final, "SCL final key", new_conn->current_aes_gcm_key, 32);
+                        derive_labeled_key(ss_init_final, "SCL final key r2i", new_conn->current_aes_gcm_key, 32);
+                        derive_labeled_key(ss_init_final, "SCL final key i2r", new_conn->rx_aes_gcm_key, 32);
                         derive_rpc_siphash_key(ss_init_final, new_conn->rpc_siphash_key);
                                                 
                         new_conn->handshake_state = SCL_CONN_STATE_ESTABLISHED;
@@ -2260,7 +2263,7 @@ void process_spsc_queue(SclConnection *conn, State *state, P2PNetwork *net, uint
                         global_shim->register_connection(global_shim, client_cid, new_conn);
                         
                         // Dispatch Handshake Payloads through the brand new active connection context
-                        int ext = extract_l5_message(new_conn, state, synth_buf, slot->assembled_length, &sender_addr, in_msg, sender_pubkey, decryption_buffer, rx_time);
+                        int ext = extract_l5_message(new_conn, state, synth_buf, slot->assembled_length, &sender_addr, in_msg, sender_pubkey, decryption_buffer, rx_time, true);
                         if (ext > 0) crypto_verify_enqueue(state, new_conn, in_msg, sender_pubkey, &sender_addr);
                         
                         scl_connection_release(new_conn);
@@ -2311,7 +2314,7 @@ void process_spsc_queue(SclConnection *conn, State *state, P2PNetwork *net, uint
                         
                 size_t enc_len = frame_len - (SCL_HEADER_MIN_LEN + 12);
                 size_t pt_len;
-                if (decrypt_aead_packet(conn->current_aes_gcm_key, current_frag_pkt_num, frame_ptr + SCL_HEADER_MIN_LEN + 12, enc_len, decryption_buffer, &pt_len) != 0) {
+                if (decrypt_aead_packet(conn->rx_aes_gcm_key, current_frag_pkt_num, frame_ptr + SCL_HEADER_MIN_LEN + 12, enc_len, decryption_buffer, &pt_len, frame_ptr, SCL_HEADER_MIN_LEN + 12) != 0) {
                     if (global_state) {
                         pthread_mutex_lock(&global_state->hypergraph.lock);
                         bloom_filter_add(global_state->hypergraph.poison_bloom_aging, client_cid);
@@ -2609,7 +2612,7 @@ void process_spsc_queue(SclConnection *conn, State *state, P2PNetwork *net, uint
                                                                     
                                     synth_buf[0] = SCL_PACKET_FLAG_SHORT_HEADER | 0x08; // Flag pre-authenticated
                                                                                                     
-                                    int ext = extract_l5_message(conn, state, synth_buf, SCL_HEADER_MIN_LEN + act_len, &sender_addr, in_msg, sender_pubkey, decryption_buffer, rx_time);
+                                    int ext = extract_l5_message(conn, state, synth_buf, SCL_HEADER_MIN_LEN + act_len, &sender_addr, in_msg, sender_pubkey, decryption_buffer, rx_time, true);
                                     if (ext > 0) {
                                         crypto_verify_enqueue(state, conn, in_msg, sender_pubkey, &sender_addr);
                                     }
@@ -2675,7 +2678,7 @@ void process_spsc_queue(SclConnection *conn, State *state, P2PNetwork *net, uint
                     goto advance_queue;
                 }
                 // Unfragmented short header for established connection - process normally
-                int ext = extract_l5_message(conn, state, frame_ptr, frame_len, &sender_addr, in_msg, sender_pubkey, decryption_buffer, rx_time);
+                int ext = extract_l5_message(conn, state, frame_ptr, frame_len, &sender_addr, in_msg, sender_pubkey, decryption_buffer, rx_time, false);
                 if (ext > 0) crypto_verify_enqueue(state, conn, in_msg, sender_pubkey, &sender_addr);
             } else if (is_long_header) {
                 UserSpaceState *us_state = (UserSpaceState *)global_shim->impl_state;
@@ -2929,8 +2932,10 @@ void process_spsc_queue(SclConnection *conn, State *state, P2PNetwork *net, uint
                     // Securely wipe the ephemeral private key from memory immediately after decapsulation
                     explicit_bzero(conn->ephemeral_kyber_privkey, KYBER_SECRETKEY_LEN);
                                         
-                    derive_labeled_key(ss_init, "SCL flight3 key", conn->flight3_aes_gcm_key, 32);
-                    derive_labeled_key(ss_init, "SCL final key", conn->current_aes_gcm_key, 32);
+                    derive_labeled_key(ss_init, "SCL flight3 key i2r", conn->flight3_aes_gcm_key, 32);
+                    derive_labeled_key(ss_init, "SCL final key i2r", conn->current_aes_gcm_key, 32);
+                    derive_labeled_key(ss_init, "SCL flight3 key r2i", conn->rx_flight3_aes_gcm_key, 32);
+                    derive_labeled_key(ss_init, "SCL final key r2i", conn->rx_aes_gcm_key, 32);
                     derive_rpc_siphash_key(ss_init, conn->rpc_siphash_key);
                     
                     uint32_t inner_payload_len = DILITHIUM_PUBKEY_LEN + KYBER_PUBKEY_LEN + 19;
@@ -2991,7 +2996,7 @@ void process_spsc_queue(SclConnection *conn, State *state, P2PNetwork *net, uint
                 }
             } else {
                 // UNFRAGMENTED Packets safely bypass the buffer (neither short nor long header - shouldn't happen)
-                int ext = extract_l5_message(conn, state, frame_ptr, frame_len, &sender_addr, in_msg, sender_pubkey, decryption_buffer, rx_time);
+                int ext = extract_l5_message(conn, state, frame_ptr, frame_len, &sender_addr, in_msg, sender_pubkey, decryption_buffer, rx_time, false);
                 if (ext > 0) crypto_verify_enqueue(state, conn, in_msg, sender_pubkey, &sender_addr);
             }
         }
@@ -3734,6 +3739,24 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         save_user_wallet(&state.user_wallet, wallet_filename);
+    }
+
+    /* C-1 fix (split key): disposable testnet identity served on blank connects.
+     * Persisted to its own file so it is stable across restarts; copy the same file
+     * to every seed behind the load balancer for consistent serving. */
+    char testnet_filename[256];
+    snprintf(testnet_filename, sizeof(testnet_filename), "testnet_identity_%d.dat", config.port);
+    if (load_user_wallet(&state.testnet_identity_wallet, testnet_filename) == 0) {
+        scl_log(LOG_LEVEL_INFO, "Crypto", "Loaded shared testnet identity from %s", testnet_filename);
+    } else {
+        scl_log(LOG_LEVEL_INFO, "Crypto", "No %s found. Generating new testnet identity...", testnet_filename);
+        if (!create_user_wallet(&state.testnet_identity_wallet)) {
+            scl_log(LOG_LEVEL_FATAL, "Crypto", "Failed to generate testnet identity wallet");
+            pthread_mutex_unlock(&state.wallet_mutex);
+            cleanup_handler(SIGINT);
+            return 1;
+        }
+        save_user_wallet(&state.testnet_identity_wallet, testnet_filename);
     }
     // Unify Peer and User Dilithium identities to ensure seamless key routing and verification in DKG
     memcpy(peer_wallet.dilithium_pubkey, state.user_wallet.dilithium_pubkey, DILITHIUM_PUBKEY_LEN);
