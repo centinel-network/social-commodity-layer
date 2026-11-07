@@ -676,8 +676,13 @@ function handleProcessFrame(wireBytes) {
 
                     let tvdCommitmentHex = '';
                     let validatorSigHex = '';
-                    if (payloadLen >= 2124) {
-                        const commBytes = payloadBytes.subarray(76, 76 + 32);
+                    /* Layout (quantum_tvd.h QuantumDriftCertificate):
+                     * commitment_blinding[32] sits at 76..108 and must NOT be
+                     * exposed as the commitment; the 2048-byte BdlopCommitment
+                     * starts at 108. Gate on 2156 so the whole commitment is
+                     * present before exposing its first 32 bytes (c1). */
+                    if (payloadLen >= 2156) {
+                        const commBytes = payloadBytes.subarray(108, 108 + 32);
                         tvdCommitmentHex = Array.from(commBytes).map(b => b.toString(16).padStart(2, '0')).join('');
                     }
                     if (payloadLen >= 6751) {
@@ -853,9 +858,18 @@ function handleProcessFrame(wireBytes) {
                         nodePrivkeyHex = Array.from(privkeyBytes).map(b => b.toString(16).padStart(2, '0')).join('');
                     }
 
+                    // SCL402: fee-recipient pubkey appended by the bridge at offset
+                    // 44 + 2592 + 4864. SHA-256(nodeFeePubkeyHex) equals
+                    // SclRpcPaymentChallenge.recipientHex in the binary 402 challenge.
+                    let nodeFeePubkeyHex = "";
+                    if (payloadLen >= 44 + 2592 + 4864 + 2592) {
+                        const feePubkeyBytes = payloadBytes.subarray(44 + 2592 + 4864, 44 + 2592 + 4864 + 2592);
+                        nodeFeePubkeyHex = Array.from(feePubkeyBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                    }
+
                     postMessage({
                         type: 'CHAIN_INFO_RECEIVED',
-                        data: { blockHeight, totalSubunits, totalStaked, committeeCount, activeDkgSessions, lastDkgEpoch, totalFees, nodePubkeyHex, nodePrivkeyHex }
+                        data: { blockHeight, totalSubunits, totalStaked, committeeCount, activeDkgSessions, lastDkgEpoch, totalFees, nodePubkeyHex, nodePrivkeyHex, nodeFeePubkeyHex }
                     });
                 }
             }
