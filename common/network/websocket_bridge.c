@@ -379,12 +379,32 @@ static int perform_handshake(State *state, int fd, char *req_buf, size_t req_len
     if (base64_encode(sha1_out, 20, accept_key, sizeof(accept_key)) != 0) return -1;
 
     // 4. Transmit HTTP 101 Switching Protocols response
+    /* RFC 6455 §4.2.2: when the client offers Sec-WebSocket-Protocol the server
+     * MUST echo exactly one selected subprotocol in its 101 response. Chromium,
+     * Edge and Brave abort the connection when a requested subprotocol is not
+     * selected (Firefox/Safari tolerate the omission) — the SCL402 bearer token
+     * rides as the second offered subprotocol entry, so every Chromium-based
+     * visitor was left with a dead pipeline and a silent reconnect loop. */
+    const char *offered_proto = strstr(req_buf, "Sec-WebSocket-Protocol:");
+    if (!offered_proto) offered_proto = strstr(req_buf, "sec-websocket-protocol:");
+    bool echo_subprotocol = (offered_proto != NULL && strstr(offered_proto, "SCL402") != NULL);
+
     char response[512];
-    int resp_len = snprintf(response, sizeof(response),
+    int resp_len;
+    if (echo_subprotocol) {
+        resp_len = snprintf(response, sizeof(response),
+                            "HTTP/1.1 101 Switching Protocols\r\n"
+                            "Upgrade: websocket\r\n"
+                            "Connection: Upgrade\r\n"
+                            "Sec-WebSocket-Accept: %s\r\n"
+                            "Sec-WebSocket-Protocol: SCL402\r\n\r\n", accept_key);
+    } else {
+        resp_len = snprintf(response, sizeof(response),
                             "HTTP/1.1 101 Switching Protocols\r\n"
                             "Upgrade: websocket\r\n"
                             "Connection: Upgrade\r\n"
                             "Sec-WebSocket-Accept: %s\r\n\r\n", accept_key);
+    }
 
     if (safe_ws_write(fd, (const uint8_t *)response, resp_len) != resp_len) return -1;
     return 0;
@@ -413,13 +433,14 @@ static int perform_handshake(State *state, int fd, char *req_buf, size_t req_len
  *
  * @complexity Time: O(payload_len), Space: O(1).
  */
-static int ws_decode_frame(uint8_t *in_buf, size_t in_len, uint8_t *out_payload, size_t *out_len, size_t *frame_bytes_consumed) {
+static int ws_decode_frame(uint8_t *in_buf, size_t in_len, uint8_t *out_payload, size_t *out_len, size_t *frame_bytes_consumed, uint8_t *out_opcode) {
     if (in_len < 2) return 0; // Need more data
 
     uint8_t b0 = in_buf[0];
     uint8_t b1 = in_buf[1];
 
     uint8_t opcode = b0 & 0x0F;
+    if (out_opcode) *out_opcode = opcode;
     bool masked = (b1 & 0x80) != 0;
     uint64_t payload_len = b1 & 0x7F;
 
@@ -600,6 +621,99 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
 
     size_t actual_payload_len = 0;
 
+    /* ------------------------------------------------------------------
+     * SCL402 (receipt strip): Payment Receipt Extraction & Verification.
+     * Mirror rpc.c:472-524. The wasm builder prepends a 41-byte
+     * SclRpcPaymentReceipt ahead of the method args when
+     * SCL_RPC_FLAG_PAYMENT_RECEIPT is set; consume and strip it here so
+     * handlers parse real arguments at final_payload[0]. Without this the
+     * 0x000A handler reads receipt bytes as `shots` -> INVALID_ARGS.
+     * ------------------------------------------------------------------ */
+    bool payment_verified = false;
+    if (hdr->flags & SCL_RPC_FLAG_PAYMENT_RECEIPT) {
+        size_t sig_len = (hdr->flags & SCL_RPC_FLAG_SIGNED) ? DILITHIUM_SIGNATURE_LEN : 0;
+        size_t receipt_len = sizeof(SclRpcPaymentReceipt);
+
+        if (final_payload_len >= sig_len + receipt_len) {
+            SclRpcPaymentReceipt receipt_storage;
+            memcpy(&receipt_storage, final_payload + sig_len, receipt_len);
+
+            pthread_rwlock_rdlock(&state->bc.rwlock);
+            if (receipt_storage.payment_type == 0x01) { // OP_TRANSFER_POINTER
+                if (hash_table_lookup(state->processed_txs, receipt_storage.tx_id, true)) payment_verified = true;
+            } else if (receipt_storage.payment_type == 0x02) { // OP_REDEEM_CENTINEL
+                if (hash_table_lookup(state->bc.centinel.nullifier_set, receipt_storage.tx_id, true)) payment_verified = true;
+            }
+            pthread_rwlock_unlock(&state->bc.rwlock);
+
+            if (!payment_verified) {
+                for (int i = 0; i < MAX_PENDING_OPS; i++) {
+                    Operation *pop = atomic_load_explicit(&state->pending_operations[i], memory_order_acquire);
+                    if (pop) {
+                        const uint8_t *tx_id = get_operation_tx_id(pop);
+                        if (tx_id && memcmp(tx_id, receipt_storage.tx_id, 32) == 0) {
+                            payment_verified = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            final_payload += sig_len + receipt_len;
+            final_payload_len -= (uint32_t)(sig_len + receipt_len);
+        }
+    }
+
+    /* ------------------------------------------------------------------
+     * SCL402 (binary challenge): metered-method payment gate.
+     * Mirror rpc.c:1327-1332 + send_rpc_payment_required (rpc.c:223-274).
+     * Browsers cannot read the HTTP-level 402 emitted at upgrade time
+     * (failed WS upgrades expose no body/headers to page JS); the auditor
+     * worker only understands a binary frame with status 0x0192 and a
+     * 90-byte SclRpcPaymentChallenge (auditor.worker.js:369-396).
+     * ------------------------------------------------------------------ */
+    if (method_id == 0x000A && !payment_verified && state->config.is_daemon) {
+        rh->status_code = htobe16(SCL_RPC_STATUS_PAYMENT_REQUIRED);
+
+        SclRpcPaymentChallenge *challenge = (SclRpcPaymentChallenge *)(resp_buf + 32);
+        memset(challenge, 0, sizeof(SclRpcPaymentChallenge));
+        challenge->amount_subunits = htobe64(160000000ULL); /* 1 SCL fee (parity with rpc.c:1330) */
+        challenge->price_rate_lock_id = htobe64(get_time_us());
+
+        pthread_mutex_lock(&state->wallet_mutex);
+        SHA256(state->user_wallet.dilithium_pubkey, DILITHIUM_PUBKEY_LEN, challenge->recipient_address);
+        pthread_mutex_unlock(&state->wallet_mutex);
+
+        /* challenge_hash = SHA256(request_id || method_id || salt) */
+        uint8_t seed_buf[18];
+        uint64_t req_be = htobe64(req_id);
+        uint16_t meth_be = htobe16(method_id);
+        memcpy(seed_buf, &req_be, 8);
+        memcpy(seed_buf + 8, &meth_be, 2);
+        uint64_t salt = get_real_time_us();
+        memcpy(seed_buf + 10, &salt, 8);
+        SHA256(seed_buf, sizeof(seed_buf), challenge->challenge_hash);
+
+        challenge->valid_until_timestamp = htobe64(get_time_ms() + 300000); /* 5-minute TTL */
+        challenge->accepted_payment_types = htobe16(0x0003); /* Transfer (0x01) + Centinel (0x02) */
+
+        rh->payload_len = htobe32((uint32_t)sizeof(SclRpcPaymentChallenge));
+        size_t challenge_resp_len = 32 + sizeof(SclRpcPaymentChallenge);
+
+        size_t ws_max402 = challenge_resp_len + 16;
+        uint8_t *ws_buf402 = malloc(ws_max402);
+        if (ws_buf402) {
+            size_t ws_frame_len402 = 0;
+            if (ws_encode_frame(resp_buf, challenge_resp_len, ws_buf402, ws_max402, &ws_frame_len402) == 0) {
+                safe_ws_write(tcp_fd, ws_buf402, ws_frame_len402);
+            }
+            free(ws_buf402);
+        }
+        free(resp_buf);
+        if (decomp_buf) free(decomp_buf);
+        return;
+    }
+
     // Dispatch local method execution by opcode
     switch (method_id) {
         case 0x0001: { // GetBalance
@@ -654,7 +768,11 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                         }
                     }
                 }
-                uint64_t num_val_utxos = (uint64_t)state->user_wallet.num_val_utxos;
+                /* Report the number of entries actually appended for the
+                 * audited target (u_idx), not the wallet-global count: the
+                 * client consumes this field as the target's own unspent-UTXO
+                 * count to mark r-indices as used. */
+                uint64_t num_val_utxos = (uint64_t)u_idx;
 
                 uint8_t user_id[USER_ID_LEN];
                 SHA256(target_pk, PUBKEY_LEN, user_id);
@@ -1294,8 +1412,13 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
             pthread_mutex_lock(&state->wallet_mutex);
             memcpy(resp_buf + 32 + 44, state->testnet_identity_wallet.dilithium_pubkey, PUBKEY_LEN);
             memcpy(resp_buf + 32 + 44 + PUBKEY_LEN, state->testnet_identity_wallet.dilithium_privkey, PRIVKEY_LEN);
+            /* SCL402: append the fee-recipient pubkey (user_wallet — the wallet
+             * whose SHA-256 address is SclRpcPaymentChallenge.recipient_address).
+             * Public key only; the operator secret never leaves the node. Browsers
+             * need the full 2,592-byte key to build the paying OP_TRANSFER_POINTER. */
+            memcpy(resp_buf + 32 + 44 + PUBKEY_LEN + PRIVKEY_LEN, state->user_wallet.dilithium_pubkey, PUBKEY_LEN);
             pthread_mutex_unlock(&state->wallet_mutex);
-            actual_payload_len = 44 + PUBKEY_LEN + PRIVKEY_LEN;
+            actual_payload_len = 44 + PUBKEY_LEN + PRIVKEY_LEN + PUBKEY_LEN;
             break;
         }
         case 0x000A: { // Quantum TVD Audit
@@ -1521,15 +1644,31 @@ static void *ws_client_handler(void *arg) {
     scl_log(LOG_LEVEL_INFO, "Bridge", "Handling new WebSocket connection");
 
     char handshake_buf[WS_HANDSHAKE_BUFFER_SIZE];
-    ssize_t h_read = SCL_READ_SOCKET(tcp_fd, handshake_buf, sizeof(handshake_buf) - 1);
-    if (h_read <= 0) {
+    /* RFC 6455 §4.1: read the COMPLETE client handshake before responding.
+     * The upgrade request can arrive split across TCP segments (TLS-terminating
+     * proxies such as the GCLB front end frequently split it), and a single
+     * read() returns as soon as any bytes are available — so accumulate until
+     * the header terminator shows up, the buffer fills, or a 2s poll deadline
+     * expires. HTTP headers contain no NUL bytes, so strstr is safe here. */
+    size_t h_total = 0;
+    while (h_total < sizeof(handshake_buf) - 1) {
+        struct pollfd h_pfd = { .fd = tcp_fd, .events = POLLIN };
+        if (poll(&h_pfd, 1, 2000) <= 0) break;
+        ssize_t h_read = SCL_READ_SOCKET(tcp_fd, handshake_buf + h_total,
+                                         sizeof(handshake_buf) - 1 - h_total);
+        if (h_read <= 0) break;
+        h_total += (size_t)h_read;
+        handshake_buf[h_total] = '\0';
+        if (strstr(handshake_buf, "\r\n\r\n") != NULL) break;
+    }
+    if (h_total == 0) {
         SCL_CLOSE_SOCKET(tcp_fd);
         free(ctx);
         return NULL;
     }
-    handshake_buf[h_read] = '\0';
+    handshake_buf[h_total] = '\0';
 
-    if (perform_handshake(ctx->state, tcp_fd, handshake_buf, h_read) != 0) {
+    if (perform_handshake(ctx->state, tcp_fd, handshake_buf, h_total) != 0) {
         scl_log(LOG_LEVEL_WARN, "Bridge", "WebSocket handshake failed or 402 Payment Required emitted");
         SCL_CLOSE_SOCKET(tcp_fd);
         free(ctx);
@@ -1614,8 +1753,9 @@ static void *ws_client_handler(void *arg) {
             while (stream_pos - processed >= 2) {
                 size_t frame_consumed = 0;
                 size_t decoded_len = 0;
-                ssize_t dec_status = ws_decode_frame(tcp_in_stream + processed, stream_pos - processed,
-                                                     payload_buf, &decoded_len, &frame_consumed);
+                uint8_t frame_opcode = 0;
+                int dec_status = ws_decode_frame(tcp_in_stream + processed, stream_pos - processed,
+                                                 payload_buf, &decoded_len, &frame_consumed, &frame_opcode);
                 if (dec_status == 0) {
                     break; // Frame incomplete, wait for more bytes
                 }
@@ -1626,6 +1766,28 @@ static void *ws_client_handler(void *arg) {
                 if (dec_status == -2) {
                     disconnect_requested = true;
                     break; // Connection close requested
+                }
+                if (frame_opcode == 0x09) {
+                    /* RFC 6455 §5.5.2: a Ping MUST be answered with a Pong
+                     * echoing the payload (control payloads are capped at 125
+                     * bytes). Pings previously fell through to the non-RPC
+                     * drop below and were never answered. */
+                    if (decoded_len > 125) { // §5.5 control-frame payload cap
+                        disconnect_requested = true;
+                        break;
+                    }
+                    uint8_t pong_buf[2 + 125];
+                    pong_buf[0] = 0x8A; // FIN=1, Opcode=0xA (Pong)
+                    pong_buf[1] = (uint8_t)decoded_len;
+                    if (decoded_len > 0) memcpy(pong_buf + 2, payload_buf, decoded_len);
+                    safe_ws_write(tcp_fd, pong_buf, 2 + decoded_len);
+                    processed += frame_consumed;
+                    continue;
+                }
+                if (frame_opcode == 0x0A) {
+                    // Unsolicited Pong (heartbeat reply): consume silently.
+                    processed += frame_consumed;
+                    continue;
                 }
 
                 if (decoded_len > 0) {
