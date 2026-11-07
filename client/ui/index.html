@@ -199,7 +199,7 @@
     <link rel="apple-touch-icon" sizes="180x180" href="favicon_io/apple-touch-icon.png">
     <link rel="icon" type="image/png" sizes="16x16" href="favicon_io/favicon-16x16.png">
     <link rel="icon" type="image/png" sizes="32x32" href="favicon_io/favicon-32x32.png">
-    <link rel="manifest" href="site.webmanifest">
+    <link rel="manifest" href="favicon_io/site.webmanifest">
     <script>
         (function() {
             const savedTheme = localStorage.getItem('theme') || 'dark';
@@ -2630,12 +2630,6 @@
                         </div>
                     </div>
                     <div class="canvas-container" style="margin-top: 12px;">
-                        <div style="display: none;">
-                            <!-- Ensures helper targets are aligned -->
-                            <button id="btn-zoom-in" class="btn" style="padding: 4px 12px; font-size: 0.75rem; background-color: var(--bg-primary); border-color: var(--border-color); color: var(--text-main); height: auto; line-height: normal;">Zoom In</button>
-                            <button id="btn-zoom-out" class="btn" style="padding: 4px 12px; font-size: 0.75rem; background-color: var(--bg-primary); border-color: var(--border-color); color: var(--text-main); height: auto; line-height: normal;">Zoom Out</button>
-                            <button id="btn-reset-3d" class="btn" style="padding: 4px 12px; font-size: 0.75rem; background-color: var(--bg-primary); border-color: var(--border-color); color: var(--text-main); height: auto; line-height: normal;">Reset View</button>
-                        </div>
                         <canvas id="mmr-canvas" width="1150" height="450"></canvas>
                     </div>
                 </div>
@@ -3249,6 +3243,20 @@
                     <div class="form-group">
                         <label for="search-user-id">Search by User ID (HEX)</label>
                         <input type="text" id="search-user-id" placeholder="Enter User ID...">
+                    </div>
+                    <div class="form-group">
+                        <label for="search-tx-hash">Audit Transaction by Hash (64 HEX chars)</label>
+                        <div style="display: flex; gap: 8px;">
+                            <input type="text" id="search-tx-hash" placeholder="Enter Tx Hash...">
+                            <button id="btn-search-tx" class="btn" style="background-color: var(--bg-primary); border-color: var(--border-color); color: var(--text-main); white-space: nowrap;">Audit Tx</button>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="search-block-height">Audit Block by Height</label>
+                        <div style="display: flex; gap: 8px;">
+                            <input type="number" id="search-block-height" min="0" placeholder="e.g. 6">
+                            <button id="btn-search-block" class="btn" style="background-color: var(--bg-primary); border-color: var(--border-color); color: var(--text-main); white-space: nowrap;">Audit Block</button>
+                        </div>
                     </div>
                 </div>
 
