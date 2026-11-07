@@ -538,7 +538,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const statusText = document.getElementById('status-text');
     const matchesList = document.getElementById('matches-list');
     const canvas = document.getElementById('mmr-canvas');
-    const centinelFileInput = document.getElementById('centinel-file');
     const toggle3dBtn = document.getElementById('btn-toggle-3d');
 
     // Key Generator UI Elements
@@ -689,6 +688,16 @@ document.addEventListener('DOMContentLoaded', () => {
             toggle3dBtn.textContent = renderer.is3D ? "Toggle 2D Mode" : "Toggle 3D Mode";
             toggle3dBtn.style.backgroundColor = renderer.is3D ? "var(--bg-primary)" : "var(--accent-green)";
             toggle3dBtn.style.color = renderer.is3D ? "var(--text-main)" : "#ffffff";
+            /* Zoom / reset only apply to the 3D projection — reflect that in
+             * the toolbar instead of leaving three dead buttons in 2D view. */
+            [document.getElementById('btn-zoom-in'),
+             document.getElementById('btn-zoom-out'),
+             document.getElementById('btn-reset-3d')].forEach(btn => {
+                if (!btn) return;
+                btn.disabled = !renderer.is3D;
+                btn.title = renderer.is3D ? '' : 'Available in 3D mode';
+                btn.style.opacity = renderer.is3D ? '1' : '0.5';
+            });
         });
     }
 
@@ -722,6 +731,15 @@ document.addEventListener('DOMContentLoaded', () => {
             if (renderer.is3D) renderer.resetRotation();
         });
     }
+
+    // Start the toolbar in the correct (2D) state: zoom controls are 3D-only
+    [zoomInBtn, zoomOutBtn, reset3dBtn].forEach(btn => {
+        if (btn) {
+            btn.disabled = true;
+            btn.title = 'Available in 3D mode';
+            btn.style.opacity = '0.5';
+        }
+    });
 
     // Default Node Coordinates & Persistent Testnet Wallet Initialization
     const host = window.location.hostname || 'localhost';
@@ -917,6 +935,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function send_chain_info_fallback() {
         if (client) client.lastChainInfoResponseTime = Date.now();
+        /* Never fabricate telemetry: if no chain info has ever been received on
+         * this page load, keep the honest "Awaiting Telemetry..." placeholders
+         * instead of painting authoritative-looking zeros (Active Nodes: 0,
+         * height 0). The window.lastKnown* values are only set by a real
+         * onChainInfoReceived. */
+        if (window.lastKnownChainHeight === undefined &&
+            window.lastKnownCommitteeCount === undefined &&
+            window.lastStableCommitteeCount === undefined) {
+            return;
+        }
         window.hasDkgTelemetry = true;
         window.hasLatticeTelemetry = true;
         window.hasInvariantTelemetry = true;
@@ -988,6 +1016,13 @@ document.addEventListener('DOMContentLoaded', () => {
     // Register Status Updates
     client.onStatusChange = (status) => {
         let displayStatus = (status || '').replace(/_/g, ' ');
+        /* Only a genuine onopen event (auditor_client logs 'PIPELINE CONNECTED'
+         * from socket.onopen) may run the connection-lifecycle reset below.
+         * The KEYS INITIALIZED remap is badge-only: key hot-swap re-injection
+         * posts KEYS_INITIALIZED while the socket stays open, and letting the
+         * remapped string drive the reset branch wiped the entire synced chain
+         * state (MMR canvas, blocks, ledger) on every keystroke. */
+        const isFreshPipelineConnection = (status === 'PIPELINE CONNECTED');
         if ((displayStatus === 'KEYS INITIALIZED' || status === 'KEYS_INITIALIZED') && client.socket && client.socket.readyState === WebSocket.OPEN) {
             displayStatus = 'PIPELINE CONNECTED';
         }
@@ -997,7 +1032,7 @@ document.addEventListener('DOMContentLoaded', () => {
             connectBtn.disabled = false;
             connectBtn.textContent = 'Connect Node';
             connectBtn.className = 'btn btn-connect';
-        } else if (displayStatus === 'PIPELINE CONNECTED' || status === 'PIPELINE_CONNECTED') {
+        } else if (isFreshPipelineConnection) {
             connectBtn.disabled = false;
             connectBtn.textContent = 'Disconnect';
             connectBtn.className = 'btn btn-disconnect';
@@ -2764,8 +2799,15 @@ document.addEventListener('DOMContentLoaded', () => {
     function hotSwapCredentials() {
         if (client && client.socket && client.socket.readyState === WebSocket.OPEN) {
             const targetUrl = nodeUrlInput ? nodeUrlInput.value.trim() : client.wsUrl;
-            if (client.socket.url !== targetUrl && client.socket.url !== targetUrl + "/") {
-                return; // Let the reconnect logic handle this if URL changed
+            /* Accept the connection when it matches either the input URL or the
+             * client's live wsUrl: the auto-reconnect logic flips wsUrl between
+             * localhost and 127.0.0.1 after a dropped connection, and the old
+             * input-only comparison permanently disabled key hot-swap in that
+             * state. */
+            const matchesInput = client.socket.url === targetUrl || client.socket.url === targetUrl + "/";
+            const matchesLive = client.socket.url === client.wsUrl || client.socket.url === client.wsUrl + "/";
+            if (!matchesInput && !matchesLive) {
+                return; // Socket is connected to a different endpoint than the UI believes
             }
 
             const rawPrf = prfKeyInput ? prfKeyInput.value.trim() : "";
@@ -2864,6 +2906,15 @@ document.addEventListener('DOMContentLoaded', () => {
     if (walletPubkeyInput) walletPubkeyInput.addEventListener('input', hotSwapCredentials);
     if (walletPrivkeyInput) walletPrivkeyInput.addEventListener('input', hotSwapCredentials);
 
+    /* Export the settlement helpers on window: auditor_client's 402 handler
+     * (_handleAutonomousSettlement) resolves them via
+     * window.selectUnspentPointers / window.resolveWalletCredentials, but both
+     * lived as closures in this scope, so every settlement attempt aborted
+     * with "Missing pointer selector". Function declarations hoist, so this is
+     * safe even though selectUnspentPointers is defined further below. */
+    window.selectUnspentPointers = selectUnspentPointers;
+    window.resolveWalletCredentials = resolveWalletCredentials;
+
     // Form Event Listeners
     connectBtn.addEventListener('click', () => {
         if (window.auditTimeoutTimer) {
@@ -2872,8 +2923,13 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         
         const targetUrl = nodeUrlInput ? nodeUrlInput.value.trim() : client.wsUrl;
-        const isDisconnecting = client.socket && client.socket.readyState === WebSocket.OPEN &&
-                               (client.socket.url === targetUrl || client.socket.url === targetUrl + "/");
+        /* Decide by connection state, not URL equality: the auto-reconnect
+         * logic flips this.wsUrl between localhost and 127.0.0.1 on every
+         * dropped connection, so socket.url can legitimately differ from the
+         * input box while the pipeline is live. The old URL-equality gate
+         * turned the red "Disconnect" button into a silent reconnect in
+         * exactly that state. */
+        const isDisconnecting = client.socket && (client.socket.readyState === WebSocket.OPEN || client.socket.readyState === WebSocket.CONNECTING) && connectBtn.classList.contains('btn-disconnect');
         
         if (isDisconnecting) {
             lastHotSwappedCredentials = "";
@@ -3188,6 +3244,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const intervalMins = Math.round(60 / currentInputVal);
         if (apCadencePreview) apCadencePreview.textContent = intervalMins <= 1 ? 'Every 1 min' : `Every ${intervalMins} min`;
+        /* The Estimated Yield card was a frozen hard-coded "+¢1-10/hr" that
+         * never reflected state (and showed a yield while Auto-Pilot was
+         * disabled). Placeholder formula — replace with the real reward model. */
+        const apYieldPreview = document.getElementById('ap-yield-preview');
+        if (apYieldPreview) {
+            apYieldPreview.textContent = autopilotState.enabled ? `+¢${currentInputVal}/hr` : '—';
+        }
 
         if (btnToggleAutopilot) {
             if (autopilotState.enabled) {
