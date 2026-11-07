@@ -1325,7 +1325,14 @@ void handle_rpc_request(State *state, RpcTask *task) {
             break;
         }
         case 0x000A: { // Quantum TVD Audit
-            if (!payment_verified && state->config.is_daemon) {
+            /* SCL402 scope fix: meter only expensive client-supplied OpenQASM
+             * circuits (payload_len > 36, mirroring the handler's own
+             * circuit_bytes detection). The default 7-qubit telemetry audit
+             * feeds the explorer's TVD panel and must stay unmetered like the
+             * other telemetry methods, or the panel sticks on
+             * "Awaiting Telemetry" on zero-balance testnet wallets. */
+            bool tvd_custom_circuit = (hdr.payload_len > 36);
+            if (tvd_custom_circuit && !payment_verified && state->config.is_daemon) {
                 // Require a 1 SCL fee (160,000,000 subunits) for expensive QPU audits
                 send_rpc_payment_required(state, task->conn, hdr.method_id, hdr.request_id, 160000000ULL);
                 break;
