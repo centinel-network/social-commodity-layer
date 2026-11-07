@@ -367,19 +367,27 @@ function handleProcessFrame(wireBytes) {
         }
 
         if (status === 0x0192) { // SCL_RPC_STATUS_PAYMENT_REQUIRED (402)
-            const challengePtr = wasmInstance._wasm_malloc(90); // sizeof(SclRpcPaymentChallenge)
+            /* sizeof(SclRpcPaymentChallenge) is 96 bytes on the wire (90 field
+             * bytes + 6 tail padding); _wasm_parser_get_payment_challenge
+             * memcpy's the full struct, so a 90-byte alloc overflowed by 6. */
+            const challengePtr = wasmInstance._wasm_malloc(96);
             if (wasmInstance._wasm_parser_get_payment_challenge(parserCtx, challengePtr) === 0) {
                 const heap = getLiveHeapU8();
                 const chView = new DataView(heap.buffer, heap.byteOffset + challengePtr, 90);
                 
-                const amountSubunits = chView.getBigUint64(0, false).toString();
-                const rateLockId = chView.getBigUint64(8, false).toString();
+                /* scl_rpc_parser_get_payment_challenge() normalizes all fields
+                 * with be64toh()/be16toh(), so this buffer holds HOST-order
+                 * (little-endian) values. Reading big-endian double-swapped
+                 * them: the 1 SCL fee (160,000,000 subunits) decoded as
+                 * 29,424,069,325,619,200, so auto-settlement never succeeded. */
+                const amountSubunits = chView.getBigUint64(0, true).toString();
+                const rateLockId = chView.getBigUint64(8, true).toString();
                 const recipientHex = Array.from(heap.subarray(challengePtr + 16, challengePtr + 48))
                     .map(b => b.toString(16).padStart(2, '0')).join('');
                 const challengeHashHex = Array.from(heap.subarray(challengePtr + 48, challengePtr + 80))
                     .map(b => b.toString(16).padStart(2, '0')).join('');
-                const validUntil = Number(chView.getBigUint64(80, false));
-                const acceptedTypes = chView.getUint16(88, false);
+                const validUntil = Number(chView.getBigUint64(80, true));
+                const acceptedTypes = chView.getUint16(88, true);
                 
                 postMessage({
                     type: 'PAYMENT_REQUIRED',
