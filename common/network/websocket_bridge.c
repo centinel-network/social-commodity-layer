@@ -664,15 +664,15 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
         }
     }
 
-    /* ------------------------------------------------------------------
-     * SCL402 (binary challenge): metered-method payment gate.
-     * Mirror rpc.c:1327-1332 + send_rpc_payment_required (rpc.c:223-274).
-     * Browsers cannot read the HTTP-level 402 emitted at upgrade time
-     * (failed WS upgrades expose no body/headers to page JS); the auditor
-     * worker only understands a binary frame with status 0x0192 and a
-     * 90-byte SclRpcPaymentChallenge (auditor.worker.js:369-396).
-     * ------------------------------------------------------------------ */
-    if (method_id == 0x000A && !payment_verified && state->config.is_daemon) {
+    /* SCL402 scope fix: meter only client-supplied OpenQASM circuits
+     * (final_payload_len > 36, the handler's own circuit_bytes detection).
+     * The default 7-qubit telemetry audit (~1-2 ms local qsim) feeds the
+     * explorer's "Quantum TVD Audit & Noise-Model Fidelity" panel; every
+     * other telemetry method is unmetered, and gating this one left the
+     * panel stuck on "Awaiting Telemetry" because auto-settlement needs
+     * liquid SCL the fresh testnet identity wallet does not hold. */
+    bool tvd_custom_circuit = (final_payload_len > 36);
+    if (method_id == 0x000A && tvd_custom_circuit && !payment_verified && state->config.is_daemon) {
         rh->status_code = htobe16(SCL_RPC_STATUS_PAYMENT_REQUIRED);
 
         SclRpcPaymentChallenge *challenge = (SclRpcPaymentChallenge *)(resp_buf + 32);
