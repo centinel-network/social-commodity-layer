@@ -274,6 +274,8 @@ class SclAuditorClient {
         this.autoSettlePayments = true;
         /** @type {Map<string, Object>} Tracks pending API queries awaiting transaction serialization. */
         this._pending402Replays = new Map();
+        /** @type {string|null} Full 2,592-byte node fee-recipient pubkey from chain info (SCL402). */
+        this._nodeFeePubkeyHex = null;
         /** @type {Function|null} Callback invoked upon transaction decryption audit. */
         this.onTransactionAudited = null;
         /** @type {Function|null} Callback invoked upon autopilot state update. */
@@ -683,6 +685,10 @@ class SclAuditorClient {
         const salt = BigInt(Math.floor(Math.random() * 65535));
         const reqId = (timestamp << 16n) | salt;
 
+        /* Remember which page of the walk this request opened: the
+         * RECENT_TXS_RECEIVED handler resets its accumulator whenever a walk
+         * restarts from page 0 (see the pagination fix there). */
+        this._lastTxCursor = cursor;
         this.worker.postMessage({
             type: 'BUILD_RECENT_TXS',
             data: {
@@ -839,6 +845,9 @@ class SclAuditorClient {
                 break;
             case 'CHAIN_INFO_RECEIVED':
                 this.lastChainInfoResponseTime = Date.now();
+                if (data.nodeFeePubkeyHex) {
+                    this._nodeFeePubkeyHex = data.nodeFeePubkeyHex;
+                }
                 if (this.onChainInfoReceived) {
                     this.onChainInfoReceived(data);
                 }
@@ -862,8 +871,15 @@ class SclAuditorClient {
                 break;
             case 'RECENT_TXS_RECEIVED':
                 if (data && data.txs) {
-                    const mempoolVal = document.getElementById('mempool-size-val');
-                    if (mempoolVal) mempoolVal.textContent = data.txs.length;
+                    /* Pagination: the bridge caps each page at
+                     * MAX_PAGINATION_RANGE (500) tx ids and signals further
+                     * pages via nextCursor. Accumulate across the walk and
+                     * paint the badge only when the walk completes; a fresh
+                     * walk (opened from cursor 0) restarts the total. */
+                    if (this._lastTxCursor === 0 || this._mempoolWalkTotal === undefined) {
+                        this._mempoolWalkTotal = 0;
+                    }
+                    this._mempoolWalkTotal += data.txs.length;
 
                     if (!this._seenMempoolTxs) this._seenMempoolTxs = new Set();
                     for (const txId of data.txs) {
@@ -873,6 +889,14 @@ class SclAuditorClient {
                             this._seenMempoolTxs.add(txHex);
                             this.requestTransaction(txBytes);
                         }
+                    }
+
+                    const hasMorePages = (data.nextCursor !== undefined && data.nextCursor !== null && data.nextCursor > 0);
+                    if (hasMorePages) {
+                        this.requestRecentTransactions(data.nextCursor);
+                    } else {
+                        const mempoolVal = document.getElementById('mempool-size-val');
+                        if (mempoolVal) mempoolVal.textContent = this._mempoolWalkTotal;
                     }
                 }
                 // Suppress onRecentTxsReceived to eliminate redundant [Mempool Tx] viewport messages
@@ -949,6 +973,15 @@ class SclAuditorClient {
      * @return {void}
      */
     _trySyncNodeWallet() {
+        /* SyncWalletKeys (0x0009) is categorically rejected with UNAUTHORIZED by
+         * both the WebSocket bridge and the P2P RPC handler (remote wallet
+         * mutation is disabled by design), and this.wsUrl can point at a remote
+         * wss:// endpoint. Never ship 8.5 KB of key material — including the
+         * 4,864-byte Dilithium private key — to a remote node just to receive a
+         * guaranteed rejection; restrict the sync to loopback dev sessions. */
+        if (!/^(ws|wss):\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/.test(this.wsUrl)) {
+            return;
+        }
         if (this.socket && this.socket.readyState === WebSocket.OPEN &&
             this.rawDilithiumPubkey && this.rawDilithiumPubkey.length === 2592 && !this.rawDilithiumPubkey.every(b => b === 0) &&
             this.rawDilithiumKey && this.rawDilithiumKey.length === 4864 && !this.rawDilithiumKey.every(b => b === 0) &&
@@ -1121,8 +1154,47 @@ class SclAuditorClient {
             methodId: challenge.methodId
         });
 
+        // SCL402: challenge.recipientHex is the node's 32-byte SHA-256 *address*,
+        // but the worker's OP_TRANSFER_POINTER builder requires the full 2,592-byte
+        // Dilithium pubkey and zero-fills anything shorter — paying the 32-byte hash
+        // directly would fund SHA256(0x00 x 2592), a burn address. Resolve the node
+        // pubkey whose SHA-256 equals the recipient address and pass that instead.
+        const resolveFeeRecipientPubkey = async () => {
+            const recipient = (challenge.recipientHex || '').toLowerCase();
+            if (!recipient || !window.crypto || !window.crypto.subtle) return null;
+
+            const candidates = [];
+            if (this._nodeFeePubkeyHex) candidates.push(this._nodeFeePubkeyHex);
+            if (typeof window.nodePubkeyHex === 'string') candidates.push(window.nodePubkeyHex);
+
+            for (const candidate of candidates) {
+                const hex = candidate.toLowerCase();
+                if (hex.length !== 5184) continue; // 2,592 bytes
+
+                const pubkeyBytes = new Uint8Array(2592);
+                for (let i = 0; i < 2592; i++) {
+                    pubkeyBytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+                }
+
+                const digest = await window.crypto.subtle.digest('SHA-256', pubkeyBytes);
+                const digestHex = Array.from(new Uint8Array(digest))
+                    .map(b => b.toString(16).padStart(2, '0')).join('');
+
+                if (digestHex === recipient) return hex;
+            }
+            return null;
+        };
+
+        const feeRecipientPubkeyHex = await resolveFeeRecipientPubkey();
+        if (!feeRecipientPubkeyHex) {
+            console.error('[Agent Bridge] Autonomous settlement aborted: no known node pubkey hashes to recipient ' +
+                challenge.recipientHex + '. Refusing to transfer to an unresolved (burn) address.');
+            this._pending402Replays.delete(reqIdStr);
+            return;
+        }
+
         this.submitTransaction(reqIdStr, 'OP_TRANSFER_POINTER', {
-            recipientPubkeyHex: challenge.recipientHex,
+            recipientPubkeyHex: feeRecipientPubkeyHex,
             senderPubkeyHex: pubKeyHex,
             privkeyHex: privKeyHex,
             amountSubunits: challenge.amountSubunits,
