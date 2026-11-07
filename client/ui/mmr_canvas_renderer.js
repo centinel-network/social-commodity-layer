@@ -906,7 +906,11 @@ class MmrCanvasRenderer {
 
         // Perspective Projection Math
         const fov = 600;
-        const scale = fov / (fov + z2);
+        /* Guard the projection denominator: idle auto-rotation drives yaw
+         * through ±90° every ~13s, where (fov + z2) crosses zero for edge
+         * nodes — exploding |scale| or mirroring the tree. Clamping keeps the
+         * perspective monotonic and bounded (scale <= 4). */
+        const scale = fov / Math.max(fov * 0.25, fov + z2);
 
         return {
             x: cx + x2 * scale * this.zoom,
