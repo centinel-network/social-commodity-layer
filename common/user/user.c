@@ -90,7 +90,15 @@ int user_init(User *user, State *state, const uint8_t *pubkey) {
         // Deterministically derive initial blinding factor r from master private key
         uint8_t r_input[DILITHIUM_SECRETKEY_LEN + 32];
         memcpy(r_input, state->user_wallet.dilithium_privkey, DILITHIUM_SECRETKEY_LEN);
-        int tag_len = snprintf((char *)(r_input + DILITHIUM_SECRETKEY_LEN), 32, "SCL_VAL_UTXO_0");
+        /* Born-spent genesis guard: after a restart the persistent nullifier store
+         * still holds the pre-restart genesis spend (the autopilot burns it within
+         * seconds of boot), so a fixed tag-0 genesis would be re-minted already
+         * spent and invisible. Derive at the first unspent tag instead; the
+         * scl_wallet_rescan_utxos() fallback uses the identical derivation so both
+         * minting sites agree on the same commitment. */
+        size_t genesis_tag = scl_next_unspent_val_tag(state, state->user_wallet.dilithium_privkey,
+                                                      INITIAL_VALIDATION_CREDITS, 0);
+        int tag_len = snprintf((char *)(r_input + DILITHIUM_SECRETKEY_LEN), 32, "SCL_VAL_UTXO_%zu", genesis_tag);
         uint8_t r_init[32];
         SHA256(r_input, DILITHIUM_SECRETKEY_LEN + tag_len, r_init);
 
@@ -136,8 +144,25 @@ int user_init(User *user, State *state, const uint8_t *pubkey) {
         }
         pthread_mutex_unlock(&state->user_wallet.utxo_mutex);
 
+        /* Restart-resilience fix: re-broadcast the genesis claim whenever the
+         * commitment is missing from the validation MMR, not only when the wallet
+         * array lacks the UTXO. The post-restart rescan rebuilds the genesis record,
+         * but the validation_commitments MMR is only ever repopulated from block-
+         * embedded claims — OP_CLAIM_VALIDATION takes the off-chain direct-
+         * registration path and never persists inside a block. Without the re-
+         * broadcast, GetBalance's MMR membership check silently drops the genesis
+         * credits after every restart. */
+        bool mmr_has_genesis = false;
+        {
+            uint8_t genesis_hash[COIN_ID_LEN];
+            SHA256((const uint8_t*)&init_utxo.commitment, sizeof(BdlopCommitment), genesis_hash);
+            pthread_rwlock_rdlock(&state->bc.rwlock);
+            mmr_has_genesis = (state->bc.centinel.validation_commitments != NULL) &&
+                              (mmr_get_leaf_position(state->bc.centinel.validation_commitments, genesis_hash, 0) >= 0);
+            pthread_rwlock_unlock(&state->bc.rwlock);
+        }
         // Broadcast initial genesis validation claim on-chain to register commitment in MMR
-        if (!already_exists) {
+        if (!already_exists || !mmr_has_genesis) {
             Operation *claim_op = calloc(1, sizeof(Operation));
             if (claim_op) {
                 claim_op->type = OP_CLAIM_VALIDATION;
@@ -249,10 +274,17 @@ int grant_validation(State *state, User *user) {
         
         // Provision private UTXO records strictly for the local node operator's wallet
         if (memcmp(user->dilithium_pubkey, state->user_wallet.dilithium_pubkey, PUBKEY_LEN) == 0) {
+            /* Born-spent grant guard: the wallet tag counter resets on every restart
+             * while the persistent nullifier store remembers each pre-restart spend,
+             * and the hourly autopilot burn walks the oldest UTXOs first. Derive the
+             * grant at the first tag whose (tag, amount) nullifier is unspent so
+             * re-minted grants are never born spent (invisible to GetBalance). */
+            size_t grant_tag = scl_next_unspent_val_tag(state, state->user_wallet.dilithium_privkey,
+                                                        total_validations, state->user_wallet.num_val_utxos);
             // Derive deterministic blinding factor r for this grant index
             uint8_t r_input[DILITHIUM_SECRETKEY_LEN + 32];
             memcpy(r_input, state->user_wallet.dilithium_privkey, DILITHIUM_SECRETKEY_LEN);
-            int tag_len = snprintf((char *)(r_input + DILITHIUM_SECRETKEY_LEN), 32, "SCL_VAL_UTXO_%zu", state->user_wallet.num_val_utxos);
+            int tag_len = snprintf((char *)(r_input + DILITHIUM_SECRETKEY_LEN), 32, "SCL_VAL_UTXO_%zu", grant_tag);
             uint8_t r_mint[32];
             SHA256(r_input, DILITHIUM_SECRETKEY_LEN + tag_len, r_mint);
 
@@ -317,7 +349,12 @@ int grant_validation(State *state, User *user) {
             {
                 uint8_t t_r_input[DILITHIUM_SECRETKEY_LEN + 32];
                 memcpy(t_r_input, state->testnet_identity_wallet.dilithium_privkey, DILITHIUM_SECRETKEY_LEN);
-                int t_tag_len = snprintf((char *)(t_r_input + DILITHIUM_SECRETKEY_LEN), 32, "SCL_VAL_UTXO_%zu", state->user_wallet.num_val_utxos);
+                /* Born-spent guard (testnet mirror): same restart/reset hazard as the
+                 * operator grant above; the shared identity's tag space must also skip
+                 * derivations whose nullifiers are already persisted as spent. */
+                size_t t_grant_tag = scl_next_unspent_val_tag(state, state->testnet_identity_wallet.dilithium_privkey,
+                                                              total_validations, state->user_wallet.num_val_utxos);
+                int t_tag_len = snprintf((char *)(t_r_input + DILITHIUM_SECRETKEY_LEN), 32, "SCL_VAL_UTXO_%zu", t_grant_tag);
                 uint8_t t_r_mint[32];
                 SHA256(t_r_input, DILITHIUM_SECRETKEY_LEN + t_tag_len, t_r_mint);
 
