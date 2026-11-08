@@ -2223,7 +2223,12 @@ document.addEventListener('DOMContentLoaded', () => {
             updateAutopilotUI({});
         }
             
-        if (activeUtxos) {
+        /* LB-mismatch resilience: with two seeds behind the scl-url-map load
+         * balancer the WebSocket can land on a node whose local wallet does
+         * not hold the entered key pair; that node reports an empty active
+         * set even though the chain-wide balances above are correct. Only a
+         * non-empty report may replace the client-side audited set. */
+        if (activeUtxos && activeUtxos.length > 0) {
             window.loadedUTXOs = activeUtxos;
         }
                 
@@ -2241,9 +2246,19 @@ document.addEventListener('DOMContentLoaded', () => {
         if (utxoValEl && utxoValidations !== undefined && utxoValidations !== null) {
             const recentSubmission = window.lastValuationSubmissionAt &&
                 (Date.now() - window.lastValuationSubmissionAt) < 8000;
+            /* Audited-tally fix: when the polled seed does not hold the entered
+             * key pair (load balancer routed the pipeline to the other seed) it
+             * reports 0 while the client-side audited set still tracks unspent
+             * outputs credited from redeem echoes; keep the local tally in that
+             * case instead of zeroing the display. */
+            const localAuditedTally = (window.loadedUTXOs || [])
+                .filter(u => u && !window.seenNullifiers.has(u.nullifier))
+                .reduce((sum, u) => sum + (u.amount || 0), 0);
             if (recentSubmission && utxoValidations > (window.privateUtxoBalance || 0)) {
                 /* UTXO-stat stability fix: the node has not applied our burn yet; do not
                  * let the pre-burn echo reset the locally decremented tally. */
+            } else if (Number(utxoValidations) === 0 && localAuditedTally > 0) {
+                window.privateUtxoBalance = localAuditedTally;
             } else {
                 window.privateUtxoBalance = utxoValidations;
             }
@@ -4506,9 +4521,15 @@ document.addEventListener('DOMContentLoaded', () => {
                     btnRedeemCentinel.textContent = 'Claiming...';
 
                     utxos.forEach((utxo, idx) => {
-                        if (utxo && utxo.nullifier) {
-                            window.seenNullifiers.add(utxo.nullifier);
-                        }
+                        /* Redeem-echo credit fix: do NOT pre-mark the spent
+                         * ticket nullifier here. onTransactionMatch treats any
+                         * seenNullifiers entry as a replay and returns before
+                         * crediting newNullifiers, so the redeemed output was
+                         * never added to the audited tally and 'Audited UTXO
+                         * Validations' never stepped up. The redeem echo itself
+                         * marks the spend (window.seenNullifiers.add inside
+                         * onTransactionMatch), and the worker's utxoNullifiers
+                         * set already blocks double-redeeming a ticket. */
                         client.generateCentinelProof({
                             requestId: (BigInt(Date.now()) << 16n | BigInt(Math.floor(Math.random() * 65535))),
                             amountToTake: utxo.amount.toString(),
