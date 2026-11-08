@@ -2661,6 +2661,64 @@ int consume_utxos_for_amount(State *state, uint64_t amount) {
 }
 
 /**
+ * @brief Finds the first sequential SCL_VAL_UTXO derivation tag whose nullifier is unspent.
+ *
+ * @details
+ * Wallet blinding factors are derived deterministically as
+ * `r = SHA256(privkey || "SCL_VAL_UTXO_<tag>")` and a UTXO's nullifier is a function of
+ * (tag, amount). The wallet's tag counter (`num_val_utxos`) lives in RAM only, so it resets
+ * on every restart while the persistent nullifier store (Bloom + libmdbx) remembers every
+ * pre-restart spend. Re-minting a (tag, amount) pair that was already spent produces a
+ * "born spent" UTXO that GetBalance's is_spent filter silently drops. This helper advances
+ * past such collisions.
+ *
+ * @param[in] state Global node state container.
+ * @param[in] privkey 4,864-byte Dilithium private key owning the tag space.
+ * @param[in] amount Committed value the caller will pair with the tag.
+ * @param[in] start_tag First tag index to probe (the wallet high-water mark).
+ * @return First unspent tag, or start_tag if none is found within the guard window.
+ *
+ * @complexity Time: O(guard * BDLOP_COMMIT), Space: O(1).
+ */
+size_t scl_next_unspent_val_tag(State *state, const uint8_t *privkey, uint64_t amount, size_t start_tag) {
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && !defined(SCL_UNIT_TEST)
+    (void)state; (void)privkey; (void)amount;
+    return start_tag;
+#else
+    if (!state || !privkey || is_zeroed(privkey, DILITHIUM_SECRETKEY_LEN)) return start_tag;
+    if (!state->bc.centinel.nullifier_set) return start_tag;
+
+    for (size_t tag = start_tag; tag < start_tag + 4096; tag++) {
+        uint8_t r_input[DILITHIUM_SECRETKEY_LEN + 32];
+        memcpy(r_input, privkey, DILITHIUM_SECRETKEY_LEN);
+        int tag_len = snprintf((char *)(r_input + DILITHIUM_SECRETKEY_LEN), 32, "SCL_VAL_UTXO_%zu", tag);
+        uint8_t r_mint[32];
+        SHA256(r_input, DILITHIUM_SECRETKEY_LEN + tag_len, r_mint);
+
+        BdlopCommitment probe;
+        if (bdlop_commit((const uint8_t*)BDLOP_RHO_SEED, amount, r_mint, &probe) != CRYPTO_SUCCESS) continue;
+
+        uint8_t probe_hash[COIN_ID_LEN];
+        SHA256((const uint8_t*)&probe, sizeof(BdlopCommitment), probe_hash);
+
+        PRFKey probe_prf;
+        prf_keygen(&probe_prf, r_mint, 32);
+        uint8_t probe_nullifier[NULLIFIER_LEN];
+        prf_evaluate(probe_nullifier, &probe_prf, probe_hash, COIN_ID_LEN, probe_hash);
+
+        pthread_rwlock_rdlock(&state->bc.rwlock);
+        bool spent = hash_table_lookup(state->bc.centinel.nullifier_set, probe_nullifier, true) != NULL ||
+                     (nullifier_bloom_check(state->bc.centinel.nullifier_bloom, probe_nullifier) &&
+                      scl_db_has_nullifier(probe_nullifier));
+        pthread_rwlock_unlock(&state->bc.rwlock);
+
+        if (!spent) return tag;
+    }
+    return start_tag;
+#endif
+}
+
+/**
  * @brief Scans an on-chain OP_REDEEM_CENTINEL operation to discover incoming transfer or change commitments.
  *
  * @param[in,out] state Global node state container.
@@ -2845,14 +2903,21 @@ void scl_wallet_rescan_utxos(State *state) {
 
     if (comm_count == 0 || !block_comms) {
         if (block_comms) free(block_comms);
+        /* Born-spent genesis guard (restart fallback): derive at the first unspent
+         * tag — computed BEFORE taking utxo_mutex because the helper acquires
+         * bc.rwlock (read), and GetBalance takes those two locks in the opposite
+         * order. Must match user_init()'s derivation so both minting sites agree. */
+        uint8_t genesis_privkey[DILITHIUM_SECRETKEY_LEN];
+        pthread_mutex_lock(&state->wallet_mutex);
+        memcpy(genesis_privkey, state->user_wallet.dilithium_privkey, DILITHIUM_SECRETKEY_LEN);
+        pthread_mutex_unlock(&state->wallet_mutex);
+        size_t genesis_tag = scl_next_unspent_val_tag(state, genesis_privkey, INITIAL_VALIDATION_CREDITS, 0);
         pthread_mutex_lock(&state->user_wallet.utxo_mutex);
         if (state->user_wallet.num_val_utxos == 0) {
             uint8_t r_input[DILITHIUM_SECRETKEY_LEN + 32];
-            pthread_mutex_lock(&state->wallet_mutex);
-            memcpy(r_input, state->user_wallet.dilithium_privkey, DILITHIUM_SECRETKEY_LEN);
-            pthread_mutex_unlock(&state->wallet_mutex);
+            memcpy(r_input, genesis_privkey, DILITHIUM_SECRETKEY_LEN);
 
-            int tag_len = snprintf((char *)(r_input + DILITHIUM_SECRETKEY_LEN), 32, "SCL_VAL_UTXO_0");
+            int tag_len = snprintf((char *)(r_input + DILITHIUM_SECRETKEY_LEN), 32, "SCL_VAL_UTXO_%zu", genesis_tag);
             uint8_t r_init[32];
             SHA256(r_input, DILITHIUM_SECRETKEY_LEN + tag_len, r_init);
 
