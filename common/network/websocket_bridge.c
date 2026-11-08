@@ -768,11 +768,20 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                         }
                     }
                 }
-                /* Report the number of entries actually appended for the
-                 * audited target (u_idx), not the wallet-global count: the
-                 * client consumes this field as the target's own unspent-UTXO
-                 * count to mark r-indices as used. */
-                uint64_t num_val_utxos = (uint64_t)u_idx;
+                /* R-index allocation fix: report the wallet-global tag
+                 * high-water mark (num_val_utxos), not the active count
+                 * (u_idx). Blinding-factor tags are allocated sequentially
+                 * from state->user_wallet.num_val_utxos by grant_validation()
+                 * and consume_utxos_for_amount(), and the auditor worker marks
+                 * r-indices [0, numValUtxos) as consumed before choosing the
+                 * next free index for redemption outputs. Reporting u_idx
+                 * undercounts (spent UTXOs and the C-1 testnet-identity
+                 * mirror UTXOs are excluded), so the worker re-used indices
+                 * whose derived commitments/nullifiers were already spent or
+                 * mirrored — redemption outputs were born spent or duplicate,
+                 * and 'Audited UTXO Validations' never updated after a
+                 * successful redeem. */
+                uint64_t num_val_utxos = (uint64_t)state->user_wallet.num_val_utxos;
 
                 uint8_t user_id[USER_ID_LEN];
                 SHA256(target_pk, PUBKEY_LEN, user_id);
