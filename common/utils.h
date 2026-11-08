@@ -826,6 +826,19 @@ void scl_wallet_scan_claim_op(State *state, const Operation *op);
 void scl_wallet_rescan_utxos(State *state);
 
 /**
+ * @brief Finds the first sequential SCL_VAL_UTXO derivation tag whose (tag, amount) nullifier is unspent.
+ *
+ * @param[in] state Global node state container.
+ * @param[in] privkey 4,864-byte Dilithium private key owning the tag space.
+ * @param[in] amount Committed value the caller will pair with the tag.
+ * @param[in] start_tag First tag index to probe (wallet tag high-water mark).
+ * @return First unspent tag, or start_tag when the guard window is exhausted.
+ *
+ * @complexity Time: O(guard * BDLOP_COMMIT), Space: O(1).
+ */
+size_t scl_next_unspent_val_tag(State *state, const uint8_t *privkey, uint64_t amount, size_t start_tag);
+
+/**
  * @brief Consumes and burns unspent validation UTXOs to cover the cost of submitting valuations.
  *
  * @param[in,out] state Global node state container.
