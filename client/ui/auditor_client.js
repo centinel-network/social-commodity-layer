@@ -278,6 +278,12 @@ class SclAuditorClient {
         this.autoSettlePayments = true;
         /** @type {Map<string, Object>} Tracks pending API queries awaiting transaction serialization. */
         this._pending402Replays = new Map();
+        /** @type {number} SCL402 auto-settlement attempts for the current query (loop guard). */
+        this._settlementAttempts = 0;
+        /** @type {Function|null} Callback invoked when a settlement tx is accepted by the node mempool. */
+        this.onSettlementTxAccepted = null;
+        /** @type {Function|null} Callback invoked when autonomous SCL402 settlement cannot proceed. */
+        this.onSettlementFailed = null;
         /** @type {string|null} Full 2,592-byte node fee-recipient pubkey from chain info (SCL402). */
         this._nodeFeePubkeyHex = null;
         /** @type {Function|null} Callback invoked upon transaction decryption audit. */
@@ -643,6 +649,7 @@ class SclAuditorClient {
      */
     requestQuantumTvdAudit(shots = 15000, beaconSeed = null, circuitBytes = null, receipt = null) {
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+        if (!receipt) this._settlementAttempts = 0; // fresh query: reset the SCL402 auto-settle budget
         const timestamp = BigInt(Date.now());
         const salt = BigInt(Math.floor(Math.random() * 65535));
         const reqId = (timestamp << 16n) | salt;
@@ -672,6 +679,7 @@ class SclAuditorClient {
      */
     requestDriftCertAudit(shots = 15000, beaconSeed = null, histogram = null, circuitBytes = null, receipt = null) {
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+        if (!receipt) this._settlementAttempts = 0; // fresh query: reset the SCL402 auto-settle budget
         const timestamp = BigInt(Date.now());
         const salt = BigInt(Math.floor(Math.random() * 65535));
         const reqId = (timestamp << 16n) | salt;
@@ -848,28 +856,16 @@ class SclAuditorClient {
                 if (this.socket && this.socket.readyState === WebSocket.OPEN) {
                     this.socket.send(data.wireBytes);
                 }
-                
-                // Intercept autonomous payment fulfillment and immediately replay the blocked API query
-                if (data.requestId && this._pending402Replays.has(data.requestId.toString())) {
-                    const replayCtx = this._pending402Replays.get(data.requestId.toString());
-                    this._pending402Replays.delete(data.requestId.toString());
-                    
-                    console.log(`[Agent Bridge] Settled 402 challenge via Tx: ${data.txIdHex}. Replaying Method 0x${replayCtx.methodId.toString(16)}...`);
-                    
-                    const receipt = {
-                        paymentType: 0x01, // OP_TRANSFER_POINTER
-                        txIdHex: data.txIdHex,
-                        rateLockId: replayCtx.challenge.rateLockId
-                    };
-                    
-                    if (replayCtx.methodId === 0x000A) {
-                        this.requestQuantumTvdAudit(15000, null, null, receipt);
-                    } else if (replayCtx.methodId === 0x000D && this._lastDriftAuditContext) {
-                        const auditCtx = this._lastDriftAuditContext;
-                        this.requestDriftCertAudit(auditCtx.shots, auditCtx.beaconSeed, auditCtx.histogram, auditCtx.circuitBytes, receipt);
-                    }
-                }
-                
+
+                /* NOTE: the SCL402 replay intentionally no longer fires here.
+                 * WIRE_FRAME_READY only proves the settlement frame left the
+                 * browser; the node re-selects inputs and re-signs the transfer
+                 * custodially, so the tx id computed locally is NOT the id that
+                 * lands in the mempool. Replaying with it made the node miss the
+                 * receipt and re-issue the 402 challenge forever. The replay now
+                 * waits for the SubmitTx RESPONSE (TRANSACTION_AUDITED), which
+                 * echoes the authoritative settlement operation. */
+
                 if (this.onWireFrameReady) {
                     this.onWireFrameReady(data);
                 }
@@ -911,6 +907,40 @@ class SclAuditorClient {
                 }
                 break;
             case 'TRANSACTION_AUDITED':
+                /* SCL402 replay: the node accepted the settlement transaction and
+                 * echoed the canonical operation. Build the payment receipt from
+                 * the NODE's tx id (never the local guess) and replay the blocked
+                 * query — receipt validation resolves against this mempool op. */
+                if (data && data.requestId !== undefined && data.txId &&
+                    this._pending402Replays.has(String(data.requestId))) {
+                    const replayRid = String(data.requestId);
+                    const replayCtx = this._pending402Replays.get(replayRid);
+                    this._pending402Replays.delete(replayRid);
+
+                    console.log(`[Agent Bridge] Settled 402 challenge via node tx: ${data.txId}. Replaying Method 0x${Number(replayCtx.methodId).toString(16)}...`);
+
+                    const receipt = {
+                        paymentType: 0x01, // OP_TRANSFER_POINTER
+                        txIdHex: data.txId,
+                        rateLockId: replayCtx.challenge.rateLockId
+                    };
+
+                    if (typeof this.onSettlementTxAccepted === 'function') {
+                        this.onSettlementTxAccepted({
+                            requestId: replayRid,
+                            txIdHex: data.txId,
+                            amountSubunits: replayCtx.challenge.amountSubunits,
+                            methodId: replayCtx.methodId
+                        });
+                    }
+
+                    if (Number(replayCtx.methodId) === 0x000A) {
+                        this.requestQuantumTvdAudit(15000, null, null, receipt);
+                    } else if (Number(replayCtx.methodId) === 0x000D && this._lastDriftAuditContext) {
+                        const auditCtx = this._lastDriftAuditContext;
+                        this.requestDriftCertAudit(auditCtx.shots, auditCtx.beaconSeed, auditCtx.histogram, auditCtx.circuitBytes, receipt);
+                    }
+                }
                 if (this.onTransactionAudited) {
                     this.onTransactionAudited(data);
                 }
@@ -1163,94 +1193,138 @@ class SclAuditorClient {
 
     /**
      * @brief Autonomous API Payment challenge settlement handler.
+     * @details Every abort path reports through onSettlementFailed so the UI can
+     *          state the exact unmet requirement instead of hanging on
+     *          "Settling autonomously…" — a silent dead end is the worst failure
+     *          mode this platform can ship.
      */
     async _handleAutonomousSettlement(challenge) {
-        console.warn(`[Agent Bridge] 402 Payment Required for Method 0x${Number(challenge.methodId).toString(16)}: ${challenge.amountSubunits} subunits`);
-
-        const requiredAmount = BigInt(challenge.amountSubunits);
-        if ((window.lastBalanceSubunits || 0n) < requiredAmount) {
-            console.error('[Agent Bridge] Autonomous settlement failed: Insufficient liquid SCL.');
-            return;
-        }
-
-        // Defer pointer selection to the consuming application (explorer_app.js implements window.selectUnspentPointers natively)
-        if (typeof window.selectUnspentPointers === 'undefined') {
-            console.warn('[Agent Bridge] Missing pointer selector. Manual UI intervention required for settlement.');
-            return;
-        }
-        
-        const selectedInputs = window.selectUnspentPointers(requiredAmount, false);
-        if (!selectedInputs) {
-            console.error('[Agent Bridge] Autonomous settlement failed: Unable to aggregate UTXO pointers.');
-            return;
-        }
-
-        let privKeyHex = null;
-        let pubKeyHex = null;
-        if (typeof window.resolveWalletCredentials === 'function') {
-            const creds = window.resolveWalletCredentials();
-            privKeyHex = creds.privKeyHex;
-            pubKeyHex = creds.pubKeyHex;
-        }
-
-        if (!privKeyHex || !pubKeyHex) {
-            console.error('[Agent Bridge] Autonomous settlement failed: Cryptographic credentials unavailable.');
-            return;
-        }
-
-        const reqIdStr = ((BigInt(Date.now()) << 16n) | BigInt(Math.floor(Math.random() * 65535))).toString();
-        
-        this._pending402Replays.set(reqIdStr, {
-            challenge: challenge,
-            methodId: challenge.methodId
-        });
-
-        // SCL402: challenge.recipientHex is the node's 32-byte SHA-256 *address*,
-        // but the worker's OP_TRANSFER_POINTER builder requires the full 2,592-byte
-        // Dilithium pubkey and zero-fills anything shorter — paying the 32-byte hash
-        // directly would fund SHA256(0x00 x 2592), a burn address. Resolve the node
-        // pubkey whose SHA-256 equals the recipient address and pass that instead.
-        const resolveFeeRecipientPubkey = async () => {
-            const recipient = (challenge.recipientHex || '').toLowerCase();
-            if (!recipient || !window.crypto || !window.crypto.subtle) return null;
-
-            const candidates = [];
-            if (this._nodeFeePubkeyHex) candidates.push(this._nodeFeePubkeyHex);
-            if (typeof window.nodePubkeyHex === 'string') candidates.push(window.nodePubkeyHex);
-
-            for (const candidate of candidates) {
-                const hex = candidate.toLowerCase();
-                if (hex.length !== 5184) continue; // 2,592 bytes
-
-                const pubkeyBytes = new Uint8Array(2592);
-                for (let i = 0; i < 2592; i++) {
-                    pubkeyBytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
-                }
-
-                const digest = await window.crypto.subtle.digest('SHA-256', pubkeyBytes);
-                const digestHex = Array.from(new Uint8Array(digest))
-                    .map(b => b.toString(16).padStart(2, '0')).join('');
-
-                if (digestHex === recipient) return hex;
+        const settleFail = (reason) => {
+            console.error('[Agent Bridge] Autonomous settlement failed: ' + reason);
+            if (typeof this.onSettlementFailed === 'function') {
+                this.onSettlementFailed({
+                    methodId: challenge ? challenge.methodId : null,
+                    amountSubunits: challenge ? challenge.amountSubunits : 0,
+                    reason: reason
+                });
             }
-            return null;
         };
 
-        const feeRecipientPubkeyHex = await resolveFeeRecipientPubkey();
-        if (!feeRecipientPubkeyHex) {
-            console.error('[Agent Bridge] Autonomous settlement aborted: no known node pubkey hashes to recipient ' +
-                challenge.recipientHex + '. Refusing to transfer to an unresolved (burn) address.');
-            this._pending402Replays.delete(reqIdStr);
-            return;
-        }
+        try {
+            console.warn(`[Agent Bridge] 402 Payment Required for Method 0x${Number(challenge.methodId).toString(16)}: ${challenge.amountSubunits} subunits`);
 
-        this.submitTransaction(reqIdStr, 'OP_TRANSFER_POINTER', {
-            recipientPubkeyHex: feeRecipientPubkeyHex,
-            senderPubkeyHex: pubKeyHex,
-            privkeyHex: privKeyHex,
-            amountSubunits: challenge.amountSubunits,
-            inputs: selectedInputs
-        });
+            /* Loop guard: a node that keeps re-issuing the 402 challenge (receipt
+             * not resolving) must not drive an unbounded settle/replay cycle. */
+            this._settlementAttempts = (this._settlementAttempts || 0) + 1;
+            if (this._settlementAttempts > 3) {
+                settleFail('the node re-issued the SCL402 challenge after ' + (this._settlementAttempts - 1) +
+                    ' settlement attempts — the payment receipt is not resolving against a mempool transaction. ' +
+                    'Verify the node runs the settlement-echo build (SubmitTx must return the settlement operation).');
+                return;
+            }
+
+            const requiredAmount = BigInt(challenge.amountSubunits);
+            /* Input selection must cover the payment PLUS the network fee
+             * (calculate_fee: amount × π/100) or the node rejects the transfer. */
+            const networkFee = (requiredAmount * 3141592653589793n) / 100000000000000000n;
+            const targetAmount = requiredAmount + networkFee;
+            if ((window.lastBalanceSubunits || 0n) < targetAmount) {
+                settleFail('insufficient liquid SCL — the wallet holds ' +
+                    (window.lastBalanceSubunits !== undefined
+                        ? (Number(window.lastBalanceSubunits) / 160000000).toFixed(4) + ' SCL'
+                        : 'no polled balance') +
+                    ' but settlement needs ' + (Number(targetAmount) / 160000000).toFixed(4) +
+                    ' SCL (fee + π% network fee)');
+                return;
+            }
+
+            // Defer pointer selection to the consuming application (explorer_app.js implements window.selectUnspentPointers natively)
+            if (typeof window.selectUnspentPointers === 'undefined') {
+                settleFail('pointer selector unavailable — connect the node on the Dashboard first');
+                return;
+            }
+
+            const selectedInputs = window.selectUnspentPointers(targetAmount, false);
+            if (!selectedInputs) {
+                settleFail('unable to aggregate UTXO pointers covering ' + (Number(targetAmount) / 160000000).toFixed(4) +
+                    ' SCL — the unspent-pointer cache may be empty or every liquid pointer is mempool-locked');
+                return;
+            }
+
+            let privKeyHex = null;
+            let pubKeyHex = null;
+            if (typeof window.resolveWalletCredentials === 'function') {
+                const creds = window.resolveWalletCredentials();
+                privKeyHex = creds.privKeyHex;
+                pubKeyHex = creds.pubKeyHex;
+            }
+
+            if (!privKeyHex || !pubKeyHex) {
+                settleFail('cryptographic credentials unavailable — load or unlock the wallet (private key) on the Dashboard');
+                return;
+            }
+
+            if (!this.worker) {
+                settleFail('the auditor worker thread is not running — reload the page and reconnect');
+                return;
+            }
+
+            const reqIdStr = ((BigInt(Date.now()) << 16n) | BigInt(Math.floor(Math.random() * 65535))).toString();
+
+            this._pending402Replays.set(reqIdStr, {
+                challenge: challenge,
+                methodId: challenge.methodId
+            });
+
+            // SCL402: challenge.recipientHex is the node's 32-byte SHA-256 *address*,
+            // but the worker's OP_TRANSFER_POINTER builder requires the full 2,592-byte
+            // Dilithium pubkey and zero-fills anything shorter — paying the 32-byte hash
+            // directly would fund SHA256(0x00 x 2592), a burn address. Resolve the node
+            // pubkey whose SHA-256 equals the recipient address and pass that instead.
+            const resolveFeeRecipientPubkey = async () => {
+                const recipient = (challenge.recipientHex || '').toLowerCase();
+                if (!recipient || !window.crypto || !window.crypto.subtle) return null;
+
+                const candidates = [];
+                if (this._nodeFeePubkeyHex) candidates.push(this._nodeFeePubkeyHex);
+                if (typeof window.nodePubkeyHex === 'string') candidates.push(window.nodePubkeyHex);
+
+                for (const candidate of candidates) {
+                    const hex = candidate.toLowerCase();
+                    if (hex.length !== 5184) continue; // 2,592 bytes
+
+                    const pubkeyBytes = new Uint8Array(2592);
+                    for (let i = 0; i < 2592; i++) {
+                        pubkeyBytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+                    }
+
+                    const digest = await window.crypto.subtle.digest('SHA-256', pubkeyBytes);
+                    const digestHex = Array.from(new Uint8Array(digest))
+                        .map(b => b.toString(16).padStart(2, '0')).join('');
+
+                    if (digestHex === recipient) return hex;
+                }
+                return null;
+            };
+
+            const feeRecipientPubkeyHex = await resolveFeeRecipientPubkey();
+            if (!feeRecipientPubkeyHex) {
+                this._pending402Replays.delete(reqIdStr);
+                settleFail('no known node pubkey hashes to the 402 recipient ' + challenge.recipientHex +
+                    ' (chain info did not publish the fee-recipient key) — refusing to transfer to a burn address');
+                return;
+            }
+
+            this.submitTransaction(reqIdStr, 'OP_TRANSFER_POINTER', {
+                recipientPubkeyHex: feeRecipientPubkeyHex,
+                senderPubkeyHex: pubKeyHex,
+                privkeyHex: privKeyHex,
+                amountSubunits: challenge.amountSubunits,
+                inputs: selectedInputs
+            });
+        } catch (e) {
+            settleFail('internal error — ' + (e && e.message ? e.message : String(e)));
+        }
     }
 
     /**
