@@ -5346,6 +5346,12 @@ int verify_operation_heavy_crypto(const Operation *op) {
         if (zk_centinel_verify(&op->data.redeem_centinel) != CRYPTO_SUCCESS) {
             return CRYPTO_ERROR_PROOF_INVALID;
         }
+    } else if (op->type == OP_APPLY_DRIFT_CERT) {
+        // Verify the funding wallet's ML-DSA-87 signature over the canonical certificate digest
+        const ApplyDriftCertData *dc = &op->data.apply_drift_cert;
+        if (dilithium_verify(dc->cert_digest, 32, dc->signature, dc->sender_pubkey) != 0) {
+            return CRYPTO_ERROR_INVALID_SIGNATURE;
+        }
     }
     
     return CRYPTO_SUCCESS;
