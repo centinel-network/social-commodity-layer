@@ -3666,12 +3666,12 @@ function handleSubmitTransaction(requestId, opType, payload) {
             new DataView(digestBuf.buffer, 40, 4).setUint32(0, shotsVal, false);
             new DataView(digestBuf.buffer, 44, 4).setUint32(0, statusVal, false);
             digestBuf.set(commitmentRoot, 48);
-            new DataView(digestBuf.buffer, 56, 8).setBigUint64(0, tsVal, false);
+            new DataView(digestBuf.buffer, 80, 8).setBigUint64(0, tsVal, false);
 
-            const digestInPtr = wasmInstance._wasm_malloc(32);
+            const digestInPtr = wasmInstance._wasm_malloc(88);
             const digestOutPtr = wasmInstance._wasm_malloc(32);
-            getLiveHeapU8().subarray(digestInPtr, digestInPtr + 32).set(digestBuf);
-            wasmInstance._wasm_sha256(digestInPtr, 32, digestOutPtr);
+            getLiveHeapU8().subarray(digestInPtr, digestInPtr + 88).set(digestBuf);
+            wasmInstance._wasm_sha256(digestInPtr, 88, digestOutPtr);
             const certDigest = getLiveHeapU8().subarray(digestOutPtr, digestOutPtr + 32).slice(0);
             wasmInstance._wasm_free(digestInPtr);
             wasmInstance._wasm_free(digestOutPtr);
