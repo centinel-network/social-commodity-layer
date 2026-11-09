@@ -140,3 +140,129 @@ void handle_rpc_quantum_tvd_audit(State *state, RpcTask *task, const SclRpcHeade
     }
     arena_reset(mark);
 }
+
+/* ============================================================================
+ * SECTION 2: ENTERPRISE DRIFT CERTIFICATE HISTOGRAM AUDIT (METHOD 0x000D)
+ * ============================================================================ */
+
+/** @brief Method opcode identifier for enterprise drift certificate histogram audits. */
+#define SCL_RPC_METHOD_DRIFT_CERT_AUDIT 0x000D
+
+/** @brief Fixed Hilbert-space dimensionality of the 7-qubit audit register (2^7). */
+#define DRIFT_CERT_HISTOGRAM_DIM 128
+
+/**
+ * @brief Decodes a client-supplied QPU measurement histogram, executes the drift audit, and returns results.
+ *
+ * @details
+ * Inbound payload layout (all multi-byte fields Big-Endian):
+ * - Bytes 00..03: `shots` measurement budget (u32 BE, bounds-checked against [1, 100000]).
+ * - Bytes 04..35: 32-byte DKG epoch beacon seed.
+ * - Bytes 36..37: `hist_dim` histogram dimensionality (u16 BE, must equal 128).
+ * - Bytes 38..549: `hist_dim` x 4-byte Big-Endian per-basis-state measurement counts.
+ * - Bytes 550..N:  Optional trailing OpenQASM circuit bytes (audited against the qsim baseline).
+ *
+ * Statistical conservation invariant: sum(histogram) must equal `shots` exactly;
+ * violations are rejected without invoking the TVD kernels. The histogram is passed
+ * straight to @ref quantum_tvd_audit_generate_certificate as the physical QPU sample,
+ * so the engine's Kraus noise simulation fallback is bypassed and the certificate
+ * attests the client's actual hardware outcomes.
+ */
+void handle_rpc_drift_cert_audit(State *state, RpcTask *task, const SclRpcHeader *hdr, const uint8_t *payload, size_t payload_len) {
+    // Step 1: Validate input pointers and verify minimum payload dimensionality
+    if (!state || !task || !hdr || !payload) return;
+
+    /* Minimum payload: 4-byte shots + 32-byte beacon + 2-byte histogram dimension = 38 bytes */
+    if (payload_len < 38) {
+        atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[SCL_RPC_METHOD_DRIFT_CERT_AUDIT], 1, memory_order_relaxed);
+        return;
+    }
+
+    // Step 2: Decode 32-bit big-endian shot budget and enforce protocol bounds
+    uint32_t shots_raw;
+    memcpy(&shots_raw, payload, sizeof(uint32_t));
+    uint32_t shots = be32toh(shots_raw);
+    if (shots == 0 || shots > 100000) {
+        atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[SCL_RPC_METHOD_DRIFT_CERT_AUDIT], 1, memory_order_relaxed);
+        return;
+    }
+
+    const uint8_t *beacon_seed = payload + 4;
+
+    // Step 3: Decode histogram dimensionality and enforce fixed 7-qubit register width
+    uint16_t hist_dim_raw;
+    memcpy(&hist_dim_raw, payload + 36, sizeof(uint16_t));
+    uint16_t hist_dim = be16toh(hist_dim_raw);
+    if (hist_dim != DRIFT_CERT_HISTOGRAM_DIM) {
+        atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[SCL_RPC_METHOD_DRIFT_CERT_AUDIT], 1, memory_order_relaxed);
+        return;
+    }
+
+    if (payload_len < 38 + (size_t)hist_dim * 4) {
+        atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[SCL_RPC_METHOD_DRIFT_CERT_AUDIT], 1, memory_order_relaxed);
+        return;
+    }
+
+    // Step 4: Decode 128 Big-Endian basis-state counts and enforce shot conservation
+    uint32_t histogram[DRIFT_CERT_HISTOGRAM_DIM];
+    uint64_t histogram_total = 0;
+    for (uint16_t i = 0; i < hist_dim; i++) {
+        uint32_t count_raw;
+        memcpy(&count_raw, payload + 38 + (size_t)i * 4, sizeof(uint32_t));
+        histogram[i] = be32toh(count_raw);
+        if (histogram[i] > shots) {
+            atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[SCL_RPC_METHOD_DRIFT_CERT_AUDIT], 1, memory_order_relaxed);
+            return;
+        }
+        histogram_total += histogram[i];
+    }
+    if (histogram_total != shots) {
+        atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[SCL_RPC_METHOD_DRIFT_CERT_AUDIT], 1, memory_order_relaxed);
+        return;
+    }
+
+    // Step 5: Extract optional trailing OpenQASM circuit bytes
+    size_t histogram_bytes = (size_t)hist_dim * 4;
+    const uint8_t *circuit_bytes = (payload_len > 38 + histogram_bytes) ? (payload + 38 + histogram_bytes) : NULL;
+    size_t circuit_len = (payload_len > 38 + histogram_bytes) ? (payload_len - 38 - histogram_bytes) : 0;
+
+    // Step 6: Execute drift audit against the client's physical QPU histogram
+    QuantumDriftCertificate cert;
+    int res = quantum_tvd_audit_generate_certificate(state, circuit_bytes, circuit_len, histogram, shots, beacon_seed, &cert);
+    if (res != 0) {
+        atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[SCL_RPC_METHOD_DRIFT_CERT_AUDIT], 1, memory_order_relaxed);
+        return;
+    }
+
+    atomic_fetch_add_explicit(&state->rpc_engine.method_requests_ok[SCL_RPC_METHOD_DRIFT_CERT_AUDIT], 1, memory_order_relaxed);
+
+    size_t resp_payload_len = sizeof(QuantumDriftCertificate);
+    size_t total_msg_len = sizeof(SclRpcHeader) + resp_payload_len;
+
+    size_t mark = arena_mark();
+    Message *resp = (Message *)arena_alloc(offsetof(Message, payload) + total_msg_len);
+    if (!resp) {
+        arena_reset(mark);
+        return;
+    }
+
+    resp->type = MSG_RPC_RESPONSE;
+    resp->length = (uint32_t)total_msg_len;
+
+    SclRpcHeader *rh = (SclRpcHeader *)resp->payload;
+    memset(rh, 0, sizeof(SclRpcHeader));
+    rh->version = SCL_RPC_VERSION_1;
+    rh->status_code = htobe16(SCL_RPC_STATUS_OK);
+    rh->method_id = htobe16(SCL_RPC_METHOD_DRIFT_CERT_AUDIT);
+    rh->request_id = htobe64(hdr->request_id);
+    rh->payload_len = htobe32((uint32_t)resp_payload_len);
+
+    memcpy(resp->payload + sizeof(SclRpcHeader), &cert, sizeof(QuantumDriftCertificate));
+
+    if (task->conn) {
+        uint64_t checksum = compute_rpc_checksum(resp->payload, 0, (uint32_t)resp_payload_len, task->conn->rpc_siphash_key);
+        rh->checksum = htobe64(checksum);
+        queue_enqueue(&task->conn->tx_stream_queue, resp);
+    }
+    arena_reset(mark);
+}
