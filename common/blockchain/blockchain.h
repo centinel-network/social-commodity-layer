@@ -200,6 +200,28 @@ Pointer *select_pointers(State *state, const uint8_t pubkey[PUBKEY_LEN], uint64_
 int create_and_broadcast_transfer(State *state, const uint8_t *recipient_pubkey, uint64_t amount_subunits, bool is_recreation);
 
 /**
+ * @brief Custodial transfer builder funded by an arbitrary node-held wallet (SCL402 settlement).
+ *
+ * @details Generalization of @ref create_and_broadcast_transfer. The browser signs an
+ * OP_TRANSFER_POINTER intent but cannot build state-root MMR inclusion proofs, so the
+ * node re-selects inputs, re-signs, and admits the transfer to the mempool itself.
+ * Funding from `funding_wallet` (the wallet whose pubkey the client submitted) keeps
+ * the payment debiting the requester's balance instead of silently re-billing the node
+ * operator. On success the full serialized operation is copied into `out_serialized_op`
+ * so the RPC bridge can echo the authoritative tx id back to the client; the SCL402
+ * payment receipt must reference that id, never the client's locally computed one.
+ *
+ * @param[in] funding_wallet Node-held wallet paying the transfer (sender and signer).
+ * @param[in] out_serialized_op Optional caller buffer receiving the serialized operation.
+ * @param[in] out_serialized_cap Capacity of `out_serialized_op` in bytes.
+ * @param[out] out_serialized_len Receives the echoed length (0 when not echoed).
+ * @return 0 on success; 2 if inputs are locked in mempool; -1 on failure.
+ */
+int create_and_broadcast_transfer_as(State *state, const UserWallet *funding_wallet, const uint8_t *recipient_pubkey,
+                                     uint64_t amount_subunits, bool is_recreation,
+                                     uint8_t *out_serialized_op, size_t out_serialized_cap, size_t *out_serialized_len);
+
+/**
  * @brief Constructs, orchestrates threshold signing, and broadcasts a staking transaction (@ref OP_STAKE).
  *
  * @details
