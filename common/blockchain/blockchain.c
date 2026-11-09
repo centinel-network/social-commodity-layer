@@ -432,13 +432,13 @@ int create_and_broadcast_transfer(State *state, const uint8_t *recipient_pubkey,
     /* Legacy custodial entry point: funds from the node operator wallet and
      * discards the serialized operation (existing callers do not need the tx id). */
     return create_and_broadcast_transfer_as(state, &state->user_wallet, recipient_pubkey, amount_subunits,
-                                             is_recreation, NULL, 0, NULL);
+                                             is_recreation, NULL, 0, NULL, NULL);
 }
 
 int create_and_broadcast_transfer_as(State *state, const UserWallet *funding_wallet, const uint8_t *recipient_pubkey,
                                       uint64_t amount_subunits, bool is_recreation,
                                       uint8_t *out_serialized_op, size_t out_serialized_cap,
-                                      size_t *out_serialized_len) {
+                                      size_t *out_serialized_len, uint8_t *out_tx_id) {
     int result = -1;
     Pointer *selected = NULL;
     TransferData *tx = NULL;
@@ -622,13 +622,17 @@ int create_and_broadcast_transfer_as(State *state, const UserWallet *funding_wal
     /* SCL402: hand the canonical serialized operation (authoritative tx id at
      * wire bytes 1..33) back to the caller so RPC bridges can echo it to the
      * client that funded the payment. The receipt the client builds from it
-     * resolves against this exact mempool operation. */
+     * resolves against this exact mempool operation. Bridges that only need
+     * the tx id pass out_serialized_op=NULL and use out_tx_id instead. */
     if (out_serialized_len) {
         *out_serialized_len = 0;
         if (out_serialized_op && out_serialized_cap > 0 && (size_t)broadcast_msg->length <= out_serialized_cap) {
             memcpy(out_serialized_op, broadcast_msg->payload, (size_t)broadcast_msg->length);
             *out_serialized_len = (size_t)broadcast_msg->length;
         }
+    }
+    if (out_tx_id) {
+        memcpy(out_tx_id, tx->tx_id, COIN_ID_LEN);
     }
 
     fprintf(stderr, "[Client] %s transfer of %.8f SCL broadcasted (tx_id first 8 bytes: %02x%02x%02x%02x%02x%02x%02x%02x)\n",
