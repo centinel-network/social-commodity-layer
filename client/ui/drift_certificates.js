@@ -542,7 +542,7 @@
 <style>
   @page { size: A4; margin: 18mm; }
   * { box-sizing: border-box; }
-  body { font-family: Georgia, 'Times New Roman', serif; color: #1e293b; margin: 0; padding: 32px; background: #fff; }
+  body { font-family: Georgia, 'Times New Roman', serif; color: #1e293b; margin: 0; padding: 84px 32px 32px; background: #fff; }
   .doc { max-width: 720px; margin: 0 auto; }
   .brand { display: flex; justify-content: space-between; align-items: baseline; border-bottom: 3px double #0f172a; padding-bottom: 12px; }
   .brand h1 { font-size: 20px; letter-spacing: .12em; margin: 0; text-transform: uppercase; }
@@ -655,7 +655,7 @@
             anchoring: state.anchor || null,
             histogram: state.lastHistogram || []
         };
-        const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+        const blob = new Blob([JSON.stringify(payload, (key, value) => (typeof value === 'bigint' ? value.toString() : value), 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = url;
