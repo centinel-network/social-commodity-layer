@@ -805,7 +805,8 @@ typedef enum {
     OP_STAKE,                            /** Locking an unspent subunit range under threshold committee custody. */
     OP_UNSTAKE,                          /** Unlocking a staked subunit range back to liquid status. */
     OP_REDEEM_CENTINEL,                  /** Private off-chain validation credit redemption via ZK-Stern proof. */
-    OP_CLAIM_VALIDATION                  /** Initial validation claim registering a BDLOP commitment on-chain. */
+    OP_CLAIM_VALIDATION,                 /** Initial validation claim registering a BDLOP commitment on-chain. */
+    OP_APPLY_DRIFT_CERT                  /** Anchors an ML-DSA-87 signed TVD drift certificate onto the immutable ledger. */
 } OperationType;
 
 /**
@@ -1316,6 +1317,38 @@ typedef struct {
 } UnstakeData;
 
 /**
+ * @struct ApplyDriftCertData
+ * @brief Transaction payload anchoring a Quantum Drift Certificate on-chain (@ref OP_APPLY_DRIFT_CERT).
+ *
+ * @details
+ * Mirrors the @ref StakeData funding model: the paying wallet locks input pointers to fund the
+ * anchoring fee while the digest fields bind the ML-DSA-87 attested TVD result into the ledger.
+ * The canonical 32-byte `cert_digest` is SHA-256 over
+ * `circuit_hash || tvd_scaled(BE) || shots(BE) || status(BE) || commitment_root || timestamp_us(BE)`,
+ * and `signature` is an ML-DSA-87 (Dilithium5) signature over `cert_digest` by `sender_pubkey`.
+ */
+typedef struct {
+    uint8_t cert_tx_id[COIN_ID_LEN];         /** SHA-256 deterministic operation identity. */
+    uint8_t nonce[8];                        /** Anti-replay nonce. */
+    uint32_t num_inputs;                     /** Number of input pointers funding the anchoring fee. */
+    Pointer inputs[MAX_INPUTS];              /** Input pointers array. */
+    MMRProof proofs[MAX_INPUTS];             /** Inclusion proofs for inputs. */
+    uint8_t inputs_merkle_root[COIN_ID_LEN]; /** Merkle root of input pointer hashes. */
+    uint8_t client_root[COIN_ID_LEN];        /** Client's MMR root. */
+    uint8_t circuit_hash[32];                /** SHA-256 digest of the audited OpenQASM circuit. */
+    uint64_t tvd_scaled;                     /** Nano-scale fixed-point TVD in [0, 10^9]. */
+    uint32_t shots;                          /** Measurement shot budget evaluated. */
+    uint32_t status;                         /** Drift classification (QuantumQpuDriftStatus semantics: 0..3). */
+    uint8_t commitment_root[32];             /** SHA-256 of the BDLOP homomorphic TVD commitment. */
+    uint64_t timestamp_us;                   /** Microsecond attestation timestamp. */
+    uint8_t recipient_pubkey[PUBKEY_LEN];    /** Enterprise client's public key. */
+    uint8_t sender_pubkey[PUBKEY_LEN];       /** Paying wallet's public key. */
+    uint64_t amount;                         /** Anchoring fee in subunits. */
+    uint8_t signature[SIGNATURE_LEN];        /** ML-DSA-87 signature over cert_digest. */
+    uint8_t cert_digest[32];                 /** SHA-256(circuit_hash || tvd_scaled || shots || status || commitment_root || timestamp_us). */
+} ApplyDriftCertData;
+
+/**
  * @struct BlockVoteQueue
  * @brief Thread-safe queue accumulating validator votes for a candidate block proposal.
  */
@@ -1439,6 +1472,7 @@ typedef struct {
         UnstakeData unstake;                  /** Unstake operation data. */
         RedeemCentinelData redeem_centinel;   /** Centinel redemption payload. */
         ClaimValidationData claim_validation; /** Global Sync Payload. */
+        ApplyDriftCertData apply_drift_cert;  /** TVD drift certificate on-chain anchoring payload. */
     } data;
 } Operation;
 
@@ -1618,9 +1652,9 @@ typedef struct {
     _Atomic(uint64_t)  rejected_auth_fail;       /** Authentication failures. */
     _Atomic(uint64_t)  rejected_checksum_mismatch;/** Checksum validation errors. */
     _Atomic(uint64_t)  latency_microseconds_sum; /** Cumulative request latency in microseconds. */
-    _Atomic(uint64_t)  method_requests_ok[12];   /** Per-method success counters. */
-    _Atomic(uint64_t)  method_requests_err[12];  /** Per-method error counters. */
-    _Atomic(uint64_t)  method_latency[12];       /** Per-method cumulative latency. */
+    _Atomic(uint64_t)  method_requests_ok[16];   /** Per-method success counters (incl. 0x000D drift audits). */
+    _Atomic(uint64_t)  method_requests_err[16];  /** Per-method error counters (incl. 0x000D drift audits). */
+    _Atomic(uint64_t)  method_latency[16];       /** Per-method cumulative latency (incl. 0x000D drift audits). */
 } SclRpcEngine;
 
 /**
