@@ -5337,8 +5337,8 @@ end Satocialist.Quantum.TVD</code></pre>
                     <span style="font-size: 0.8rem; color: var(--text-muted);">Independent Total Variation Distance auditing for enterprise QPU compute — post-quantum signed, on-chain anchored</span>
                 </div>
                 <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-                    <span id="drift-status-badge" class="status-badge">PIPELINE IDLE</span>
-                    <span id="drift-balance-badge" class="status-badge">Balance: —</span>
+                    <span id="drift-status-badge" class="status-badge">PIPELINE DISCONNECTED</span>
+                    <span id="drift-balance-badge" class="status-badge">Balance: — (no wallet loaded)</span>
                 </div>
             </div>
             <div style="font-size: 0.85rem; color: var(--text-muted); line-height: 1.6;">
@@ -5346,6 +5346,16 @@ end Satocialist.Quantum.TVD</code></pre>
                 statistical drift (TVD), classifies hardware fidelity, binds the result in a BDLOP lattice commitment, and
                 signs it with ML-DSA-87. The certificate can then be anchored on-chain and exported as a professional
                 verification deliverable.
+            </div>
+            <!-- On-page scoping disclosure (plainly visible — not tucked behind an info-badge tooltip):
+                 the FAQ metadata already states "No physical QPU is queried"; enterprise reviewers
+                 must see the same honesty here, before they dig. -->
+            <div style="margin-top: 12px; padding: 10px 14px; border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-secondary); font-size: 0.78rem; color: var(--text-muted); line-height: 1.6;">
+                <strong style="color: var(--text-main);">Scope of this platform:</strong> no physical QPU is queried and no
+                quantum cloud endpoint is contacted by this page. You supply the measurement histogram (or load the built-in
+                healthy sample); the node benchmarks it against a deterministic qsim (Google simulator) baseline and issues
+                the post-quantum signed certificate. Direct QPU telemetry adapters for commercial quantum clouds are an
+                active roadmap milestone — histogram ingestion, certification, and on-chain anchoring ship today.
             </div>
         </div>
 
