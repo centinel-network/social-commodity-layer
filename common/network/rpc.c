@@ -304,6 +304,45 @@ static void send_rpc_ok(State *state, SclConnection *conn, uint16_t method_id, u
     }
 }
 
+/**
+ * @brief Emits an OK RPC response carrying a binary payload (e.g. the serialized
+ *        SCL402 settlement operation whose authoritative tx id the client needs).
+ */
+static void send_rpc_ok_with_payload(State *state, SclConnection *conn, uint16_t method_id, uint64_t req_id,
+                                     const uint8_t *payload, size_t payload_len) {
+    if (!conn || !payload || payload_len == 0) {
+        send_rpc_ok(state, conn, method_id, req_id);
+        return;
+    }
+    size_t rpc_mark = arena_mark();
+    Message *resp = (Message *)arena_alloc(offsetof(Message, payload) + sizeof(SclRpcHeader) + payload_len);
+    if (resp) {
+        resp->type = MSG_RPC_RESPONSE;
+        resp->length = sizeof(SclRpcHeader) + payload_len;
+        SclRpcHeader *rh = (SclRpcHeader *)resp->payload;
+        memset(rh, 0, sizeof(SclRpcHeader));
+        rh->version = SCL_RPC_VERSION_1;
+        rh->status_code = htobe16(SCL_RPC_STATUS_OK);
+        rh->method_id = htobe16(method_id);
+        rh->request_id = htobe64(req_id);
+        rh->payload_len = htobe32((uint32_t)payload_len);
+
+        memcpy(resp->payload + sizeof(SclRpcHeader), payload, payload_len);
+
+        uint64_t checksum = compute_rpc_checksum(resp->payload, 0, (uint32_t)payload_len, conn->rpc_siphash_key);
+        rh->checksum = htobe64(checksum);
+
+        if (state && method_id < 16) {
+            atomic_fetch_add_explicit(&state->rpc_engine.method_requests_ok[method_id], 1, memory_order_relaxed);
+        }
+        queue_enqueue(&conn->tx_stream_queue, resp);
+        arena_reset(rpc_mark);
+    } else {
+        arena_reset(rpc_mark);
+        send_rpc_ok(state, conn, method_id, req_id);
+    }
+}
+
 /* ============================================================================ */
 /* SECTION 3: REQUEST INGRESS DECODING, VALIDATION & ROUTING                    */
 /* ============================================================================ */
@@ -865,12 +904,38 @@ void handle_rpc_request(State *state, RpcTask *task) {
 
                         // Dispatch operation execution based on operation type
                         if (op->type == OP_TRANSFER_POINTER) {
-                            int added = create_and_broadcast_transfer(state, op->data.transfer_pointer.recipient_pubkey, op->data.transfer_pointer.amount, false);
-                            if (added == 0 || added == 2) {
+                            /* SCL402 settlement parity with websocket_bridge.c: debit
+                             * the wallet that signed the intent when the node holds its
+                             * key, and echo the serialized settlement operation so the
+                             * client can build a payment receipt against the real
+                             * mempool tx id instead of its locally computed guess. */
+                            UserWallet funding_snapshot;
+                            const UserWallet *funding_wallet = &state->user_wallet;
+
+                            pthread_mutex_lock(&state->wallet_mutex);
+                            if (memcmp(op->data.transfer_pointer.sender_pubkey,
+                                       state->testnet_identity_wallet.dilithium_pubkey, PUBKEY_LEN) == 0) {
+                                funding_snapshot = state->testnet_identity_wallet;
+                                funding_wallet = &funding_snapshot;
+                            }
+                            pthread_mutex_unlock(&state->wallet_mutex);
+
+                            size_t settle_mark = arena_mark();
+                            size_t settle_cap = 15000 + (size_t)MAX_INPUTS * 8000;
+                            uint8_t *settled_op = arena_alloc(settle_cap);
+                            size_t settled_op_len = 0;
+                            int added = settled_op ? create_and_broadcast_transfer_as(state, funding_wallet,
+                                        op->data.transfer_pointer.recipient_pubkey,
+                                        op->data.transfer_pointer.amount, false,
+                                        settled_op, settle_cap, &settled_op_len) : -1;
+                            if (added == 0 && settled_op_len > 0) {
+                                send_rpc_ok_with_payload(state, task->conn, hdr.method_id, hdr.request_id, settled_op, settled_op_len);
+                            } else if (added == 0 || added == 2) {
                                 send_rpc_ok(state, task->conn, hdr.method_id, hdr.request_id);
                             } else {
                                 send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id, SCL_RPC_STATUS_INVALID_ARGS, "Transfer failed: insufficient balance");
                             }
+                            arena_reset(settle_mark);
                             free(op);
                             break;
                         } else if (op->type == OP_STAKE) {
@@ -1321,6 +1386,10 @@ void handle_rpc_request(State *state, RpcTask *task) {
                 pthread_mutex_lock(&state->wallet_mutex);
                 memcpy(resp->payload + sizeof(SclRpcHeader) + 44, state->testnet_identity_wallet.dilithium_pubkey, PUBKEY_LEN);
                 memcpy(resp->payload + sizeof(SclRpcHeader) + 44 + PUBKEY_LEN, state->testnet_identity_wallet.dilithium_privkey, PRIVKEY_LEN);
+                /* SCL402 parity with websocket_bridge.c: append the fee-recipient
+                 * pubkey (user_wallet) whose SHA-256 address is the 402 challenge
+                 * recipient, so non-browser clients can resolve the payee. */
+                memcpy(resp->payload + sizeof(SclRpcHeader) + 44 + PUBKEY_LEN + PRIVKEY_LEN, state->user_wallet.dilithium_pubkey, PUBKEY_LEN);
                 pthread_mutex_unlock(&state->wallet_mutex);
                 
                 uint64_t checksum = compute_rpc_checksum(resp->payload, 0, payload_size, task->conn->rpc_siphash_key);
