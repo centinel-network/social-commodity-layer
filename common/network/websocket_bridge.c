@@ -1094,17 +1094,25 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                             }
                             pthread_mutex_unlock(&state->wallet_mutex);
 
-                            size_t settled_op_len = 0;
+                            uint8_t settled_tx_id[COIN_ID_LEN];
                             int added = create_and_broadcast_transfer_as(state, funding_wallet,
                                         op->data.transfer_pointer.recipient_pubkey,
                                         op->data.transfer_pointer.amount, false,
-                                        resp_buf + 32, resp_max - 64, &settled_op_len);
-                            if (added == 0 && settled_op_len > 0) {
-                                /* Echo the canonical settlement operation back to the
-                                 * requesting viewport; the WASM client extracts the
-                                 * authoritative tx id and replays the metered query
-                                 * with a matching SCL402 receipt. */
-                                actual_payload_len = settled_op_len;
+                                        NULL, 0, NULL, settled_tx_id);
+                            if (added == 0) {
+                                /* Echo only the authoritative settlement identity —
+                                 * [0x02 OP_TRANSFER_POINTER][32-byte mempool tx id] —
+                                 * never the full ~425 KB serialized operation. The
+                                 * client's SCL402 receipt needs the tx id alone, and
+                                 * full-op echoes push 400 KB+ WebSocket frames through
+                                 * the scl-ws-map load balancer / TLS front ends, which
+                                 * can silently drop them and stall the replay at
+                                 * "Settling autonomously..." forever. 33 bytes
+                                 * satisfies the WASM client's 0x0003 parser exactly
+                                 * (payload[0] = op type, tx id at bytes 1..33). */
+                                resp_buf[32] = 0x02;
+                                memcpy(resp_buf + 33, settled_tx_id, COIN_ID_LEN);
+                                actual_payload_len = 1 + COIN_ID_LEN;
                             } else if (added == 2) {
                                 rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
                                 const char *err_msg = "Settlement deferred: the funding wallet's inputs are locked by a pending mempool operation. Retry after the next block.";
