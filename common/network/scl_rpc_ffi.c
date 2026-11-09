@@ -831,6 +831,49 @@ int scl_rpc_frame_quantum_tvd_audit(uint64_t request_id, uint32_t shots, const u
 }
 
 /**
+ * @brief Constructs a wire frame for dispatching a Drift Certificate Histogram Audit request (Method 0x000D).
+ *
+ * @param[in] request_id 64-bit request identifier.
+ * @param[in] shots Measurement shot count budget (1..100,000).
+ * @param[in] beacon_seed Optional 32-byte DKG beacon seed (NULL defaults to zero seed).
+ * @param[in] histogram Pointer to 128 Big-Endian u32 basis-state measurement counts.
+ * @param[in] circuit_bytes Optional OpenQASM circuit byte stream.
+ * @param[in] circuit_len Byte length of circuit stream.
+ * @param[out] out_frame Output wire frame buffer.
+ * @param[in] max_len Buffer capacity.
+ * @param[out] out_len Destination receiving exact serialized frame length.
+ * @return 0 on success; negative value on buffer overflow.
+ *
+ * @complexity Time: O(circuit_len), Space: O(1).
+ */
+int scl_rpc_frame_drift_cert_audit(uint64_t request_id, uint32_t shots, const uint8_t* beacon_seed, const uint32_t* histogram, const uint8_t* circuit_bytes, size_t circuit_len, uint8_t* out_frame, size_t max_len, size_t* out_len) {
+    // Method 0x000D: Enterprise drift certificate histogram audit (TVD platform)
+    static const uint16_t kDriftHistogramDim = 128;
+    SclRpcBuilder b = scl_rpc_builder_create(0x01, 0x000D, request_id);
+    if (!b) return -1;
+    uint32_t shots_be = htobe32(shots);
+    scl_rpc_builder_append_args(b, (const uint8_t *)&shots_be, 4);
+    uint8_t zero_seed[32] = {0};
+    scl_rpc_builder_append_args(b, beacon_seed ? beacon_seed : zero_seed, 32);
+    uint16_t dim_be = htobe16(kDriftHistogramDim);
+    scl_rpc_builder_append_args(b, (const uint8_t *)&dim_be, 2);
+    if (histogram) {
+        uint8_t hist_wire[512];
+        for (uint16_t i = 0; i < kDriftHistogramDim; i++) {
+            uint32_t count_be = htobe32(histogram[i]);
+            memcpy(hist_wire + (size_t)i * 4, &count_be, 4);
+        }
+        scl_rpc_builder_append_args(b, hist_wire, sizeof(hist_wire));
+    }
+    if (circuit_bytes && circuit_len > 0) {
+        scl_rpc_builder_append_args(b, circuit_bytes, circuit_len);
+    }
+    int ret = scl_rpc_builder_finalize(b, out_frame, max_len, out_len);
+    scl_rpc_builder_destroy(b);
+    return ret;
+}
+
+/**
  * @brief Constructs a wire frame for configuring or querying node Auto-Pilot automation (Method 0x000B).
  *
  * @param[in] request_id 64-bit request identifier.
