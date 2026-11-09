@@ -252,10 +252,12 @@
      * ===================================================================== */
 
     /**
-     * @brief Arms the no-response watchdog for an in-flight 0x000D audit. A silent
-     *        dead end (no certificate, no 402, no error) is reported with live
-     *        pipeline diagnostics instead of leaving the operator staring at
-     *        "AWAITING NODE" forever.
+     * @brief Arms the no-response watchdog for an in-flight 0x000D audit. The
+     *        diagnostic is decisive, not speculative: it reports whether the
+     *        SCL402 settlement frame ever left the browser, and states the
+     *        protocol fact that receipts resolve against the mempool — block
+     *        inclusion is never a precondition for the certificate, so a slow
+     *        chain cadence can never explain a timeout.
      * @param {number} [timeoutMs=30000] Watchdog window.
      */
     function armAuditWatchdog(timeoutMs) {
@@ -268,11 +270,26 @@
             const client = window.client;
             const connected = !!(client && client.socket && client.socket.readyState === WebSocket.OPEN);
             setStatus(connected ? 'NO NODE RESPONSE' : 'PIPELINE DISCONNECTED', 'var(--accent-red)');
+
+            const dispatchedAt = client ? client._settlementDispatchedAt : null;
+            let transport;
+            if (dispatchedAt) {
+                transport = 'the fee settlement transaction left the browser ' +
+                    Math.round((Date.now() - dispatchedAt) / 1000) +
+                    's ago but the node never acknowledged it. The request was lost in transit (load balancer / ' +
+                    'proxy / node). Settlement receipts resolve against the mempool the moment the node accepts ' +
+                    'the transaction — block inclusion is NOT required and a slow block cadence can never stall ' +
+                    'this step; only the balance display waits for the next block.';
+            } else {
+                transport = 'the fee settlement transaction never left the browser — the worker stalled or failed ' +
+                    'while building it. Any worker failure states its exact requirement in a SETTLEMENT FAILED ' +
+                    'message above (missing wallet key, WASM builder error, connection drop).';
+            }
+
             progress('No drift certificate within ' + Math.round((timeoutMs || 30000) / 1000) +
                 's. Diagnostics — connection: ' + (connected ? 'OPEN' : 'CLOSED') +
                 '; WebAssembly engine: ' + (client && client.isWasmLoaded ? 'loaded' : 'still compiling') +
-                '. If the node returned SCL402 the fee settlement micro-transaction may still be pending ' +
-                'block inclusion; otherwise the request was dropped before reaching the 0x000D handler.', false);
+                '; ' + transport, false);
         }, timeoutMs || 30000);
     }
 
