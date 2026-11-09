@@ -934,6 +934,20 @@ int wasm_frame_quantum_tvd_audit(uint64_t request_id, uint32_t shots, const uint
 }
 
 /**
+ * @brief Directly serializes a binary Drift Certificate Histogram Audit query frame.
+ *
+ * Method ID: 0x000D. Submits a client-side QPU measurement histogram (128 BE u32
+ * basis-state counts), execution shots, random beacon seed, and optional OpenQASM
+ * circuit for enterprise-grade Total Variation Distance drift certification.
+ *
+ * @complexity Time: O(circuit_len). Space: O(1).
+ */
+EMSCRIPTEN_KEEPALIVE
+int wasm_frame_drift_cert_audit(uint64_t request_id, uint32_t shots, const uint8_t* beacon_seed, const uint32_t* histogram, const uint8_t* circuit_bytes, size_t circuit_len, uint8_t* out_frame, size_t max_len, size_t* out_len) {
+    return scl_rpc_frame_drift_cert_audit(request_id, shots, beacon_seed, histogram, circuit_bytes, circuit_len, out_frame, max_len, out_len);
+}
+
+/**
  * @brief Directly serializes a binary Auto-Pilot Configuration command frame.
  *
  * Method ID: 0x0009. Configures or toggles autonomous consensus auto-pilot.
