@@ -770,6 +770,13 @@ function handleProcessFrame(wireBytes) {
                             validatorSigHex
                         }
                     });
+                } else {
+                    /* Truncated 0x000D success payloads previously vanished — report
+                     * them as a framed RPC error so the UI can react. */
+                    postMessage({
+                        type: 'RPC_ERROR',
+                        data: { methodId: 0x000D, status: 0x0004, version: 1, error: 'Malformed drift certificate response (payload ' + payloadLen + ' bytes, minimum 76)' }
+                    });
                 }
             }
             wasmInstance._wasm_free(outPtrPtr);
@@ -2064,7 +2071,12 @@ function handleBuildQuantumTvdAudit(requestId, shots, beaconSeed, circuitBytes, 
  * @complexity Time: O(circuit_length), Space: O(1).
  */
 function handleBuildDriftCertAudit(requestId, shots, beaconSeed, histogram, circuitBytes, receipt) {
-    if (!wasmInstance) return;
+    if (!wasmInstance) {
+        /* Never drop silently: the UI must learn the engine was not ready so it
+         * can prompt a retry instead of hanging on "AWAITING NODE". */
+        postMessage({ type: 'ERROR', message: 'Drift certificate audit ignored: the WebAssembly engine is not loaded yet. Retry in a few seconds.' });
+        return;
+    }
     let outFramePtr = 0;
     let outLenPtr = 0;
     let builderPtr = 0;
@@ -2073,7 +2085,14 @@ function handleBuildDriftCertAudit(requestId, shots, beaconSeed, histogram, circ
 
     try {
         const shotsNum = shots || 15000;
-        const hist = (histogram && histogram.length === 512) ? histogram : new Uint8Array(512);
+        /* Hard-fail on a malformed histogram instead of silently auditing an
+         * all-zero 512-byte buffer — that would bill the caller (SCL402) for a
+         * meaningless certificate. */
+        if (!histogram || histogram.length !== 512) {
+            postMessage({ type: 'ERROR', message: 'Drift certificate audit rejected: histogram must be exactly 512 wire bytes (128 x u32 big-endian counts).' });
+            return;
+        }
+        const hist = histogram;
         const circLen = circuitBytes ? circuitBytes.length : 0;
         const argsLen = 4 + 32 + 2 + hist.length + circLen;
 
@@ -2117,6 +2136,9 @@ function handleBuildDriftCertAudit(requestId, shots, beaconSeed, histogram, circ
                     frame: new Uint8Array(frameBytes)
                 }
             });
+        } else {
+            /* Finalize failures were previously swallowed whole — surface them. */
+            postMessage({ type: 'ERROR', message: 'Drift certificate audit frame could not be finalized (WASM builder error ' + res + '). The request was not sent.' });
         }
     } catch (e) {
         postMessage({ type: 'ERROR', message: 'Build drift certificate audit failed: ' + e.message });
