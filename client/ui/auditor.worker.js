@@ -264,6 +264,9 @@ self.onmessage = function(event) {
         case 'BUILD_QUANTUM_TVD_AUDIT':
             handleBuildQuantumTvdAudit(data.requestId, data.shots, data.beaconSeed, data.circuitBytes, data.receipt);
             break;
+        case 'BUILD_DRIFT_CERT_AUDIT':
+            handleBuildDriftCertAudit(data.requestId, data.shots, data.beaconSeed, data.histogram, data.circuitBytes, data.receipt);
+            break;
         case 'BUILD_AUTOPILOT':
             handleBuildAutopilot(data.requestId, data.enable, data.valPerHr, data.stakeRatio);
             break;
@@ -719,6 +722,60 @@ function handleProcessFrame(wireBytes) {
             wasmInstance._wasm_free(outLenPtr);
         }
         
+        if (methodId === 0x000D) { // Drift Certificate Histogram Audit Response Handler
+            const outPtrPtr = wasmInstance._wasm_malloc(4);
+            const outLenPtr = wasmInstance._wasm_malloc(4);
+
+            if (wasmInstance._wasm_parser_get_payload_ref(parserCtx, outPtrPtr, outLenPtr) === 0) {
+                const view = new DataView(wasmInstance.HEAPU8.buffer);
+                const payloadPtr = view.getUint32(outPtrPtr, true);
+                const payloadLen = view.getUint32(outLenPtr, true);
+
+                if (payloadLen >= 76) {
+                    const payloadBytes = getLiveHeapU8().subarray(payloadPtr, payloadPtr + payloadLen);
+                    const viewPayload = new DataView(payloadBytes.buffer, payloadBytes.byteOffset, payloadLen);
+
+                    const circuitHashHex = Array.from(payloadBytes.subarray(0, 32)).map(b => b.toString(16).padStart(2, '0')).join('');
+                    const timestamp = Number(viewPayload.getBigUint64(32, true));
+                    const numQubits = viewPayload.getUint32(40, true);
+                    const shots = viewPayload.getUint32(44, true);
+                    const tvdScaled = Number(viewPayload.getBigUint64(48, true));
+                    const tvdDouble = viewPayload.getFloat64(56, true);
+                    const confidenceMargin = viewPayload.getFloat64(64, true);
+                    const status = viewPayload.getUint32(72, true);
+
+                    let tvdCommitmentHex = '';
+                    let validatorSigHex = '';
+                    if (payloadLen >= 2156) {
+                        const commBytes = payloadBytes.subarray(108, 108 + 32);
+                        tvdCommitmentHex = Array.from(commBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                    }
+                    if (payloadLen >= 6751) {
+                        const sigBytes = payloadBytes.subarray(2156, 2156 + 4595);
+                        validatorSigHex = Array.from(sigBytes.subarray(0, 32)).map(b => b.toString(16).padStart(2, '0')).join('') + '...';
+                    }
+
+                    postMessage({
+                        type: 'DRIFT_CERT_AUDIT_RECEIVED',
+                        data: {
+                            circuitHash: circuitHashHex,
+                            timestamp,
+                            numQubits,
+                            shots,
+                            tvdScaled,
+                            tvdDouble,
+                            confidenceMargin,
+                            status,
+                            tvdCommitmentHex,
+                            validatorSigHex
+                        }
+                    });
+                }
+            }
+            wasmInstance._wasm_free(outPtrPtr);
+            wasmInstance._wasm_free(outLenPtr);
+        }
+
         if (methodId === 0x000C) { // GetBlockchainLedger Response Handler
             const outPtrPtr = wasmInstance._wasm_malloc(4);
             const outLenPtr = wasmInstance._wasm_malloc(4);
@@ -1990,6 +2047,88 @@ function handleBuildQuantumTvdAudit(requestId, shots, beaconSeed, circuitBytes, 
     }
 }
 
+/**
+ * @brief Builds a Method 0x000D Drift Certificate Histogram Audit request frame.
+ *
+ * @details
+ * Args layout (Big-Endian): [4B shots][32B beacon seed][2B histogram dim = 128]
+ * [512B histogram: 128 x u32 BE basis-state counts][OpenQASM circuit bytes].
+ *
+ * @param {number|string} requestId 64-bit correlation ID.
+ * @param {number} shots Measurement shot count budget (1..100,000).
+ * @param {Uint8Array|null} beaconSeed 32-byte DKG consensus beacon seed.
+ * @param {Uint8Array|null} histogram 512-byte wire histogram (128 x u32 BE).
+ * @param {Uint8Array|null} circuitBytes Optional serialized OpenQASM circuit byte stream.
+ * @param {Object|null} receipt Optional SCL402 payment receipt {paymentType, txIdHex, rateLockId}.
+ * @return {void}
+ * @complexity Time: O(circuit_length), Space: O(1).
+ */
+function handleBuildDriftCertAudit(requestId, shots, beaconSeed, histogram, circuitBytes, receipt) {
+    if (!wasmInstance) return;
+    let outFramePtr = 0;
+    let outLenPtr = 0;
+    let builderPtr = 0;
+    let txIdPtr = 0;
+    let argsPtr = 0;
+
+    try {
+        const shotsNum = shots || 15000;
+        const hist = (histogram && histogram.length === 512) ? histogram : new Uint8Array(512);
+        const circLen = circuitBytes ? circuitBytes.length : 0;
+        const argsLen = 4 + 32 + 2 + hist.length + circLen;
+
+        builderPtr = wasmInstance._wasm_builder_create(1, 0x000D, BigInt(requestId));
+        if (!builderPtr) throw new Error("WASM builder creation failed");
+
+        if (receipt) {
+            const txIdBytes = hexToBytes(receipt.txIdHex, 32);
+            txIdPtr = wasmInstance._wasm_malloc(32);
+            getLiveHeapU8().set(txIdBytes, txIdPtr);
+            wasmInstance._wasm_builder_set_payment_receipt(builderPtr, receipt.paymentType, txIdPtr, BigInt(receipt.rateLockId));
+        }
+
+        const bSeed = (beaconSeed && beaconSeed.length === 32) ? beaconSeed : new Uint8Array(32);
+        argsPtr = wasmInstance._wasm_malloc(argsLen);
+        const heap = getLiveHeapU8();
+        const view = new DataView(heap.buffer, argsPtr, argsLen);
+        view.setUint32(0, shotsNum, false);
+        heap.set(bSeed, argsPtr + 4);
+        view.setUint16(36, 128, false);
+        heap.set(hist, argsPtr + 38);
+        if (circLen > 0) {
+            heap.set(circuitBytes, argsPtr + 38 + 512);
+        }
+
+        wasmInstance._wasm_builder_append_args(builderPtr, argsPtr, argsLen);
+
+        outFramePtr = wasmInstance._wasm_malloc(4096 + circLen);
+        outLenPtr = wasmInstance._wasm_malloc(4);
+
+        const res = wasmInstance._wasm_builder_finalize(builderPtr, outFramePtr, 4096 + circLen, outLenPtr);
+
+        if (res === 0) {
+            const outView = new DataView(wasmInstance.HEAPU8.buffer, outLenPtr, 4);
+            const actualLen = outView.getUint32(0, true);
+            const frameBytes = getLiveHeapU8().subarray(outFramePtr, outFramePtr + actualLen);
+            postMessage({
+                type: 'FRAME_BUILT',
+                data: {
+                    queryType: 'DRIFT_CERT_AUDIT',
+                    frame: new Uint8Array(frameBytes)
+                }
+            });
+        }
+    } catch (e) {
+        postMessage({ type: 'ERROR', message: 'Build drift certificate audit failed: ' + e.message });
+    } finally {
+        if (txIdPtr) wasmInstance._wasm_free(txIdPtr);
+        if (argsPtr) wasmInstance._wasm_free(argsPtr);
+        if (outFramePtr) wasmInstance._wasm_free(outFramePtr);
+        if (outLenPtr) wasmInstance._wasm_free(outLenPtr);
+        if (builderPtr) wasmInstance._wasm_builder_destroy(builderPtr);
+    }
+}
+
 /* ============================================================================
  * SECTION 6: POST-QUANTUM KEY GENERATION & PROOF OPERATIONS
  * ============================================================================ */
@@ -2782,6 +2921,9 @@ function handleSubmitTransaction(requestId, opType, payload) {
         } else if (opType === 'OP_CLAIM_VALIDATION') {
             opCode = 6;
             isHalved = false;
+        } else if (opType === 'OP_APPLY_DRIFT_CERT') {
+            opCode = 7;
+            isHalved = true; // Staking-grade halved fee schedule for on-chain anchoring
         }
 
         const amountSubunits = BigInt(payload.amountSubunits || '0');
@@ -3405,6 +3547,164 @@ function handleSubmitTransaction(requestId, opType, payload) {
             fullOp.set(commitment, 1);
             fullOp.set(pubkeyBytes, 2049);
             fullOp.set(claimSig, 2049 + 2592);
+
+            opPayloadBytes = fullOp;
+        } else if (opType === 'OP_APPLY_DRIFT_CERT') {
+            /* On-chain drift certificate anchoring op. Wire layout mirrors the C
+             * serialize_operation case OP_APPLY_DRIFT_CERT byte-for-byte. */
+            const recipientPubkeyBytes = new Uint8Array(2592);
+            if (payload.recipientPubkeyHex) {
+                const rBytes = hexToBytes(payload.recipientPubkeyHex);
+                if (rBytes.length === 2592) recipientPubkeyBytes.set(rBytes);
+            }
+            const senderPubkeyBytes = new Uint8Array(2592);
+            let hasSender = false;
+            if (payload.senderPubkeyHex) {
+                const sBytes = hexToBytes(payload.senderPubkeyHex);
+                if (sBytes.length === 2592) {
+                    senderPubkeyBytes.set(sBytes);
+                    hasSender = true;
+                }
+            }
+            if (!hasSender && dilithiumPubkeyPtr !== 0) {
+                senderPubkeyBytes.set(getLiveHeapU8().subarray(dilithiumPubkeyPtr, dilithiumPubkeyPtr + 2592));
+            }
+
+            const amountVal = BigInt(payload.amountSubunits || '0');
+            const nonce = new Uint8Array(8);
+            if (self.crypto && self.crypto.getRandomValues) {
+                self.crypto.getRandomValues(nonce);
+            }
+
+            const clientRoot = new Uint8Array(32);
+            if (payload.clientRootHex && payload.clientRootHex.length === 64) {
+                clientRoot.set(hexToBytes(payload.clientRootHex));
+            }
+
+            const circuitHash = hexToBytes(payload.circuitHashHex || '', 32);
+            const commitmentRoot = hexToBytes(payload.commitmentRootHex || '', 32);
+            const tvdScaled = BigInt(payload.tvdScaled || '0');
+            const shotsVal = Number(payload.shots || 15000);
+            const statusVal = Number(payload.status || 0);
+            const tsVal = BigInt(payload.timestampUs || (Date.now() * 1000));
+
+            const inputs = payload.inputs || [];
+            const numInputs = inputs.length;
+
+            let inputsBufferList = [];
+            let totalInputsLen = 0;
+            for (let i = 0; i < numInputs; i++) {
+                const ptr = inputs[i];
+                const ptrBuf = new Uint8Array(152);
+                ptrBuf.set(hexToBytes(ptr.pointerId || ptr.pointer_id), 0);
+                ptrBuf.set(hexToBytes(ptr.parentCoinId || ptr.parent_coin_id), 32);
+                const viewP = new DataView(ptrBuf.buffer);
+                viewP.setBigUint64(64, BigInt(ptr.startSubunit || ptr.start_subunit || 0), false);
+                viewP.setBigUint64(72, BigInt(ptr.endSubunit || ptr.end_subunit || 0), false);
+                ptrBuf.set(hexToBytes(ptr.ownerAddress || ptr.owner_address), 80);
+                ptrBuf.set(hexToBytes(ptr.prevTxHash || ptr.prev_tx_hash), 112);
+                viewP.setUint32(144, 0, false);
+                viewP.setUint32(148, 0, false);
+
+                const proof = ptr.proof || {};
+                const pathHashes = proof.pathHashes || proof.path_hashes || [];
+                const isLeft = proof.isLeft || proof.is_left || [];
+                const leftPeaks = proof.leftPeaks || proof.left_peaks || [];
+                const rightPeaks = proof.rightPeaks || proof.right_peaks || [];
+
+                const proofLen = 4 + pathHashes.length * 36 + 4 + leftPeaks.length * 32 + 4 + rightPeaks.length * 32;
+                const proofBuf = new Uint8Array(proofLen);
+                const viewPrf = new DataView(proofBuf.buffer);
+                let pOff = 0;
+
+                viewPrf.setUint32(pOff, pathHashes.length, false); pOff += 4;
+                for (let k = 0; k < pathHashes.length; k++) {
+                    proofBuf.set(hexToBytes(pathHashes[k]), pOff); pOff += 32;
+                    viewPrf.setUint32(pOff, isLeft[k] ? 1 : 0, false); pOff += 4;
+                }
+
+                viewPrf.setUint32(pOff, leftPeaks.length, false); pOff += 4;
+                for (let k = 0; k < leftPeaks.length; k++) {
+                    proofBuf.set(hexToBytes(leftPeaks[k]), pOff); pOff += 32;
+                }
+
+                viewPrf.setUint32(pOff, rightPeaks.length, false); pOff += 4;
+                for (let k = 0; k < rightPeaks.length; k++) {
+                    proofBuf.set(hexToBytes(rightPeaks[k]), pOff); pOff += 32;
+                }
+
+                const itemBuf = new Uint8Array(152 + proofLen);
+                itemBuf.set(ptrBuf, 0);
+                itemBuf.set(proofBuf, 152);
+
+                inputsBufferList.push(itemBuf);
+                totalInputsLen += itemBuf.length;
+            }
+
+            const inputsMerkleRoot = computeInputsMerkleRoot(inputs);
+
+            /* Canonical certificate digest (mirrors the C builder):
+             * SHA-256(circuit_hash || tvd_scaled BE || shots BE || status BE || commitment_root || timestamp BE) */
+            const digestBuf = new Uint8Array(32 + 8 + 4 + 4 + 32 + 8);
+            digestBuf.set(circuitHash, 0);
+            new DataView(digestBuf.buffer, 32, 8).setBigUint64(0, tvdScaled, false);
+            new DataView(digestBuf.buffer, 40, 4).setUint32(0, shotsVal, false);
+            new DataView(digestBuf.buffer, 44, 4).setUint32(0, statusVal, false);
+            digestBuf.set(commitmentRoot, 48);
+            new DataView(digestBuf.buffer, 56, 8).setBigUint64(0, tsVal, false);
+
+            const digestInPtr = wasmInstance._wasm_malloc(32);
+            const digestOutPtr = wasmInstance._wasm_malloc(32);
+            getLiveHeapU8().subarray(digestInPtr, digestInPtr + 32).set(digestBuf);
+            wasmInstance._wasm_sha256(digestInPtr, 32, digestOutPtr);
+            const certDigest = getLiveHeapU8().subarray(digestOutPtr, digestOutPtr + 32).slice(0);
+            wasmInstance._wasm_free(digestInPtr);
+            wasmInstance._wasm_free(digestOutPtr);
+
+            /* ML-DSA-87 signature over the certificate digest by the funding wallet */
+            const certSignature = signBufferWithDilithium(certDigest);
+
+            /* Deterministic operation identity: SHA-256(cert_digest || amount || nonce) */
+            const txIdBuf = new Uint8Array(48);
+            txIdBuf.set(certDigest, 0);
+            new DataView(txIdBuf.buffer, 32, 8).setBigUint64(0, amountVal, false);
+            txIdBuf.set(nonce, 40);
+            const txIdInPtr = wasmInstance._wasm_malloc(48);
+            const txIdOutPtr = wasmInstance._wasm_malloc(32);
+            getLiveHeapU8().subarray(txIdInPtr, txIdInPtr + 48).set(txIdBuf);
+            wasmInstance._wasm_sha256(txIdInPtr, 48, txIdOutPtr);
+            const txIdBytes = getLiveHeapU8().subarray(txIdOutPtr, txIdOutPtr + 32).slice(0);
+            wasmInstance._wasm_free(txIdInPtr);
+            wasmInstance._wasm_free(txIdOutPtr);
+
+            const fullOpLen = 1 + 32 + 8 + 4 + 32 + totalInputsLen + 32 + 8 + 4 + 4 + 32 + 8 + 2592 + 2592 + 8 + 32 + 32 + 4595;
+            const fullOp = new Uint8Array(fullOpLen);
+            const viewFull = new DataView(fullOp.buffer);
+
+            fullOp[0] = 7; // OP_APPLY_DRIFT_CERT
+            fullOp.set(txIdBytes, 1);
+            fullOp.set(nonce, 33);
+            viewFull.setUint32(41, numInputs, false);
+            fullOp.set(clientRoot, 45);
+
+            let offset = 77;
+            for (let i = 0; i < numInputs; i++) {
+                fullOp.set(inputsBufferList[i], offset);
+                offset += inputsBufferList[i].length;
+            }
+
+            fullOp.set(circuitHash, offset); offset += 32;
+            viewFull.setBigUint64(offset, tvdScaled, false); offset += 8;
+            viewFull.setUint32(offset, shotsVal, false); offset += 4;
+            viewFull.setUint32(offset, statusVal, false); offset += 4;
+            fullOp.set(commitmentRoot, offset); offset += 32;
+            viewFull.setBigUint64(offset, tsVal, false); offset += 8;
+            fullOp.set(recipientPubkeyBytes, offset); offset += 2592;
+            fullOp.set(senderPubkeyBytes, offset); offset += 2592;
+            viewFull.setBigUint64(offset, amountVal, false); offset += 8;
+            fullOp.set(inputsMerkleRoot, offset); offset += 32;
+            fullOp.set(certDigest, offset); offset += 32;
+            fullOp.set(certSignature, offset);
 
             opPayloadBytes = fullOp;
         } else {
