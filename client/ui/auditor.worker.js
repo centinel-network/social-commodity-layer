@@ -1368,6 +1368,11 @@ function handleProcessFrame(wireBytes) {
                         type: 'TRANSACTION_AUDITED',
                         data: {
                             txId: txIdHex,
+                            /* Echoed RPC request id: lets the settlement bridge match
+                             * this accepted SubmitTx response to the pending SCL402
+                             * replay keyed by the same id (the node echoes the request
+                             * id in the response header). */
+                            requestId: wasmInstance._wasm_parser_get_request_id(parserCtx).toString(),
                             typeString: txTypeString,
                             payloadLen: outLen,
                             matchFound: matchFound,
