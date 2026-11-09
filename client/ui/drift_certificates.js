@@ -48,6 +48,8 @@
         pollTimer: null,
         bound: false,
         auditWatchdog: null,  // Timeout handle flagging a silently missing 0x000D response
+        auditInFlight: false, // True from Run Audit until a terminal event (watchdog guard)
+        settlementInFlight: false, // True while an SCL402 fee settlement is pending
         sampleBeaconSeed: null // 32-byte client beacon bound to the loaded healthy sample
     };
 
@@ -260,7 +262,9 @@
         disarmAuditWatchdog();
         state.auditWatchdog = setTimeout(() => {
             state.auditWatchdog = null;
-            if (state.lastAudit) return; // A certificate already arrived.
+            if (!state.auditInFlight) return; // A terminal event already arrived.
+            state.auditInFlight = false;
+            state.settlementInFlight = false;
             const client = window.client;
             const connected = !!(client && client.socket && client.socket.readyState === WebSocket.OPEN);
             setStatus(connected ? 'NO NODE RESPONSE' : 'PIPELINE DISCONNECTED', 'var(--accent-red)');
@@ -328,7 +332,9 @@
 
         progress('Dispatching audit (Method 0x000D)… If the node returns SCL402, the fee (' +
             fmtScl(quoteAuditFee(shots)) + ') settles autonomously via an SCL micro-transaction and the query replays.', true);
-        setStatus('AWAITING NODE', 'var(--text-muted)');
+        setStatus('AUDIT IN FLIGHT', 'var(--text-muted)');
+        state.auditInFlight = true;
+        state.settlementInFlight = false;
 
         armAuditWatchdog(30000);
 
@@ -341,6 +347,8 @@
      */
     function onAuditReceived(data) {
         disarmAuditWatchdog();
+        state.auditInFlight = false;
+        state.settlementInFlight = false;
         state.lastAudit = data;
 
         const tvd = Number(data.tvdDouble);
@@ -673,10 +681,32 @@
         client.onWireFrameReady = onWireFrameReady;
         client.onPaymentRequired = (challenge) => {
             if (Number(challenge.methodId) === 0x000D) {
-                armAuditWatchdog(120000); // settlement tx must wait for block inclusion before the replay
+                state.settlementInFlight = true;
+                armAuditWatchdog(120000); // settlement + replay window
+                setStatus('SETTLING SCL402 FEE', 'var(--accent-green)');
                 progress('SCL402 challenge received (' + fmtScl(BigInt(challenge.amountSubunits)) +
                     '). Settling autonomously via machine-to-machine micro-transaction…', true);
             }
+        };
+        client.onSettlementTxAccepted = (info) => {
+            if (!state.auditInFlight) return;
+            state.settlementInFlight = false;
+            armAuditWatchdog(60000); // the replayed audit must answer within a minute
+            setStatus('REPLAYING AUDIT', 'var(--text-muted)');
+            progress('Settlement accepted by the node mempool — tx ' + String(info.txIdHex || '').substring(0, 16) +
+                '… debits ' + fmtScl(BigInt(info.amountSubunits || 0)) + ' plus the network fee. Replaying the audit ' +
+                'with the payment receipt; the certificate follows immediately and the balance updates when the next ' +
+                'block includes the transaction.', true);
+        };
+        client.onSettlementFailed = (info) => {
+            if (!state.auditInFlight) return;
+            disarmAuditWatchdog();
+            state.auditInFlight = false;
+            state.settlementInFlight = false;
+            setStatus('SETTLEMENT FAILED', 'var(--accent-red)');
+            progress('SCL402 auto-settlement could not complete: ' + String(info && info.reason ? info.reason : 'unknown failure') +
+                '. Requirements: a connected node, an unlocked funded wallet (balance ≥ fee + π% network fee), and a ' +
+                'node that echoes the settlement transaction. Fix the stated gap and click "Run Audit" again.', false);
         };
 
         /* Chain the shared pipeline telemetry. explorer_app.js owns the primary
@@ -698,8 +728,23 @@
         const upstreamRpcError = client.onRpcError;
         client.onRpcError = (data) => {
             if (typeof upstreamRpcError === 'function') upstreamRpcError(data);
+            if (data && Number(data.methodId) === 0x0003 && state.settlementInFlight) {
+                /* The node refused the settlement transaction itself — surface it
+                 * instead of freezing on "Settling autonomously…" forever. */
+                disarmAuditWatchdog();
+                state.auditInFlight = false;
+                state.settlementInFlight = false;
+                setStatus('SETTLEMENT REJECTED', 'var(--accent-red)');
+                progress('The node rejected the SCL402 settlement transaction (status 0x' +
+                    Number(data.status).toString(16).padStart(4, '0') + '): ' +
+                    (data.error || 'no diagnostics returned') +
+                    '. The audit fee was not spent. Resolve the stated reason and click "Run Audit" again.', false);
+                return;
+            }
             if (data && Number(data.methodId) === 0x000D) {
                 disarmAuditWatchdog();
+                state.auditInFlight = false;
+                state.settlementInFlight = false;
                 setStatus('AUDIT REJECTED', 'var(--accent-red)');
                 progress('Node rejected the drift audit (status 0x' +
                     Number(data.status).toString(16).padStart(4, '0') + '): ' +
@@ -849,6 +894,11 @@
         /* Compute the fee quote immediately on first paint so the field never
          * shows the "—" placeholder, even before the view is first entered. */
         updateFeeQuote();
+
+        /* Mark the effective default tier (Standard, 15,000 shots) with the
+         * selection ring from the start — previously only the Precision card
+         * carried accent styling, which read as a pre-selected state. */
+        selectTier('drift-tier-standard');
     }
 
     if (document.readyState === 'loading') {
