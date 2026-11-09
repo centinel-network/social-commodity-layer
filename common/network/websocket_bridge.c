@@ -1072,9 +1072,53 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                         }
 
                         if (op->type == OP_TRANSFER_POINTER) {
-                            int added = create_and_broadcast_transfer(state, op->data.transfer_pointer.recipient_pubkey, op->data.transfer_pointer.amount, false);
-                            if (added != 0 && added != 2) {
+                            /* SCL402 settlement: the browser cannot build state-root
+                             * MMR inclusion proofs, so the node re-selects inputs and
+                             * re-signs custodially — but it must (a) debit the wallet
+                             * that signed this intent whenever the node holds its key
+                             * (operator wallet or the published testnet identity
+                             * wallet), and (b) echo the resulting operation so the
+                             * client's payment receipt references the real mempool
+                             * tx id. The previous implementation silently discarded
+                             * the client tx and returned an empty OK, so every
+                             * receipt missed and the node re-issued the 402
+                             * challenge forever (Run Audit never completed). */
+                            UserWallet funding_snapshot;
+                            const UserWallet *funding_wallet = &state->user_wallet;
+
+                            pthread_mutex_lock(&state->wallet_mutex);
+                            if (memcmp(op->data.transfer_pointer.sender_pubkey,
+                                       state->testnet_identity_wallet.dilithium_pubkey, PUBKEY_LEN) == 0) {
+                                funding_snapshot = state->testnet_identity_wallet;
+                                funding_wallet = &funding_snapshot;
+                            }
+                            pthread_mutex_unlock(&state->wallet_mutex);
+
+                            size_t settled_op_len = 0;
+                            int added = create_and_broadcast_transfer_as(state, funding_wallet,
+                                        op->data.transfer_pointer.recipient_pubkey,
+                                        op->data.transfer_pointer.amount, false,
+                                        resp_buf + 32, resp_max - 64, &settled_op_len);
+                            if (added == 0 && settled_op_len > 0) {
+                                /* Echo the canonical settlement operation back to the
+                                 * requesting viewport; the WASM client extracts the
+                                 * authoritative tx id and replays the metered query
+                                 * with a matching SCL402 receipt. */
+                                actual_payload_len = settled_op_len;
+                            } else if (added == 2) {
                                 rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
+                                const char *err_msg = "Settlement deferred: the funding wallet's inputs are locked by a pending mempool operation. Retry after the next block.";
+                                size_t err_len = strlen(err_msg) + 1;
+                                rh->error_msg_len = htobe16((uint16_t)err_len);
+                                memcpy(resp_buf + 32, err_msg, err_len);
+                                actual_payload_len = err_len;
+                            } else if (added != 0) {
+                                rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
+                                const char *err_msg = "Settlement failed: the funding wallet cannot cover the payment plus network fee.";
+                                size_t err_len = strlen(err_msg) + 1;
+                                rh->error_msg_len = htobe16((uint16_t)err_len);
+                                memcpy(resp_buf + 32, err_msg, err_len);
+                                actual_payload_len = err_len;
                             }
                             free(op);
                             break;
