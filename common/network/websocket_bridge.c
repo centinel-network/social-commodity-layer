@@ -670,14 +670,32 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
      * explorer's "Quantum TVD Audit & Noise-Model Fidelity" panel; every
      * other telemetry method is unmetered, and gating this one left the
      * panel stuck on "Awaiting Telemetry" because auto-settlement needs
-     * liquid SCL the fresh testnet identity wallet does not hold. */
+     * liquid SCL the fresh testnet identity wallet does not hold.
+     * Enterprise drift-certificate audits (0x000D) always carry a
+     * client-supplied QPU histogram and are therefore always metered,
+     * mirroring the rpc.c P2P gate exactly: 1 SCL base + 0.2 SCL per
+     * commenced 10,000 shots. */
     bool tvd_custom_circuit = (final_payload_len > 36);
-    if (method_id == 0x000A && tvd_custom_circuit && !payment_verified && state->config.is_daemon) {
+    uint64_t scl402_required_subunits = 0;
+    if (!payment_verified && state->config.is_daemon) {
+        if (method_id == 0x000D) {
+            uint32_t dc_shots = 15000;
+            if (final_payload_len >= 4) {
+                uint32_t shots_raw;
+                memcpy(&shots_raw, final_payload, sizeof(uint32_t));
+                dc_shots = be32toh(shots_raw);
+            }
+            scl402_required_subunits = 160000000ULL + 32000000ULL * (((uint64_t)dc_shots + 9999) / 10000);
+        } else if (method_id == 0x000A && tvd_custom_circuit) {
+            scl402_required_subunits = 160000000ULL; /* 1 SCL fee (parity with rpc.c:1330) */
+        }
+    }
+    if (scl402_required_subunits > 0) {
         rh->status_code = htobe16(SCL_RPC_STATUS_PAYMENT_REQUIRED);
 
         SclRpcPaymentChallenge *challenge = (SclRpcPaymentChallenge *)(resp_buf + 32);
         memset(challenge, 0, sizeof(SclRpcPaymentChallenge));
-        challenge->amount_subunits = htobe64(160000000ULL); /* 1 SCL fee (parity with rpc.c:1330) */
+        challenge->amount_subunits = htobe64(scl402_required_subunits);
         challenge->price_rate_lock_id = htobe64(get_time_us());
 
         pthread_mutex_lock(&state->wallet_mutex);
@@ -1572,6 +1590,95 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
             actual_payload_len = offset;
             break;
         }
+        case 0x000D: { // Enterprise Drift Certificate Histogram Audit (SCL402-metered)
+            /* Wire layout (mirrors handle_rpc_drift_cert_audit, quantum_tvd_rpc.c):
+             * [4B shots BE][32B beacon seed][2B hist_dim BE = 128]
+             * [512B histogram: 128 x u32 BE basis-state counts][optional OpenQASM bytes].
+             * Unlike the P2P handler, every validation failure returns
+             * SCL_RPC_STATUS_INVALID_ARGS carrying a human-readable reason so the
+             * browser can state exactly what is missing instead of hanging. */
+            const char *dc_err = NULL;
+            uint32_t shots = 0;
+            uint16_t hist_dim = 0;
+            uint32_t histogram[128];
+            memset(histogram, 0, sizeof(histogram));
+
+            if (final_payload_len < 38) {
+                dc_err = "Drift audit payload too short: expected 4-byte shots + 32-byte beacon + 2-byte histogram dimension (38 bytes minimum)";
+            } else {
+                uint32_t shots_raw;
+                memcpy(&shots_raw, final_payload, sizeof(uint32_t));
+                shots = be32toh(shots_raw);
+                if (shots == 0 || shots > 100000) {
+                    dc_err = "Shot budget must be between 1 and 100,000";
+                }
+            }
+
+            if (!dc_err) {
+                uint16_t hist_dim_raw;
+                memcpy(&hist_dim_raw, final_payload + 36, sizeof(uint16_t));
+                hist_dim = be16toh(hist_dim_raw);
+                if (hist_dim != 128) {
+                    dc_err = "Histogram dimension must be exactly 128 basis states (7-qubit register)";
+                } else if (final_payload_len < 38 + (size_t)hist_dim * 4) {
+                    dc_err = "Histogram truncated: expected 128 x 4-byte big-endian counts (512 bytes)";
+                }
+            }
+
+            if (!dc_err) {
+                uint64_t histogram_total = 0;
+                for (uint16_t i = 0; i < hist_dim; i++) {
+                    uint32_t count_raw;
+                    memcpy(&count_raw, final_payload + 38 + (size_t)i * 4, sizeof(uint32_t));
+                    histogram[i] = be32toh(count_raw);
+                    if (histogram[i] > shots) {
+                        dc_err = "Histogram bin exceeds the shot budget (counts must be non-negative and <= shots)";
+                        break;
+                    }
+                    histogram_total += histogram[i];
+                }
+                if (!dc_err && histogram_total != shots) {
+                    dc_err = "Shot conservation violated: histogram bins must sum exactly to the shot budget";
+                }
+            }
+
+            if (dc_err) {
+                rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
+                size_t err_len = strlen(dc_err) + 1;
+                rh->error_msg_len = htobe16((uint16_t)err_len);
+                memcpy(resp_buf + 32, dc_err, err_len);
+                actual_payload_len = err_len;
+                if (method_id < 16) {
+                    atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[method_id], 1, memory_order_relaxed);
+                }
+                break;
+            }
+
+            const uint8_t *beacon_seed = final_payload + 4;
+            size_t histogram_bytes = (size_t)hist_dim * 4;
+            const uint8_t *circuit_bytes = (final_payload_len > 38 + histogram_bytes) ? (final_payload + 38 + histogram_bytes) : NULL;
+            size_t circuit_len = (final_payload_len > 38 + histogram_bytes) ? (final_payload_len - 38 - histogram_bytes) : 0;
+
+            QuantumDriftCertificate cert;
+            if (quantum_tvd_audit_generate_certificate(state, circuit_bytes, circuit_len, histogram, shots, beacon_seed, &cert) == 0) {
+                memcpy(resp_buf + 32, &cert, sizeof(QuantumDriftCertificate));
+                actual_payload_len = sizeof(QuantumDriftCertificate);
+                if (method_id < 16) {
+                    atomic_fetch_add_explicit(&state->rpc_engine.method_requests_ok[method_id], 1, memory_order_relaxed);
+                }
+            } else {
+                const char *err_msg = "Drift audit engine failed to generate the certificate";
+                rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
+                size_t err_len = strlen(err_msg) + 1;
+                rh->error_msg_len = htobe16((uint16_t)err_len);
+                memcpy(resp_buf + 32, err_msg, err_len);
+                actual_payload_len = err_len;
+                if (method_id < 16) {
+                    atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[method_id], 1, memory_order_relaxed);
+                }
+            }
+            break;
+        }
         case 0x0009: { // SyncWalletKeys
             // SPEC COMPLIANCE: Remote mutation of the node's wallet credentials
             // is strictly disabled on public RPC / Explorer endpoints to prevent
@@ -1804,7 +1911,10 @@ static void *ws_client_handler(void *arg) {
                     if (decoded_len >= 32) {
                         const SclRpcHeader *hdr = (const SclRpcHeader *)payload_buf;
                         uint16_t m_id = be16toh(hdr->method_id);
-                        if (hdr->version == SCL_RPC_VERSION_1 && (m_id >= 0x0001 && m_id <= 0x000C)) {
+                        /* 0x000D (enterprise drift-certificate histogram audit) previously
+                         * fell through to the drop below: the browser could never reach
+                         * the drift-audit handler and the UI hung silently. */
+                        if (hdr->version == SCL_RPC_VERSION_1 && (m_id >= 0x0001 && m_id <= 0x000D)) {
                             handle_local_rpc_request(state, payload_buf, decoded_len, tcp_fd);
                             processed += frame_consumed;
                             continue;
