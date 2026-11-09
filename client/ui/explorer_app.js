@@ -4762,6 +4762,27 @@ document.addEventListener('DOMContentLoaded', () => {
             window.scrollTo({ top: 0, behavior: 'smooth' });
             if (window.SCLDriftCertificates) {
                 window.SCLDriftCertificates.onEnter();
+            } else {
+                /* Deployment guard: drift_certificates.js failed to load (404 / stale
+                 * bucket). Fail LOUDLY — a fully dead form with zero feedback is the
+                 * worst possible failure mode for this product. */
+                const badge = document.getElementById('drift-status-badge');
+                if (badge) {
+                    badge.textContent = 'MODULE FAILED TO LOAD';
+                    badge.style.color = 'var(--accent-red)';
+                }
+                const balBadge = document.getElementById('drift-balance-badge');
+                if (balBadge) {
+                    balBadge.textContent = 'Balance: — (no wallet loaded)';
+                    balBadge.style.color = 'var(--text-muted)';
+                }
+                const pr = document.getElementById('drift-progress');
+                if (pr) {
+                    pr.textContent = 'drift_certificates.js could not be loaded from the server — every control on this page is inert. ' +
+                        'Verify the file exists in the deployment bucket (check the browser Network tab for a 404) and reload.';
+                    pr.style.color = 'var(--accent-red)';
+                }
+                console.error('[ExplorerApp] SCLDriftCertificates module missing: drift_certificates.js did not load.');
             }
         } else {
             if (viewDashboard) viewDashboard.style.display = 'block';
