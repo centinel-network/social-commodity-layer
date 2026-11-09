@@ -429,6 +429,16 @@ Pointer *select_pointers(State *state, const uint8_t pubkey[PUBKEY_LEN], uint64_
  * @complexity Time: O(inputs * ZK_KAPPA), Space: O(ZK_PROOF_MAX_LEN).
  */
 int create_and_broadcast_transfer(State *state, const uint8_t *recipient_pubkey, uint64_t amount_subunits, bool is_recreation) {
+    /* Legacy custodial entry point: funds from the node operator wallet and
+     * discards the serialized operation (existing callers do not need the tx id). */
+    return create_and_broadcast_transfer_as(state, &state->user_wallet, recipient_pubkey, amount_subunits,
+                                             is_recreation, NULL, 0, NULL);
+}
+
+int create_and_broadcast_transfer_as(State *state, const UserWallet *funding_wallet, const uint8_t *recipient_pubkey,
+                                      uint64_t amount_subunits, bool is_recreation,
+                                      uint8_t *out_serialized_op, size_t out_serialized_cap,
+                                      size_t *out_serialized_len) {
     int result = -1;
     Pointer *selected = NULL;
     TransferData *tx = NULL;
@@ -467,11 +477,11 @@ int create_and_broadcast_transfer(State *state, const uint8_t *recipient_pubkey,
     size_t num_selected = 0;
         
     // First try excluding mempool
-    selected = select_pointers(state, state->user_wallet.dilithium_pubkey, total_subunits, &num_selected, false, true);
+    selected = select_pointers(state, funding_wallet->dilithium_pubkey, total_subunits, &num_selected, false, true);
         
     if (!selected || num_selected == 0) {
         // We couldn't find enough unlocked. Try including mempool to see if we should defer.
-        selected = select_pointers(state, state->user_wallet.dilithium_pubkey, total_subunits, &num_selected, false, false);
+        selected = select_pointers(state, funding_wallet->dilithium_pubkey, total_subunits, &num_selected, false, false);
         if (!selected || num_selected == 0) {
             fprintf(stderr, "[Client] ERROR: Failed to select pointers for %stransfer: insufficient balance\n", is_recreation ? "recreated " : "");
             pthread_mutex_unlock(&state->mutex);
@@ -488,7 +498,7 @@ int create_and_broadcast_transfer(State *state, const uint8_t *recipient_pubkey,
     }
 
     // Validate balance early to fail fast before heavy crypto
-    if (has_insufficient_balance_locked(state, state->user_wallet.dilithium_pubkey, selected, num_selected, total_subunits, false)) {
+    if (has_insufficient_balance_locked(state, funding_wallet->dilithium_pubkey, selected, num_selected, total_subunits, false)) {
         fprintf(stderr, "[Client] ERROR: Insufficient balance (considering pending) for %stransfer\n", is_recreation ? "recreated " : "");
         pthread_mutex_unlock(&state->mutex);
         goto cleanup;
@@ -500,7 +510,7 @@ int create_and_broadcast_transfer(State *state, const uint8_t *recipient_pubkey,
     memcpy(tx->recipient_pubkey, recipient_pubkey, PUBKEY_LEN);
     
     // Add the sender pubkey explicitly to the transaction so full nodes can verify it
-    memcpy(tx->sender_pubkey, state->user_wallet.dilithium_pubkey, PUBKEY_LEN);
+    memcpy(tx->sender_pubkey, funding_wallet->dilithium_pubkey, PUBKEY_LEN);
     
     tx->amount = amount_subunits;
         
@@ -535,8 +545,8 @@ int create_and_broadcast_transfer(State *state, const uint8_t *recipient_pubkey,
     }
 
     // Copy keys to local stack to allow unlocking mutex during heavy crypto
-    memcpy(local_privkey, state->user_wallet.dilithium_privkey, DILITHIUM_SECRETKEY_LEN);
-    local_prf_key = state->user_wallet.prf_key;
+    memcpy(local_privkey, funding_wallet->dilithium_privkey, DILITHIUM_SECRETKEY_LEN);
+    local_prf_key = funding_wallet->prf_key;
 
     pthread_mutex_unlock(&state->mutex); // <--- UNLOCK EARLY
 
@@ -608,6 +618,18 @@ int create_and_broadcast_transfer(State *state, const uint8_t *recipient_pubkey,
         goto cleanup;
     }
     p2p_broadcast(state, broadcast_msg);
+
+    /* SCL402: hand the canonical serialized operation (authoritative tx id at
+     * wire bytes 1..33) back to the caller so RPC bridges can echo it to the
+     * client that funded the payment. The receipt the client builds from it
+     * resolves against this exact mempool operation. */
+    if (out_serialized_len) {
+        *out_serialized_len = 0;
+        if (out_serialized_op && out_serialized_cap > 0 && (size_t)broadcast_msg->length <= out_serialized_cap) {
+            memcpy(out_serialized_op, broadcast_msg->payload, (size_t)broadcast_msg->length);
+            *out_serialized_len = (size_t)broadcast_msg->length;
+        }
+    }
 
     fprintf(stderr, "[Client] %s transfer of %.8f SCL broadcasted (tx_id first 8 bytes: %02x%02x%02x%02x%02x%02x%02x%02x)\n",
             is_recreation ? "Recreated" : "Initiated", (double)amount_subunits / SUBUNITS_PER_COIN,
