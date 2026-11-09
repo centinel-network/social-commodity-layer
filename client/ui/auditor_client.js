@@ -679,7 +679,10 @@ class SclAuditorClient {
      */
     requestDriftCertAudit(shots = 15000, beaconSeed = null, histogram = null, circuitBytes = null, receipt = null) {
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-        if (!receipt) this._settlementAttempts = 0; // fresh query: reset the SCL402 auto-settle budget
+        if (!receipt) {
+            this._settlementAttempts = 0; // fresh query: reset the SCL402 auto-settle budget
+            this._settlementDispatchedAt = null; // fresh query: no settlement frame in flight yet
+        }
         const timestamp = BigInt(Date.now());
         const salt = BigInt(Math.floor(Math.random() * 65535));
         const reqId = (timestamp << 16n) | salt;
@@ -855,6 +858,30 @@ class SclAuditorClient {
             case 'WIRE_FRAME_READY':
                 if (this.socket && this.socket.readyState === WebSocket.OPEN) {
                     this.socket.send(data.wireBytes);
+
+                    /* SCL402 observability: remember the instant the settlement
+                     * intent actually left the browser so the audit watchdog can
+                     * distinguish "never transmitted" (client-side stall) from
+                     * "transmitted but unacknowledged" (transport / node loss). */
+                    if (data && data.requestId !== undefined &&
+                        this._pending402Replays && this._pending402Replays.has(String(data.requestId))) {
+                        this._settlementDispatchedAt = Date.now();
+                    }
+                } else if (data && data.requestId !== undefined &&
+                    this._pending402Replays && this._pending402Replays.has(String(data.requestId))) {
+                    /* The settlement frame was built but the pipeline dropped
+                     * before it could be transmitted — fail loudly instead of
+                     * letting the watchdog time out 120 s later. */
+                    const droppedRid = String(data.requestId);
+                    const droppedCtx = this._pending402Replays.get(droppedRid);
+                    this._pending402Replays.delete(droppedRid);
+                    if (typeof this.onSettlementFailed === 'function') {
+                        this.onSettlementFailed({
+                            methodId: droppedCtx ? droppedCtx.methodId : null,
+                            amountSubunits: droppedCtx && droppedCtx.challenge ? droppedCtx.challenge.amountSubunits : 0,
+                            reason: 'the node connection dropped before the settlement transaction could be transmitted — reconnect and click "Run Audit" again'
+                        });
+                    }
                 }
 
                 /* NOTE: the SCL402 replay intentionally no longer fires here.
@@ -1030,6 +1057,23 @@ class SclAuditorClient {
                 }
                 break;
             case 'ERROR':
+                /* SCL402 observability: while a settlement intent is in flight, a
+                 * worker ERROR relating to transaction building or signing (missing
+                 * Dilithium key, WASM builder failure, out-of-memory) is the
+                 * settlement failing. Previously these only reached the console
+                 * while the UI hung on "Settling autonomously..." until the watchdog
+                 * expired — a silent dead end. */
+                if (this._pending402Replays && this._pending402Replays.size > 0 &&
+                    /dilithium|transact|builder|sign|wasm|memory|proof/i.test(String(message || '')) &&
+                    typeof this.onSettlementFailed === 'function') {
+                    this.onSettlementFailed({
+                        methodId: 0x000D,
+                        amountSubunits: 0,
+                        reason: 'the browser worker could not build or sign the settlement transaction — ' +
+                            String(message || 'unknown worker error') +
+                            '. Requirements: an unlocked funded wallet and a loaded WebAssembly engine; reload the page if it persists.'
+                    });
+                }
                 this._handleError(message);
                 break;
         }
