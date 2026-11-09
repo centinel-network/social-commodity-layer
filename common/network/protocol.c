@@ -957,6 +957,73 @@ int serialize_operation(const Operation *op, uint8_t *buffer, size_t buf_size) {
             memcpy(buffer + offset, sd->inputs_root_signature, SIGNATURE_LEN); offset += SIGNATURE_LEN;
             break;
         }
+        case OP_APPLY_DRIFT_CERT: {
+            // Serialize drift certificate anchoring intent, input pointers, and PQ signature
+            const ApplyDriftCertData *dc = &op->data.apply_drift_cert;
+            if (buf_size < offset + COIN_ID_LEN) return 0;
+            memcpy(buffer + offset, dc->cert_tx_id, COIN_ID_LEN); offset += COIN_ID_LEN;
+
+            if (buf_size < offset + 8) return 0;
+            memcpy(buffer + offset, dc->nonce, 8); offset += 8;
+
+            if (buf_size < offset + sizeof(uint32_t)) return 0;
+            uint32_t dc_num_be = htobe32(dc->num_inputs);
+            memcpy(buffer + offset, &dc_num_be, sizeof(uint32_t)); offset += sizeof(uint32_t);
+
+            if (buf_size < offset + COIN_ID_LEN) return 0;
+            memcpy(buffer + offset, dc->client_root, COIN_ID_LEN); offset += COIN_ID_LEN;
+
+            for (size_t i = 0; i < dc->num_inputs; i++) {
+                if (buf_size < offset + sizeof(Pointer)) return 0;
+                serialize_pointer(&dc->inputs[i], buffer + offset); offset += sizeof(Pointer);
+
+                size_t proof_size = serialize_mmr_proof(&dc->proofs[i], buffer + offset, buf_size - offset);
+                if (proof_size == 0) return 0;
+                offset += proof_size;
+            }
+
+            if (buf_size < offset + 32) return 0;
+            memcpy(buffer + offset, dc->circuit_hash, 32); offset += 32;
+
+            if (buf_size < offset + sizeof(uint64_t)) return 0;
+            uint64_t tvd_be = htobe64(dc->tvd_scaled);
+            memcpy(buffer + offset, &tvd_be, sizeof(uint64_t)); offset += sizeof(uint64_t);
+
+            if (buf_size < offset + sizeof(uint32_t)) return 0;
+            uint32_t shots_be = htobe32(dc->shots);
+            memcpy(buffer + offset, &shots_be, sizeof(uint32_t)); offset += sizeof(uint32_t);
+
+            if (buf_size < offset + sizeof(uint32_t)) return 0;
+            uint32_t status_be = htobe32(dc->status);
+            memcpy(buffer + offset, &status_be, sizeof(uint32_t)); offset += sizeof(uint32_t);
+
+            if (buf_size < offset + 32) return 0;
+            memcpy(buffer + offset, dc->commitment_root, 32); offset += 32;
+
+            if (buf_size < offset + sizeof(uint64_t)) return 0;
+            uint64_t ts_be = htobe64(dc->timestamp_us);
+            memcpy(buffer + offset, &ts_be, sizeof(uint64_t)); offset += sizeof(uint64_t);
+
+            if (buf_size < offset + PUBKEY_LEN) return 0;
+            memcpy(buffer + offset, dc->recipient_pubkey, PUBKEY_LEN); offset += PUBKEY_LEN;
+
+            if (buf_size < offset + PUBKEY_LEN) return 0;
+            memcpy(buffer + offset, dc->sender_pubkey, PUBKEY_LEN); offset += PUBKEY_LEN;
+
+            if (buf_size < offset + sizeof(uint64_t)) return 0;
+            uint64_t amount_be = htobe64(dc->amount);
+            memcpy(buffer + offset, &amount_be, sizeof(uint64_t)); offset += sizeof(uint64_t);
+
+            if (buf_size < offset + COIN_ID_LEN) return 0;
+            memcpy(buffer + offset, dc->inputs_merkle_root, COIN_ID_LEN); offset += COIN_ID_LEN;
+
+            if (buf_size < offset + 32) return 0;
+            memcpy(buffer + offset, dc->cert_digest, 32); offset += 32;
+
+            if (buf_size < offset + SIGNATURE_LEN) return 0;
+            memcpy(buffer + offset, dc->signature, SIGNATURE_LEN); offset += SIGNATURE_LEN;
+            break;
+        }
         case OP_UNSTAKE: {
             // Serialize unstaking intent, input pointers with MMR proofs, and threshold signature
             const UnstakeData *sd = &op->data.unstake;
@@ -1225,6 +1292,46 @@ int deserialize_operation(const uint8_t *buffer, size_t buf_size, Operation *op,
             memcpy(sd->inputs_merkle_root, p, COIN_ID_LEN); p += COIN_ID_LEN; remaining -= COIN_ID_LEN;
             memcpy(sd->inputs_root_signature, p, SIGNATURE_LEN); p += SIGNATURE_LEN; remaining -= SIGNATURE_LEN;
             
+            return p - buffer;
+        }
+        case OP_APPLY_DRIFT_CERT: {
+            // Unpack drift certificate anchoring intent, input pointers, and PQ signature
+            ApplyDriftCertData *dc = &op->data.apply_drift_cert;
+            if (remaining < COIN_ID_LEN + 8 + 4) return -1;
+            memcpy(dc->cert_tx_id, p, COIN_ID_LEN); p += COIN_ID_LEN; remaining -= COIN_ID_LEN;
+            memcpy(dc->nonce, p, 8); p += 8; remaining -= 8;
+            uint32_t dc_num_be; memcpy(&dc_num_be, p, 4); dc->num_inputs = be32toh(dc_num_be); p += 4; remaining -= 4;
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
+            if (dc->num_inputs > MAX_INPUTS) dc->num_inputs = MAX_INPUTS;
+#else
+            if (dc->num_inputs > MAX_INPUTS || remaining < COIN_ID_LEN) return -1;
+#endif
+            if (remaining < COIN_ID_LEN) return -1;
+            memcpy(dc->client_root, p, COIN_ID_LEN); p += COIN_ID_LEN; remaining -= COIN_ID_LEN;
+
+            for (size_t i = 0; i < dc->num_inputs; i++) {
+                if (remaining < sizeof(Pointer)) return -1;
+                deserialize_pointer(p, &dc->inputs[i]); p += sizeof(Pointer); remaining -= sizeof(Pointer);
+
+                const uint8_t *old_p = p;
+                if (deserialize_mmr_proof(&p, buffer + buf_size, &dc->proofs[i]) != 0) return -1;
+                if ((size_t)(p - old_p) > remaining) return -1;
+                remaining -= (p - old_p);
+            }
+
+            if (remaining < 32 + 8 + 4 + 4 + 32 + 8 + PUBKEY_LEN + PUBKEY_LEN + 8 + COIN_ID_LEN + 32 + SIGNATURE_LEN) return -1;
+            memcpy(dc->circuit_hash, p, 32); p += 32; remaining -= 32;
+            uint64_t tvd_be; memcpy(&tvd_be, p, 8); dc->tvd_scaled = be64toh(tvd_be); p += 8; remaining -= 8;
+            uint32_t shots_be; memcpy(&shots_be, p, 4); dc->shots = be32toh(shots_be); p += 4; remaining -= 4;
+            uint32_t status_be; memcpy(&status_be, p, 4); dc->status = be32toh(status_be); p += 4; remaining -= 4;
+            memcpy(dc->commitment_root, p, 32); p += 32; remaining -= 32;
+            uint64_t ts_be; memcpy(&ts_be, p, 8); dc->timestamp_us = be64toh(ts_be); p += 8; remaining -= 8;
+            memcpy(dc->recipient_pubkey, p, PUBKEY_LEN); p += PUBKEY_LEN; remaining -= PUBKEY_LEN;
+            memcpy(dc->sender_pubkey, p, PUBKEY_LEN); p += PUBKEY_LEN; remaining -= PUBKEY_LEN;
+            uint64_t amount_be; memcpy(&amount_be, p, 8); dc->amount = be64toh(amount_be); p += 8; remaining -= 8;
+            memcpy(dc->inputs_merkle_root, p, COIN_ID_LEN); p += COIN_ID_LEN; remaining -= COIN_ID_LEN;
+            memcpy(dc->cert_digest, p, 32); p += 32; remaining -= 32;
+            memcpy(dc->signature, p, SIGNATURE_LEN); p += SIGNATURE_LEN; remaining -= SIGNATURE_LEN;
             return p - buffer;
         }
         case OP_UNSTAKE: {
