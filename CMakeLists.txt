@@ -1,7 +1,6 @@
 # ==============================================================================
 # Satocialist Protocol: Master CMake Build Configuration
 # ==============================================================================
-#
 # File: CMakeLists.txt
 # Architecture Role: Orchestrates cross-platform compilation of the native node
 #   daemon (satocialist_client), shared RPC library (libscl_rpc), libFuzzer
@@ -767,7 +766,7 @@ else()
         "-sERROR_ON_UNDEFINED_SYMBOLS=0"
         "-sSTACK_SIZE=5242880"
         "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','HEAP8','HEAPU8']"
-        "-sEXPORTED_FUNCTIONS=['_wasm_malloc','_wasm_free','_wasm_secure_wipe','_wasm_parse_frame','_wasm_destroy_parser','_wasm_prf_evaluate','_wasm_match_transaction','_wasm_decrypt_payload','_wasm_parser_get_flags','_wasm_parser_get_method_id','_wasm_parser_get_payload_ref','_wasm_parser_get_error','_wasm_extract_block_commitments','_wasm_verify_checksum','_wasm_parser_get_version','_wasm_parser_get_status','_wasm_parser_get_cursor','_wasm_parser_get_request_id','_wasm_bdlop_commit','_wasm_bdlop_decrypt','_wasm_sha256','_wasm_builder_create','_wasm_builder_set_flags','_wasm_builder_set_cursor','_wasm_builder_append_args','_wasm_builder_sign','_wasm_builder_finalize','_wasm_builder_destroy','_wasm_frame_balance_query','_wasm_frame_recent_txs','_wasm_frame_get_tx','_wasm_frame_chain_info','_wasm_frame_valuations_query','_wasm_frame_audit_query','_wasm_frame_block_query','_wasm_frame_quantum_tvd_audit','_wasm_frame_autopilot','_wasm_dilithium_generate_keypair','_wasm_dilithium_sign','_wasm_prf_keygen','_wasm_verify_mmr_proof','_wasm_generate_zk_prf_proof','_wasm_generate_centinel_proof','_wasm_compute_threshold_pubkey']"
+        "-sEXPORTED_FUNCTIONS=['_wasm_malloc','_wasm_free','_wasm_secure_wipe','_wasm_parse_frame','_wasm_destroy_parser','_wasm_prf_evaluate','_wasm_match_transaction','_wasm_decrypt_payload','_wasm_parser_get_flags','_wasm_parser_get_method_id','_wasm_parser_get_payload_ref','_wasm_parser_get_error','_wasm_extract_block_commitments','_wasm_verify_checksum','_wasm_parser_get_version','_wasm_parser_get_status','_wasm_parser_get_cursor','_wasm_parser_get_request_id','_wasm_bdlop_commit','_wasm_bdlop_decrypt','_wasm_sha256','_wasm_builder_create','_wasm_builder_set_flags','_wasm_builder_set_cursor','_wasm_builder_append_args','_wasm_builder_sign','_wasm_builder_finalize','_wasm_builder_destroy','_wasm_frame_balance_query','_wasm_frame_recent_txs','_wasm_frame_get_tx','_wasm_frame_chain_info','_wasm_frame_valuations_query','_wasm_frame_audit_query','_wasm_frame_block_query','_wasm_frame_quantum_tvd_audit','_wasm_frame_drift_cert_audit','_wasm_frame_autopilot','_wasm_dilithium_generate_keypair','_wasm_dilithium_sign','_wasm_prf_keygen','_wasm_verify_mmr_proof','_wasm_generate_zk_prf_proof','_wasm_generate_centinel_proof','_wasm_compute_threshold_pubkey']"
         "-o" "${CMAKE_BINARY_DIR}/libscl_rpc.js"
     )
 endif()
