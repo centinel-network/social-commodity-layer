@@ -152,6 +152,53 @@ void handle_rpc_quantum_tvd_audit(State *state, RpcTask *task, const SclRpcHeade
 #define DRIFT_CERT_HISTOGRAM_DIM 128
 
 /**
+ * @brief Emits a framed SCL_RPC_STATUS_INVALID_ARGS error response for a drift
+ *        certificate audit (mirrors rpc.c send_rpc_error, which is file-static).
+ *
+ * @details Validation failures previously only bumped the error metric and
+ *          returned, leaving the client hanging on a request that would never
+ *          be answered. This helper always answers with the exact reason.
+ *
+ * @param[in,out] state Pointer to global node state container.
+ * @param[in,out] task Dispatch context wrapping the calling connection handle.
+ * @param[in] hdr Parsed request header carrying the request ID.
+ * @param[in] err_msg Human-readable rejection reason (clamped to 256 bytes).
+ */
+static void drift_cert_send_error(State *state, RpcTask *task, const SclRpcHeader *hdr, const char *err_msg) {
+    if (!state || !task || !task->conn || !hdr) return;
+    size_t err_len = err_msg ? strlen(err_msg) : 0;
+    if (err_len > 256) err_len = 256;
+
+    size_t mark = arena_mark();
+    Message *resp = (Message *)arena_alloc(offsetof(Message, payload) + sizeof(SclRpcHeader) + err_len);
+    if (!resp) {
+        arena_reset(mark);
+        return;
+    }
+
+    resp->type = MSG_RPC_RESPONSE;
+    resp->length = (uint32_t)(sizeof(SclRpcHeader) + err_len);
+
+    SclRpcHeader *rh = (SclRpcHeader *)resp->payload;
+    memset(rh, 0, sizeof(SclRpcHeader));
+    rh->version = SCL_RPC_VERSION_1;
+    rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
+    rh->method_id = htobe16(SCL_RPC_METHOD_DRIFT_CERT_AUDIT);
+    rh->request_id = htobe64(hdr->request_id);
+    rh->error_msg_len = htobe16((uint16_t)err_len);
+    if (err_len > 0 && err_msg) {
+        memcpy(resp->payload + sizeof(SclRpcHeader), err_msg, err_len);
+    }
+
+    uint64_t checksum = compute_rpc_checksum(resp->payload, (uint16_t)err_len, 0, task->conn->rpc_siphash_key);
+    rh->checksum = htobe64(checksum);
+
+    atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[SCL_RPC_METHOD_DRIFT_CERT_AUDIT], 1, memory_order_relaxed);
+    queue_enqueue(&task->conn->tx_stream_queue, resp);
+    arena_reset(mark);
+}
+
+/**
  * @brief Decodes a client-supplied QPU measurement histogram, executes the drift audit, and returns results.
  *
  * @details
@@ -169,12 +216,18 @@ void handle_rpc_quantum_tvd_audit(State *state, RpcTask *task, const SclRpcHeade
  * attests the client's actual hardware outcomes.
  */
 void handle_rpc_drift_cert_audit(State *state, RpcTask *task, const SclRpcHeader *hdr, const uint8_t *payload, size_t payload_len) {
-    // Step 1: Validate input pointers and verify minimum payload dimensionality
-    if (!state || !task || !hdr || !payload) return;
+    // Step 1: Validate input pointers.
+    // The trio (state, task, hdr) is required to emit an error response; if any is
+    // missing we cannot describe the rejection, so this must remain a silent return.
+    if (!state || !task || !hdr) return;
+    if (!payload) {
+        drift_cert_send_error(state, task, hdr, "NULL payload pointer received for drift certificate audit");
+        return;
+    }
 
     /* Minimum payload: 4-byte shots + 32-byte beacon + 2-byte histogram dimension = 38 bytes */
     if (payload_len < 38) {
-        atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[SCL_RPC_METHOD_DRIFT_CERT_AUDIT], 1, memory_order_relaxed);
+        drift_cert_send_error(state, task, hdr, "Drift audit payload too short: expected 4-byte shots + 32-byte beacon + 2-byte histogram dimension (38 bytes minimum)");
         return;
     }
 
@@ -183,7 +236,7 @@ void handle_rpc_drift_cert_audit(State *state, RpcTask *task, const SclRpcHeader
     memcpy(&shots_raw, payload, sizeof(uint32_t));
     uint32_t shots = be32toh(shots_raw);
     if (shots == 0 || shots > 100000) {
-        atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[SCL_RPC_METHOD_DRIFT_CERT_AUDIT], 1, memory_order_relaxed);
+        drift_cert_send_error(state, task, hdr, "Shot budget must be between 1 and 100,000");
         return;
     }
 
@@ -194,12 +247,12 @@ void handle_rpc_drift_cert_audit(State *state, RpcTask *task, const SclRpcHeader
     memcpy(&hist_dim_raw, payload + 36, sizeof(uint16_t));
     uint16_t hist_dim = be16toh(hist_dim_raw);
     if (hist_dim != DRIFT_CERT_HISTOGRAM_DIM) {
-        atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[SCL_RPC_METHOD_DRIFT_CERT_AUDIT], 1, memory_order_relaxed);
+        drift_cert_send_error(state, task, hdr, "Histogram dimension must be exactly 128 basis states (7-qubit register)");
         return;
     }
 
     if (payload_len < 38 + (size_t)hist_dim * 4) {
-        atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[SCL_RPC_METHOD_DRIFT_CERT_AUDIT], 1, memory_order_relaxed);
+        drift_cert_send_error(state, task, hdr, "Histogram truncated: expected 128 x 4-byte big-endian counts (512 bytes)");
         return;
     }
 
@@ -211,13 +264,17 @@ void handle_rpc_drift_cert_audit(State *state, RpcTask *task, const SclRpcHeader
         memcpy(&count_raw, payload + 38 + (size_t)i * 4, sizeof(uint32_t));
         histogram[i] = be32toh(count_raw);
         if (histogram[i] > shots) {
-            atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[SCL_RPC_METHOD_DRIFT_CERT_AUDIT], 1, memory_order_relaxed);
+            drift_cert_send_error(state, task, hdr, "Histogram bin exceeds the shot budget (counts must be non-negative and <= shots)");
             return;
         }
         histogram_total += histogram[i];
     }
     if (histogram_total != shots) {
-        atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[SCL_RPC_METHOD_DRIFT_CERT_AUDIT], 1, memory_order_relaxed);
+        char conservation_err[128];
+        snprintf(conservation_err, sizeof(conservation_err),
+                 "Shot conservation violated: histogram totals %llu but the budget is %u",
+                 (unsigned long long)histogram_total, shots);
+        drift_cert_send_error(state, task, hdr, conservation_err);
         return;
     }
 
@@ -230,7 +287,7 @@ void handle_rpc_drift_cert_audit(State *state, RpcTask *task, const SclRpcHeader
     QuantumDriftCertificate cert;
     int res = quantum_tvd_audit_generate_certificate(state, circuit_bytes, circuit_len, histogram, shots, beacon_seed, &cert);
     if (res != 0) {
-        atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[SCL_RPC_METHOD_DRIFT_CERT_AUDIT], 1, memory_order_relaxed);
+        drift_cert_send_error(state, task, hdr, "Drift audit engine failed to generate the certificate");
         return;
     }
 
