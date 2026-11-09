@@ -318,6 +318,9 @@ Pointer *select_pointers(State *state, const uint8_t pubkey[PUBKEY_LEN], uint64_
                 } else if (pop->type == OP_UNSTAKE) {
                     p_num = pop->data.unstake.num_inputs;
                     p_in = pop->data.unstake.inputs;
+                } else if (pop->type == OP_APPLY_DRIFT_CERT) {
+                    p_num = pop->data.apply_drift_cert.num_inputs;
+                    p_in = pop->data.apply_drift_cert.inputs;
                 }
 
                 for (uint32_t k = 0; k < p_num; k++) {
@@ -969,6 +972,198 @@ int create_and_broadcast_stake(State *state, uint64_t amount_subunits, bool is_r
             (double)amount_subunits / SUBUNITS_PER_COIN,
             sd->stake_tx_id[0], sd->stake_tx_id[1], sd->stake_tx_id[2], sd->stake_tx_id[3],
             sd->stake_tx_id[4], sd->stake_tx_id[5], sd->stake_tx_id[6], sd->stake_tx_id[7]);
+
+    result = 0;
+
+cleanup:
+    if (selected) free(selected);
+    arena_reset(fn_mark);
+    return result;
+}
+
+/**
+ * @brief Assembles, signs, and broadcasts a drift certificate anchoring transaction (@ref OP_APPLY_DRIFT_CERT).
+ *
+ * @details
+ * Mirrors the @ref create_and_broadcast_stake funding model: selects the funding wallet's unspent
+ * pointers, binds the client-attested certificate digest fields, signs the canonical certificate
+ * digest with ML-DSA-87, and gossips the operation to the mempool. The authenticated client intent
+ * op (deserialized from SubmitTx 0x0003) contributes the certificate identity and fee; this builder
+ * re-anchors it under the node wallet exactly as browser-submitted transfers are executed.
+ *
+ * @param[in,out] state Pointer to global node state container.
+ * @param[in] client_cert Authenticated client intent carrying the certificate digest fields and fee.
+ * @param[in] is_recreation Flag indicating background worker recreation retry.
+ * @return 0 on success; 2 if input pointers are locked in mempool; -1 on failure.
+ *
+ * @complexity Time: O(inputs + Cost(Dilithium5)), Space: O(MAX_INPUTS * sizeof(Pointer)).
+ */
+int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData *client_cert, bool is_recreation) {
+    int result = -1;
+    Pointer *selected = NULL;
+    ApplyDriftCertData *dc = NULL;
+    Operation *op = NULL;
+    Message *broadcast_msg = NULL;
+
+    if (!state || !client_cert || client_cert->amount == 0) {
+        fprintf(stderr, "[DriftCert] ERROR: Invalid parameters for %sanchoring\n", is_recreation ? "recreated " : "");
+        return -1;
+    }
+
+    /* Enterprise anchoring uses the halved (staking-grade) fee schedule */
+    uint64_t fee = calculate_fee(client_cert->amount, true);
+    uint64_t total_subunits = client_cert->amount + fee;
+
+    size_t fn_mark = arena_mark();
+
+    dc = arena_alloc(sizeof(ApplyDriftCertData));
+    op = arena_alloc(sizeof(Operation));
+    broadcast_msg = arena_alloc(offsetof(Message, payload) + 15000 + MAX_INPUTS * 8000);
+    if (!dc || !op || !broadcast_msg) {
+        fprintf(stderr, "[DriftCert] ERROR: Memory allocation failed in %sanchoring\n", is_recreation ? "recreated " : "");
+        result = -1;
+        goto cleanup;
+    }
+
+    uint8_t local_privkey[DILITHIUM_SECRETKEY_LEN];
+
+    pthread_mutex_lock(&state->mutex);
+    size_t num_selected = 0;
+
+    selected = select_pointers(state, state->user_wallet.dilithium_pubkey, total_subunits, &num_selected, false, true);
+    if (!selected || num_selected == 0) {
+        selected = select_pointers(state, state->user_wallet.dilithium_pubkey, total_subunits, &num_selected, false, false);
+        if (!selected || num_selected == 0) {
+            fprintf(stderr, "[DriftCert] ERROR: Failed to select pointers for %sanchoring: insufficient balance\n", is_recreation ? "recreated " : "");
+            pthread_mutex_unlock(&state->mutex);
+            goto cleanup;
+        }
+        if (!is_recreation) {
+            fprintf(stderr, "[DriftCert] Pointers locked in mempool. Queuing anchoring for later...\n");
+        }
+        pthread_mutex_unlock(&state->mutex);
+        result = 2;
+        goto cleanup;
+    }
+
+    if (has_insufficient_balance_locked(state, state->user_wallet.dilithium_pubkey, selected, num_selected, total_subunits, false)) {
+        fprintf(stderr, "[DriftCert] ERROR: Insufficient balance (considering pending) for %sanchoring\n", is_recreation ? "recreated " : "");
+        pthread_mutex_unlock(&state->mutex);
+        goto cleanup;
+    }
+
+    memset(dc, 0, sizeof(ApplyDriftCertData));
+    dc->num_inputs = (uint32_t)num_selected;
+    memcpy(dc->inputs, selected, num_selected * sizeof(Pointer));
+
+    /* Bind the audited certificate's cryptographic identity into the anchoring record */
+    memcpy(dc->circuit_hash, client_cert->circuit_hash, 32);
+    dc->tvd_scaled = client_cert->tvd_scaled;
+    dc->shots = client_cert->shots;
+    dc->status = client_cert->status;
+    memcpy(dc->commitment_root, client_cert->commitment_root, 32);
+    dc->timestamp_us = client_cert->timestamp_us;
+    memcpy(dc->recipient_pubkey, client_cert->recipient_pubkey, PUBKEY_LEN);
+    memcpy(dc->sender_pubkey, state->user_wallet.dilithium_pubkey, PUBKEY_LEN);
+    dc->amount = client_cert->amount;
+
+    if (RAND_bytes(dc->nonce, 8) != 1) {
+        fprintf(stderr, "[DriftCert] ERROR: Failed to generate nonce for %sanchoring\n", is_recreation ? "recreated " : "");
+        pthread_mutex_unlock(&state->mutex);
+        goto cleanup;
+    }
+    get_mmr_root(&state->bc, dc->client_root);
+
+    for (size_t i = 0; i < num_selected; i++) {
+        SCLCoin *parent = hash_table_lookup(state->bc.coin_table, dc->inputs[i].parent_coin_id, false);
+        if (!parent) {
+            fprintf(stderr, "[DriftCert] ERROR: Parent coin not found for pointer %zu\n", i);
+            pthread_mutex_unlock(&state->mutex);
+            goto cleanup;
+        }
+        ssize_t pos = mmr_get_leaf_position(state->bc.mmr, parent->coin_id, parent->remaining_subunits);
+        if (pos == -1) {
+            fprintf(stderr, "[DriftCert] ERROR: Leaf position not found for pointer %zu\n", i);
+            pthread_mutex_unlock(&state->mutex);
+            goto cleanup;
+        }
+        if (mmr_generate_proof(state->bc.mmr, (size_t)pos, dc->proofs[i].path_hashes, dc->proofs[i].is_left, &dc->proofs[i].path_len,
+            dc->proofs[i].left_peaks, &dc->proofs[i].left_peaks_len,
+            dc->proofs[i].right_peaks, &dc->proofs[i].right_peaks_len) != 0) {
+            fprintf(stderr, "[DriftCert] ERROR: Failed to generate MMR proof for pointer %zu\n", i);
+            pthread_mutex_unlock(&state->mutex);
+            goto cleanup;
+        }
+    }
+
+    memcpy(local_privkey, state->user_wallet.dilithium_privkey, DILITHIUM_SECRETKEY_LEN);
+    pthread_mutex_unlock(&state->mutex);
+
+    compute_inputs_merkle_root(dc->inputs, dc->num_inputs, dc->inputs_merkle_root);
+
+    /* Canonical certificate digest: SHA-256 over the audited attestation core */
+    {
+        SHA256_CTX digest_ctx;
+        SHA256_Init(&digest_ctx);
+        SHA256_Update(&digest_ctx, dc->circuit_hash, 32);
+        uint64_t tvd_be = htobe64(dc->tvd_scaled);   SHA256_Update(&digest_ctx, &tvd_be, 8);
+        uint32_t shots_be = htobe32(dc->shots);      SHA256_Update(&digest_ctx, &shots_be, 4);
+        uint32_t status_be = htobe32(dc->status);    SHA256_Update(&digest_ctx, &status_be, 4);
+        SHA256_Update(&digest_ctx, dc->commitment_root, 32);
+        uint64_t ts_be = htobe64(dc->timestamp_us);  SHA256_Update(&digest_ctx, &ts_be, 8);
+        SHA256_Final(dc->cert_digest, &digest_ctx);
+    }
+
+    /* Sign the certificate digest with the funding wallet's ML-DSA-87 key */
+    if (dilithium_sign(dc->cert_digest, 32, local_privkey, dc->signature) != 1) {
+        fprintf(stderr, "[DriftCert] ERROR: Failed to sign certificate digest for %sanchoring\n", is_recreation ? "recreated " : "");
+        goto cleanup;
+    }
+
+    /* Deterministic operation identity: SHA-256(cert_digest || amount || nonce) */
+    {
+        uint8_t tx_id_input[48];
+        memcpy(tx_id_input, dc->cert_digest, 32);
+        uint64_t amount_be = htobe64(dc->amount);
+        memcpy(tx_id_input + 32, &amount_be, 8);
+        memcpy(tx_id_input + 40, dc->nonce, 8);
+        SHA256(tx_id_input, sizeof(tx_id_input), dc->cert_tx_id);
+    }
+
+    op->type = OP_APPLY_DRIFT_CERT;
+    op->data.apply_drift_cert = *dc;
+
+    if (verify_operation_heavy_crypto(op) != CRYPTO_SUCCESS) {
+        fprintf(stderr, "[DriftCert] ERROR: Heavy crypto verification failed on local creation\n");
+        result = -1;
+        goto cleanup;
+    }
+
+    int added = add_pending_operation(state, op);
+    if (added == -2) {
+        if (!is_recreation) {
+            fprintf(stderr, "[DriftCert] Pointers locked in mempool. Queuing anchoring for later...\n");
+        }
+        result = 2;
+        goto cleanup;
+    } else if (added != 0) {
+        fprintf(stderr, "[DriftCert] ERROR: Failed to add OP_APPLY_DRIFT_CERT to pending operations\n");
+        goto cleanup;
+    }
+
+    broadcast_msg->type = MSG_PENDING_OPERATION;
+    broadcast_msg->length = serialize_operation(op, broadcast_msg->payload, MAX_MESSAGE_SIZE);
+    if (broadcast_msg->length == 0) {
+        fprintf(stderr, "[DriftCert] ERROR: Failed to serialize OP_APPLY_DRIFT_CERT for broadcast\n");
+        goto cleanup;
+    }
+    p2p_broadcast(state, broadcast_msg);
+
+    fprintf(stderr, "[DriftCert] %s anchoring of %.8f SCL fee broadcasted (cert_tx_id first 8 bytes: %02x%02x%02x%02x%02x%02x%02x%02x)\n",
+            is_recreation ? "Recreated" : "Initiated",
+            (double)client_cert->amount / SUBUNITS_PER_COIN,
+            dc->cert_tx_id[0], dc->cert_tx_id[1], dc->cert_tx_id[2], dc->cert_tx_id[3],
+            dc->cert_tx_id[4], dc->cert_tx_id[5], dc->cert_tx_id[6], dc->cert_tx_id[7]);
 
     result = 0;
 
