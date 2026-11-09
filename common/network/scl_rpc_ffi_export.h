@@ -386,6 +386,32 @@ int scl_rpc_frame_block_query(uint64_t request_id, uint32_t height, uint8_t* out
 int scl_rpc_frame_quantum_tvd_audit(uint64_t request_id, uint32_t shots, const uint8_t* beacon_seed, const uint8_t* circuit_bytes, size_t circuit_len, uint8_t* out_frame, size_t max_len, size_t* out_len);
 
 /**
+ * @brief Constructs a wire frame for dispatching a Drift Certificate Audit request (Method 0x000D).
+ *
+ * @details
+ * Enterprise QPU auditing variant of @ref scl_rpc_frame_quantum_tvd_audit: the client submits a
+ * hardware-measured outcome histogram together with the shot budget, beacon seed, and an optional
+ * OpenQASM reference circuit. The auditor evaluates the Total Variation Distance between the
+ * measured QPU distribution and the ideal statevector distribution, seals the metric into a
+ * BDLOP-committed, ML-DSA-87-signed QuantumDriftCertificate, and returns it for on-chain
+ * application via an OP_APPLY_DRIFT_CERT transaction.
+ *
+ * @param[in] request_id 64-bit request identifier.
+ * @param[in] shots Measurement shot count budget (1..100,000).
+ * @param[in] beacon_seed Optional 32-byte DKG beacon seed (NULL defaults to zero seed).
+ * @param[in] histogram Client-measured QPU outcome histogram (exactly QUANTUM_STATE_DIM = 128 bins, fixed-width).
+ * @param[in] circuit_bytes Optional OpenQASM circuit byte stream.
+ * @param[in] circuit_len Byte length of circuit stream.
+ * @param[out] out_frame Output wire frame buffer.
+ * @param[in] max_len Buffer capacity.
+ * @param[out] out_len Destination receiving exact serialized frame length.
+ * @return 0 on success; negative value on buffer overflow.
+ *
+ * @complexity Time: O(QUANTUM_STATE_DIM + circuit_len), Space: O(1).
+ */
+int scl_rpc_frame_drift_cert_audit(uint64_t request_id, uint32_t shots, const uint8_t* beacon_seed, const uint32_t* histogram, const uint8_t* circuit_bytes, size_t circuit_len, uint8_t* out_frame, size_t max_len, size_t* out_len);
+
+/**
  * @brief Constructs a wire frame for configuring or querying node Auto-Pilot automation (Method 0x000B).
  *
  * @param[in] request_id 64-bit request identifier.
