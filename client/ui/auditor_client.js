@@ -267,6 +267,10 @@ class SclAuditorClient {
         this.onMmrProofVerified = null;
         /** @type {Function|null} Callback invoked upon Quantum TVD drift audit receipt. */
         this.onQuantumTvdAuditReceived = null;
+        /** @type {Function|null} Callback invoked upon enterprise drift certificate histogram audit receipt. */
+        this.onDriftCertAuditReceived = null;
+        /** @type {Object|null} Last drift audit context retained for autonomous 402 replay. */
+        this._lastDriftAuditContext = null;
         /** @type {Function|null} Callback invoked upon HTTP/RPC 402 Payment Required challenge. */
         this.onPaymentRequired = null;
         
@@ -654,6 +658,45 @@ class SclAuditorClient {
             }
         });
     }
+
+    /**
+     * Build and transmit a request frame for an enterprise Drift Certificate
+     * Histogram Audit (Method 0x000D). Metered via SCL402: the node replies with a
+     * 402 Payment Required challenge which is auto-settled by an OP_TRANSFER_POINTER
+     * micro-transaction, after which this method is replayed with the receipt.
+     * @param {number} shots - Measurement shot budget (1..100,000).
+     * @param {Uint8Array|null} beaconSeed - 32-byte DKG beacon seed.
+     * @param {Uint8Array|null} histogram - 512-byte wire histogram (128 x u32 BE).
+     * @param {Uint8Array|null} circuitBytes - Optional OpenQASM circuit bytes.
+     * @param {Object|null} receipt - SCL402 payment receipt.
+     */
+    requestDriftCertAudit(shots = 15000, beaconSeed = null, histogram = null, circuitBytes = null, receipt = null) {
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+        const timestamp = BigInt(Date.now());
+        const salt = BigInt(Math.floor(Math.random() * 65535));
+        const reqId = (timestamp << 16n) | salt;
+
+        if (!receipt) {
+            this._lastDriftAuditContext = {
+                shots: shots,
+                beaconSeed: beaconSeed,
+                histogram: histogram,
+                circuitBytes: circuitBytes
+            };
+        }
+
+        this.worker.postMessage({
+            type: 'BUILD_DRIFT_CERT_AUDIT',
+            data: {
+                requestId: reqId,
+                shots: shots,
+                beaconSeed: beaconSeed,
+                histogram: histogram,
+                circuitBytes: circuitBytes,
+                receipt: receipt
+            }
+        });
+    }
     
     /**
      * Build and transmit a request frame for the complete blockchain ledger (Method 0x000C).
@@ -821,6 +864,9 @@ class SclAuditorClient {
                     
                     if (replayCtx.methodId === 0x000A) {
                         this.requestQuantumTvdAudit(15000, null, null, receipt);
+                    } else if (replayCtx.methodId === 0x000D && this._lastDriftAuditContext) {
+                        const auditCtx = this._lastDriftAuditContext;
+                        this.requestDriftCertAudit(auditCtx.shots, auditCtx.beaconSeed, auditCtx.histogram, auditCtx.circuitBytes, receipt);
                     }
                 }
                 
@@ -909,6 +955,11 @@ class SclAuditorClient {
             case 'QUANTUM_TVD_AUDIT_RECEIVED':
                 if (this.onQuantumTvdAuditReceived) {
                     this.onQuantumTvdAuditReceived(data);
+                }
+                break;
+            case 'DRIFT_CERT_AUDIT_RECEIVED':
+                if (this.onDriftCertAuditReceived) {
+                    this.onDriftCertAuditReceived(data);
                 }
                 break;
             case 'AUTOPILOT_STATUS_RECEIVED':
