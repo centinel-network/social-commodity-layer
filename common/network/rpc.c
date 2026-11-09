@@ -61,6 +61,7 @@
 extern User *global_user;
 
 extern void handle_rpc_quantum_tvd_audit(State *state, RpcTask *task, const SclRpcHeader *hdr, const uint8_t *payload, size_t payload_len);
+extern void handle_rpc_drift_cert_audit(State *state, RpcTask *task, const SclRpcHeader *hdr, const uint8_t *payload, size_t payload_len);
 
 /* ============================================================================ */
 /* SECTION 1: ASYNCHRONOUS WORKER DAEMON & TASK DEQUEUING                       */
@@ -209,7 +210,7 @@ static void send_rpc_error(State *state, SclConnection *conn, uint16_t method_id
         uint64_t checksum = compute_rpc_checksum(resp->payload, (uint16_t)err_len, 0, conn->rpc_siphash_key);
         rh->checksum = htobe64(checksum);
 
-        if (state && method_id < 12) {
+        if (state && method_id < 16) {
             atomic_fetch_add_explicit(&state->rpc_engine.method_requests_err[method_id], 1, memory_order_relaxed);
         }
         // Enqueue error response frame onto connection tx queue
@@ -293,7 +294,7 @@ static void send_rpc_ok(State *state, SclConnection *conn, uint16_t method_id, u
         uint64_t checksum = compute_rpc_checksum(resp->payload, 0, 0, conn->rpc_siphash_key);
         rh->checksum = htobe64(checksum);
 
-        if (state && method_id < 12) {
+        if (state && method_id < 16) {
             atomic_fetch_add_explicit(&state->rpc_engine.method_requests_ok[method_id], 1, memory_order_relaxed);
         }
         queue_enqueue(&conn->tx_stream_queue, resp);
@@ -828,6 +829,7 @@ void handle_rpc_request(State *state, RpcTask *task) {
                         else if (op->type == OP_MINT_COIN) auth_pubkey = op->data.mint_coin.owner_pubkey;
                         else if (op->type == OP_SUBMIT_VALUATION) auth_pubkey = op->data.submit_valuation.pubkey;
                         else if (op->type == OP_CLAIM_VALIDATION) auth_pubkey = op->data.claim_validation.pubkey;
+                        else if (op->type == OP_APPLY_DRIFT_CERT) auth_pubkey = op->data.apply_drift_cert.sender_pubkey;
                         else if (op->type == OP_REDEEM_CENTINEL) auth_pubkey = (!is_zeroed(task->sender_pubkey, PUBKEY_LEN)) ? task->sender_pubkey : state->user_wallet.dilithium_pubkey;
 
                         // Authenticate ML-DSA-87 signature over normalized header prefix (24 bytes) + serialized operation
@@ -886,6 +888,15 @@ void handle_rpc_request(State *state, RpcTask *task) {
                                 send_rpc_ok(state, task->conn, hdr.method_id, hdr.request_id);
                             } else {
                                 send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id, SCL_RPC_STATUS_INVALID_ARGS, "Unstake failed: insufficient threshold peers");
+                            }
+                            free(op);
+                            break;
+                        } else if (op->type == OP_APPLY_DRIFT_CERT) {
+                            int added = create_and_broadcast_apply_drift_cert(state, &op->data.apply_drift_cert, false);
+                            if (added == 0 || added == 2) {
+                                send_rpc_ok(state, task->conn, hdr.method_id, hdr.request_id);
+                            } else {
+                                send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id, SCL_RPC_STATUS_INVALID_ARGS, "Drift certificate anchoring failed: insufficient balance");
                             }
                             free(op);
                             break;
@@ -1409,7 +1420,7 @@ void handle_rpc_request(State *state, RpcTask *task) {
                 uint64_t checksum = compute_rpc_checksum(resp->payload, 0, 21, task->conn->rpc_siphash_key);
                 rh->checksum = htobe64(checksum);
 
-                if (hdr.method_id < 12) {
+                if (hdr.method_id < 16) {
                     atomic_fetch_add_explicit(&state->rpc_engine.method_requests_ok[hdr.method_id], 1, memory_order_relaxed);
                 }
                 queue_enqueue(&task->conn->tx_stream_queue, resp);
@@ -1418,6 +1429,30 @@ void handle_rpc_request(State *state, RpcTask *task) {
                 arena_reset(rpc_mark);
                 send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id, SCL_RPC_STATUS_RATE_LIMITED, "Arena allocation failed");
             }
+            break;
+        }
+        case 0x000D: { // Drift Certificate Histogram Audit (Enterprise TVD Platform)
+            /* Enterprise audits always carry a client-supplied QPU measurement
+             * histogram and are therefore always metered (SCL402). Fee schedule
+             * mirrors the explorer quote exactly: 1 SCL base + 0.2 SCL per
+             * commenced 10,000 shots (160,000,000 subunits = 1 SCL). */
+            const uint8_t *dc_payload = msg->payload + sizeof(SclRpcHeader) + hdr.error_msg_len;
+            size_t dc_payload_len = hdr.payload_len;
+
+            if (!payment_verified && state->config.is_daemon) {
+                uint32_t dc_shots = 15000;
+                if (dc_payload_len >= 4) {
+                    uint32_t shots_raw;
+                    memcpy(&shots_raw, dc_payload, sizeof(uint32_t));
+                    dc_shots = be32toh(shots_raw);
+                }
+                uint64_t drift_fee = 160000000ULL + 32000000ULL * (((uint64_t)dc_shots + 9999) / 10000);
+                send_rpc_payment_required(state, task->conn, hdr.method_id, hdr.request_id, drift_fee);
+                break;
+            }
+
+            // Dispatch execution to the drift certificate histogram audit subsystem
+            handle_rpc_drift_cert_audit(state, task, &hdr, dc_payload, dc_payload_len);
             break;
         }
         case 0x0009: { // SyncWalletKeys
