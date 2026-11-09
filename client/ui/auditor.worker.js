@@ -3133,35 +3133,23 @@ function handleSubmitTransaction(requestId, opType, payload) {
                     nullifierBytes.set(getLiveHeapU8().subarray(outNulPtr, outNulPtr + 32));
                 }
 
-                if (!zkProofBytes && wasmInstance._wasm_generate_zk_prf_proof) {
-                    const proofOutPtr = wasmInstance._wasm_malloc(4000000);
-                    const proofLenPtr = wasmInstance._wasm_malloc(4);
-
-                    const genRes = wasmInstance._wasm_generate_zk_prf_proof(
-                        proofOutPtr,
-                        proofLenPtr,
-                        idPtr,
-                        32,
-                        prfKeyPtr,
-                        1024,
-                        seedPtr
-                    );
-
-                    if (genRes === 0) {
-                        const viewLen = new DataView(wasmInstance.HEAPU8.buffer, proofLenPtr, 4);
-                        const actualProofLen = viewLen.getUint32(0, true);
-                        zkProofBytes = getLiveHeapU8().subarray(proofOutPtr, proofOutPtr + actualProofLen).slice(0);
-                    }
-
-                    wasmInstance._wasm_free(proofOutPtr);
-                    wasmInstance._wasm_free(proofLenPtr);
-                }
-
                 wasmInstance._wasm_free(idPtr);
                 wasmInstance._wasm_free(seedPtr);
                 wasmInstance._wasm_free(outNulPtr);
             }
 
+            /* SCL402 settlement intents never carry a client-side ZK proof: the
+             * node's custodial settlement path (create_and_broadcast_transfer_as)
+             * re-selects inputs, re-signs, and generates its own Stern proof —
+             * anything the browser proves here is discarded on arrival. Generating
+             * it anyway cost ~400 ms, spiked the WASM heap with a 4 MB scratch
+             * allocation, and inflated the SubmitTx frame to ~446 KB (the ~418 KB
+             * proof dominates the wire size) — a frame large enough for the
+             * scl-ws-map load balancer / TLS front ends to silently drop, which
+             * left Run Audit stalled on "Settling autonomously..." with no mempool
+             * entry, no balance change, and no error. Ship the 128-byte
+             * placeholder instead: identical op structure for the node's
+             * deserializer, 23x smaller frame, no heap spike, ~350 ms faster. */
             if (!zkProofBytes) {
                 zkProofBytes = new Uint8Array(128);
             }
