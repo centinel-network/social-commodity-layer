@@ -247,6 +247,23 @@ int create_and_broadcast_stake(State *state, uint64_t amount_subunits, bool is_r
 int create_and_broadcast_unstake(State *state, uint64_t amount_subunits, bool is_recreation);
 
 /**
+ * @brief Assembles, signs, and broadcasts a drift certificate anchoring transaction (@ref OP_APPLY_DRIFT_CERT).
+ *
+ * @param[in,out] state Pointer to global node state container.
+ * @param[in] client_cert Authenticated client intent carrying certificate digest fields and anchoring fee.
+ * @param[in] is_recreation Flag: `true` if invoked by background recreation worker.
+ * @return 0 on successful construction and broadcast;
+ *         2 if funding pointers are temporarily locked in mempool (caller should defer);
+ *         -1 on parameter, balance, or cryptographic failure.
+ *
+ * @pre `state` and `client_cert` must be non-NULL; `client_cert->amount > 0`.
+ * @post Resulting operation is staged in mempool and gossiped network-wide.
+ * @thread_safety Synchronizes via `state->mutex` and `state->bc.rwlock`.
+ * @complexity Time: O(inputs + Cost(Dilithium5)), Space: O(MAX_INPUTS * sizeof(Pointer)).
+ */
+int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData *client_cert, bool is_recreation);
+
+/**
  * @brief Interactive terminal routine guiding user through transfer recipient input, balance verification, and dispatch.
  *
  * @param[in] user Pointer to the local operator's @ref User profile.
