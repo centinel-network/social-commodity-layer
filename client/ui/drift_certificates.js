@@ -41,12 +41,14 @@
 
     /** @type {Object} Module state container. */
     const state = {
-        lastAudit: null,     // Parsed 0x000D certificate payload
-        lastHistogram: null, // Parsed 128-bin count array (for the deliverable)
-        lastContext: null,   // { shots, beaconSeed, circuitText }
-        anchor: null,        // { txIdHex, fee, appliedAt, confirmed }
+        lastAudit: null,      // Parsed 0x000D certificate payload
+        lastHistogram: null,  // Parsed 128-bin count array (for the deliverable)
+        lastContext: null,    // { shots, beaconSeed, circuitText }
+        anchor: null,         // { txIdHex, reqId, fee, appliedAt, confirmed }
         pollTimer: null,
-        bound: false
+        bound: false,
+        auditWatchdog: null,  // Timeout handle flagging a silently missing 0x000D response
+        sampleBeaconSeed: null // 32-byte client beacon bound to the loaded healthy sample
     };
 
     /* ========================================================================
@@ -91,9 +93,21 @@
     function refreshBalance() {
         const el = document.getElementById('drift-balance-badge');
         if (!el) return;
+        /* Mirror the dashboard's shared wallet telemetry (updated every 2 s by the
+         * chained onBalanceReceived hook). Keep the em-dash placeholder only while
+         * no wallet has been loaded at all. */
+        const walletLoaded = !!(window.client && window.client.walletPubkeyBytes) ||
+            (typeof window.lastBalanceSubunits === 'bigint');
+        if (!walletLoaded) {
+            el.textContent = 'Balance: — (no wallet loaded)';
+            el.style.color = 'var(--text-muted)';
+            return;
+        }
         const bal = window.lastBalanceSubunits || 0n;
+        const shots = parseInt((document.getElementById('drift-shots') || {}).value || '15000', 10) || 15000;
+        const needed = quoteAuditFee(shots) + ANCHOR_FEE_SUBUNITS;
         el.textContent = 'Balance: ' + fmtScl(bal);
-        el.style.color = (bal >= DRIFT_BASE_FEE_SUBUNITS + ANCHOR_FEE_SUBUNITS) ? 'var(--accent-green)' : 'var(--accent-red)';
+        el.style.color = (bal >= needed) ? 'var(--accent-green)' : 'var(--accent-red)';
     }
 
     /**
@@ -156,21 +170,78 @@
         return { ok: true, counts: values, error: null };
     }
 
+    /** @const {string} Exact bytes of the engine's default calibration circuit
+     * (quantum_tvd.cpp default_circuit[]). The healthy sample fills the circuit
+     * field with this string so the digest the node audits equals the digest the
+     * client-side ideal-distribution mirror computed against. */
+    const CALIBRATION_CIRCUIT_QASM = 'OPENQASM 2.0; include "qelib1.inc"; qreg q[7]; h q; cx q[0], q[1];';
+
     /**
-     * @brief Generates a demonstrative near-ideal histogram (uniform 1/128 +/- 3% ripple),
-     *        exactly conserving the declared shot budget. Powers instant demos.
+     * @brief Mirrors quantum_compute_ideal_distribution_qsim() byte-for-byte:
+     *        SHA-256(circuit || beaconSeed) seeds a Knuth/MMIX LCG; amplitudes
+     *        0.01 + (lcg & 0xFFFFFF) / 2^24 are L2-normalized, squared (Born rule),
+     *        then L1-normalized. Produces the exact distribution the node will
+     *        benchmark the submitted histogram against for the same seed.
+     * @param {string} circuitText OpenQASM text (must equal the bytes sent to the node).
+     * @param {Uint8Array} beaconSeed 32-byte client-generated beacon seed.
+     * @return {Promise<Array<number>>} 128 ideal probabilities summing to 1.
+     */
+    async function computeIdealDistribution(circuitText, beaconSeed) {
+        if (!window.crypto || !window.crypto.subtle) {
+            throw new Error('WebCrypto unavailable (secure context required) — cannot derive the qsim baseline');
+        }
+        const circuitBytes = new TextEncoder().encode(circuitText);
+        const hashInput = new Uint8Array(circuitBytes.length + 32);
+        hashInput.set(circuitBytes, 0);
+        hashInput.set(beaconSeed, circuitBytes.length);
+        const digest = new Uint8Array(await window.crypto.subtle.digest('SHA-256', hashInput));
+
+        /* First 8 digest bytes as a little-endian u64 (host-order memcpy in C). */
+        let lcg = 0n;
+        for (let i = 7; i >= 0; i--) lcg = (lcg << 8n) | BigInt(digest[i]);
+        if (lcg === 0n) lcg = 0xdeadbeefcafebaben;
+
+        const M64 = 0xFFFFFFFFFFFFFFFFn;
+        const amps = new Array(DRIFT_HISTOGRAM_DIM);
+        let sumSq = 0;
+        for (let i = 0; i < DRIFT_HISTOGRAM_DIM; i++) {
+            lcg = (lcg * 6364136223846793005n + 1442695040888963407n) & M64;
+            amps[i] = 0.01 + Number(lcg & 0xFFFFFFn) / 16777216.0;
+            sumSq += amps[i] * amps[i];
+        }
+        const invNorm = (sumSq > 0) ? 1 / Math.sqrt(sumSq) : 1;
+        const probs = new Array(DRIFT_HISTOGRAM_DIM);
+        let total = 0;
+        for (let i = 0; i < DRIFT_HISTOGRAM_DIM; i++) {
+            probs[i] = Math.pow(amps[i] * invNorm, 2);
+            total += probs[i];
+        }
+        const invTotal = (total > 0) ? 1 / total : 1;
+        for (let i = 0; i < DRIFT_HISTOGRAM_DIM; i++) probs[i] *= invTotal;
+        return probs;
+    }
+
+    /**
+     * @brief Generates a demonstrative healthy-QPU histogram matching the engine's
+     *        ideal distribution exactly (deterministic largest-remainder allocation,
+     *        conserving the declared shot budget to the last shot). Against the
+     *        beacon-seeded qsim baseline this audits as Fidelity Optimal.
+     * @param {Array<number>} ideal 128 ideal probabilities.
      * @param {number} shots Shot budget.
      * @return {Array<number>} 128 counts summing to shots.
      */
-    function sampleHistogram(shots) {
-        const counts = new Array(DRIFT_HISTOGRAM_DIM);
-        let assigned = 0;
-        for (let i = 0; i < DRIFT_HISTOGRAM_DIM - 1; i++) {
-            const jitter = Math.round((shots / DRIFT_HISTOGRAM_DIM) * 0.03 * Math.sin(i * 2.399963));
-            counts[i] = Math.max(0, Math.floor(shots / DRIFT_HISTOGRAM_DIM) + jitter);
-            assigned += counts[i];
+    function sampleHistogramFromIdeal(ideal, shots) {
+        const counts = ideal.map(p => Math.floor(p * shots));
+        let assigned = counts.reduce((a, b) => a + b, 0);
+        /* Largest-remainder pass: the shortfall (< 128) goes to the bins with the
+         * largest fractional parts so the total conserves the budget exactly. */
+        const order = ideal
+            .map((p, i) => ({ i: i, frac: p * shots - Math.floor(p * shots) }))
+            .sort((a, b) => b.frac - a.frac);
+        const shortfall = shots - assigned;
+        for (let j = 0; j < shortfall && j < order.length; j++) {
+            counts[order[j].i] += 1;
         }
-        counts[DRIFT_HISTOGRAM_DIM - 1] = shots - assigned;
         return counts;
     }
 
@@ -179,38 +250,89 @@
      * ===================================================================== */
 
     /**
+     * @brief Arms the no-response watchdog for an in-flight 0x000D audit. A silent
+     *        dead end (no certificate, no 402, no error) is reported with live
+     *        pipeline diagnostics instead of leaving the operator staring at
+     *        "AWAITING NODE" forever.
+     * @param {number} [timeoutMs=30000] Watchdog window.
+     */
+    function armAuditWatchdog(timeoutMs) {
+        disarmAuditWatchdog();
+        state.auditWatchdog = setTimeout(() => {
+            state.auditWatchdog = null;
+            if (state.lastAudit) return; // A certificate already arrived.
+            const client = window.client;
+            const connected = !!(client && client.socket && client.socket.readyState === WebSocket.OPEN);
+            setStatus(connected ? 'NO NODE RESPONSE' : 'PIPELINE DISCONNECTED', 'var(--accent-red)');
+            progress('No drift certificate within ' + Math.round((timeoutMs || 30000) / 1000) +
+                's. Diagnostics — connection: ' + (connected ? 'OPEN' : 'CLOSED') +
+                '; WebAssembly engine: ' + (client && client.isWasmLoaded ? 'loaded' : 'still compiling') +
+                '. If the node returned SCL402 the fee settlement micro-transaction may still be pending ' +
+                'block inclusion; otherwise the request was dropped before reaching the 0x000D handler.', false);
+        }, timeoutMs || 30000);
+    }
+
+    /**
+     * @brief Cancels the audit watchdog once any terminal event arrives.
+     */
+    function disarmAuditWatchdog() {
+        if (state.auditWatchdog) {
+            clearTimeout(state.auditWatchdog);
+            state.auditWatchdog = null;
+        }
+    }
+
+    /**
      * @brief Validates the form, then dispatches the drift certificate audit request.
+     *        Every failure mode states its exact requirement — the button never fails silently.
      */
     function submitAudit() {
         const client = window.client;
         if (!client || !client.socket || client.socket.readyState !== WebSocket.OPEN) {
-            progress('Connect a node in the Wallet panel first — the audit runs over the SCL bridge.', false);
+            setStatus('PIPELINE DISCONNECTED', 'var(--accent-red)');
+            progress('Cannot run the audit: no live node connection. Requirements: (1) open the Dashboard, ' +
+                'load or generate wallet credentials and click "Connect Node"; (2) return here — the status ' +
+                'badge above switches to PIPELINE CONNECTED automatically; (3) load the histogram; (4) Run Audit.', false);
+            return;
+        }
+        if (!client.isWasmLoaded) {
+            progress('The WebAssembly audit engine is still compiling inside the worker thread. Retry in a few seconds.', false);
+            return;
+        }
+        if (typeof client.requestDriftCertAudit !== 'function') {
+            progress('Audit pipeline unavailable: auditor_client.js did not expose requestDriftCertAudit. Reload the page.', false);
             return;
         }
 
-        const shots = parseInt(document.getElementById('drift-shots').value, 10);
+        const shotsEl = document.getElementById('drift-shots');
+        const shots = parseInt(shotsEl ? shotsEl.value : '', 10);
         if (!Number.isInteger(shots) || shots < 1000 || shots > 100000) {
             progress('Shot budget must be an integer between 1,000 and 100,000.', false);
             return;
         }
 
-        const parsed = parseHistogram(document.getElementById('drift-histogram').value, shots);
+        const histogramEl = document.getElementById('drift-histogram');
+        const parsed = parseHistogram(histogramEl ? histogramEl.value : '', shots);
         if (!parsed.ok) {
             progress(parsed.error, false);
             return;
         }
 
-        const circuitText = document.getElementById('drift-circuit').value.trim();
+        const circuitEl = document.getElementById('drift-circuit');
+        const circuitText = (circuitEl ? circuitEl.value : '').trim();
         const circuitBytes = circuitText.length > 0 ? new TextEncoder().encode(circuitText) : null;
+        const beaconSeed = state.sampleBeaconSeed; // bound to the loaded sample; null -> node derives the DKG beacon
 
         state.lastHistogram = parsed.counts;
-        state.lastContext = { shots: shots, beaconSeed: null, circuitText: circuitText };
+        state.lastContext = { shots: shots, beaconSeed: beaconSeed, circuitText: circuitText };
 
-        progress('Dispatching audit (Method 0x000D)… If the node returns HTTP 402, the fee (' +
+        progress('Dispatching audit (Method 0x000D)… If the node returns SCL402, the fee (' +
             fmtScl(quoteAuditFee(shots)) + ') settles autonomously via an SCL micro-transaction and the query replays.', true);
         setStatus('AWAITING NODE', 'var(--text-muted)');
 
-        client.requestDriftCertAudit(shots, null, buildHistogramBytes(parsed.counts), circuitBytes, null);
+        armAuditWatchdog(30000);
+
+        client.requestDriftCertAudit(shots, beaconSeed, buildHistogramBytes(parsed.counts), circuitBytes, null);
     }
 
     /**
@@ -218,6 +340,7 @@
      * @param {Object} data Certificate fields from DRIFT_CERT_AUDIT_RECEIVED.
      */
     function onAuditReceived(data) {
+        disarmAuditWatchdog();
         state.lastAudit = data;
 
         const tvd = Number(data.tvdDouble);
@@ -261,18 +384,25 @@
         const client = window.client;
         const audit = state.lastAudit;
         if (!client || !audit) return;
+        if (!client.socket || client.socket.readyState !== WebSocket.OPEN) {
+            document.getElementById('drift-anchor-status').textContent =
+                'No live node connection — anchoring requires the SCL bridge. Connect a node on the Dashboard first.';
+            document.getElementById('drift-anchor-status').style.color = 'var(--accent-red)';
+            return;
+        }
         if (typeof window.selectUnspentPointers !== 'function' || typeof window.resolveWalletCredentials !== 'function') {
             document.getElementById('drift-anchor-status').textContent = 'Wallet utilities unavailable — connect a node first.';
             return;
         }
 
         const feePlusTx = ANCHOR_FEE_SUBUNITS; // node applies the halved fee schedule on top
-        const totalNeeded = feePlusTx + BigInt(Math.floor(Number(feePlusTx) * 0.0314159)); // ~3.14% halved preview
+        const totalNeeded = feePlusTx + BigInt(Math.floor(Number(feePlusTx) * 0.0157079633)); // ~1.5708% halved (staking-grade, pi/200) preview
 
         const liquid = window.lastBalanceSubunits || 0n;
         if (liquid < totalNeeded) {
             document.getElementById('drift-anchor-status').textContent =
-                'Insufficient liquid balance (' + fmtScl(liquid) + '). Top up the wallet to anchor on-chain.';
+                'Insufficient liquid balance (' + fmtScl(liquid) + '). Anchoring needs ' + fmtScl(totalNeeded) +
+                ' (0.5 SCL anchor fee + halved network fee). Top up the wallet to anchor on-chain.';
             document.getElementById('drift-anchor-status').style.color = 'var(--accent-red)';
             return;
         }
@@ -294,7 +424,7 @@
         statusEl.textContent = 'Signing OP_APPLY_DRIFT_CERT intent with ML-DSA-87…';
 
         const reqId = ((BigInt(Date.now()) << 16n) | BigInt(Math.floor(Math.random() * 65535))).toString();
-        state.anchor = { txIdHex: null, fee: feePlusTx, appliedAt: Date.now(), confirmed: false };
+        state.anchor = { txIdHex: null, reqId: reqId, fee: feePlusTx, appliedAt: Date.now(), confirmed: false };
 
         client.submitTransaction(reqId, 'OP_APPLY_DRIFT_CERT', {
             circuitHashHex: audit.circuitHash,
@@ -319,7 +449,11 @@
     function onWireFrameReady(frame) {
         if (!state.anchor || state.anchor.txIdHex) return;
         if (!frame || !frame.txIdHex) return;
-        if (frame.queryType && frame.queryType !== 'OP_APPLY_DRIFT_CERT' && frame.computedFeeSubunits === undefined) return;
+        /* Only the anchoring intent this module dispatched (matched by requestId)
+         * may occupy the anchor slot; concurrent SCL402 settlement frames for the
+         * audit fee must not be mistaken for the on-chain certificate anchor. */
+        if (state.anchor.reqId !== undefined && frame.requestId !== undefined &&
+            String(frame.requestId) !== String(state.anchor.reqId)) return;
 
         state.anchor.txIdHex = frame.txIdHex;
         const txEl = document.getElementById('drift-anchor-tx');
@@ -510,7 +644,26 @@
      * ===================================================================== */
 
     /**
+     * @brief Maps shared pipeline status notifications (the exact events that
+     *        drive the dashboard's sidebar badge) onto the Drift view header.
+     * @param {string} status Clean status label from SclAuditorClient._logStatus.
+     */
+    function onPipelineStatus(status) {
+        const s = String(status || '');
+        if (s === 'PIPELINE CONNECTED') {
+            setStatus('PIPELINE CONNECTED', 'var(--accent-green)');
+        } else if (s === 'PIPELINE DISCONNECTED' || s === 'TERMINATED') {
+            setStatus('PIPELINE DISCONNECTED', 'var(--accent-red)');
+        } else if (s === 'WORKER CREATED' || s === 'WASM LOADED' || s === 'KEYS INITIALIZED') {
+            setStatus(s, 'var(--text-muted)');
+        }
+        refreshBalance();
+    }
+
+    /**
      * @brief Attaches the platform's callbacks to the global pipeline client (idempotent).
+     *        The dashboard's own handlers are chained, never replaced, so both views
+     *        render the exact same live connection and balance state.
      */
     function bindClient() {
         const client = window.client;
@@ -520,8 +673,38 @@
         client.onWireFrameReady = onWireFrameReady;
         client.onPaymentRequired = (challenge) => {
             if (Number(challenge.methodId) === 0x000D) {
+                armAuditWatchdog(120000); // settlement tx must wait for block inclusion before the replay
                 progress('SCL402 challenge received (' + fmtScl(BigInt(challenge.amountSubunits)) +
                     '). Settling autonomously via machine-to-machine micro-transaction…', true);
+            }
+        };
+
+        /* Chain the shared pipeline telemetry. explorer_app.js owns the primary
+         * onStatusChange / onBalanceReceived / onRpcError handlers (sidebar badge,
+         * balance panel, console fallbacks); wrap them so the Drift view mirrors
+         * the same state instead of freezing on the defaults it was entered with. */
+        const upstreamStatus = client.onStatusChange;
+        client.onStatusChange = (status) => {
+            if (typeof upstreamStatus === 'function') upstreamStatus(status);
+            onPipelineStatus(status);
+        };
+
+        const upstreamBalance = client.onBalanceReceived;
+        client.onBalanceReceived = (data) => {
+            if (typeof upstreamBalance === 'function') upstreamBalance(data);
+            refreshBalance();
+        };
+
+        const upstreamRpcError = client.onRpcError;
+        client.onRpcError = (data) => {
+            if (typeof upstreamRpcError === 'function') upstreamRpcError(data);
+            if (data && Number(data.methodId) === 0x000D) {
+                disarmAuditWatchdog();
+                setStatus('AUDIT REJECTED', 'var(--accent-red)');
+                progress('Node rejected the drift audit (status 0x' +
+                    Number(data.status).toString(16).padStart(4, '0') + '): ' +
+                    (data.error || 'no diagnostics returned') +
+                    '. Fix the highlighted requirement and run the audit again.', false);
             }
         };
     }
@@ -534,16 +717,29 @@
         refreshBalance();
         updateFeeQuote();
         const ready = !!(window.client && window.client.socket && window.client.socket.readyState === WebSocket.OPEN);
-        setStatus(ready ? 'PIPELINE READY' : 'NODE DISCONNECTED', ready ? 'var(--accent-green)' : 'var(--accent-red)');
+        setStatus(ready ? 'PIPELINE CONNECTED' : 'PIPELINE DISCONNECTED', ready ? 'var(--accent-green)' : 'var(--accent-red)');
     }
 
     /**
      * @brief Updates the fee quote when the shot budget changes.
      */
     function updateFeeQuote() {
-        const shots = parseInt(document.getElementById('drift-shots').value, 10) || 15000;
+        const shotsEl = document.getElementById('drift-shots');
+        const shots = parseInt(shotsEl ? shotsEl.value : '', 10) || 15000;
         const quoteEl = document.getElementById('drift-fee-quote');
         if (quoteEl) quoteEl.value = fmtScl(quoteAuditFee(shots)) + '  (' + shots.toLocaleString() + ' shots)';
+        refreshBalance(); // affordability coloring is a function of the quoted fee
+    }
+
+    /**
+     * @brief Highlights the active pricing tier card (selection ring only — the
+     *        "Most Popular" accent styling from the markup is left untouched).
+     */
+    function selectTier(activeId) {
+        ['drift-tier-standard', 'drift-tier-precision', 'drift-tier-anchor'].forEach((id) => {
+            const el = document.getElementById(id);
+            if (el) el.style.boxShadow = (id === activeId) ? '0 0 0 2px var(--accent-green)' : 'none';
+        });
     }
 
     /**
@@ -556,12 +752,73 @@
         const submitEl = document.getElementById('drift-submit');
         if (submitEl) submitEl.addEventListener('click', submitAudit);
 
+        /* Pricing tier cards are interactive: Standard selects the 15,000-shot
+         * budget (1.4 SCL), Precision selects 100,000 shots (3.0 SCL), Anchoring
+         * explains / jumps to the on-chain anchoring step. */
+        const tierConfigs = [
+            { id: 'drift-tier-standard', shots: 15000 },
+            { id: 'drift-tier-precision', shots: 100000 },
+            { id: 'drift-tier-anchor', shots: null }
+        ];
+        tierConfigs.forEach((cfg) => {
+            const tierEl = document.getElementById(cfg.id);
+            if (!tierEl) return;
+            tierEl.style.cursor = 'pointer';
+            tierEl.title = cfg.shots
+                ? 'Select the ' + cfg.shots.toLocaleString() + '-shot audit budget'
+                : 'On-chain anchoring adds +0.5 SCL after a certificate is issued';
+            tierEl.addEventListener('click', () => {
+                selectTier(cfg.id);
+                if (cfg.shots) {
+                    if (shotsEl) shotsEl.value = cfg.shots;
+                    updateFeeQuote();
+                    progress('Tier selected: ' + cfg.shots.toLocaleString() + ' shots — audit fee quoted at ' +
+                        fmtScl(quoteAuditFee(cfg.shots)) + '. Load the histogram (or the healthy sample) and click "Run Audit".', false);
+                } else {
+                    const anchorCard = document.getElementById('drift-anchor-card');
+                    if (anchorCard && state.lastAudit) {
+                        anchorCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }
+                    progress('On-chain anchoring (+0.5 SCL, halved staking-grade fee schedule) applies to a certificate ' +
+                        'issued in step 2 below' + (state.lastAudit ? ' — jumping to the anchoring card.' : ' — run an audit first.'), false);
+                }
+            });
+        });
+
         const sampleEl = document.getElementById('drift-sample');
-        if (sampleEl) sampleEl.addEventListener('click', () => {
-            const shots = parseInt(document.getElementById('drift-shots').value, 10) || 15000;
-            const counts = sampleHistogram(shots);
-            document.getElementById('drift-histogram').value = JSON.stringify(counts);
-            progress('Healthy QPU sample loaded: 128 bins, ' + shots.toLocaleString() + ' shots, exactly conserving. Adjust the shot budget and click "Run Audit".', false);
+        if (sampleEl) sampleEl.addEventListener('click', async () => {
+            const shots = parseInt(shotsEl ? shotsEl.value : '', 10) || 15000;
+            const circuitEl = document.getElementById('drift-circuit');
+            const histogramEl = document.getElementById('drift-histogram');
+            progress('Deriving the deterministic qsim baseline for the 7-qubit calibration circuit…', true);
+            try {
+                /* Bind a fresh client-side beacon seed: the node honours client-provided
+                 * seeds (quantum_tvd.cpp has_provided_seed), so the ideal distribution
+                 * computed here is byte-for-byte the one the audit benchmarks against. */
+                const beaconSeed = new Uint8Array(32);
+                window.crypto.getRandomValues(beaconSeed);
+                const ideal = await computeIdealDistribution(CALIBRATION_CIRCUIT_QASM, beaconSeed);
+                const counts = sampleHistogramFromIdeal(ideal, shots);
+
+                if (circuitEl) circuitEl.value = CALIBRATION_CIRCUIT_QASM;
+                if (histogramEl) histogramEl.value = JSON.stringify(counts);
+                state.sampleBeaconSeed = beaconSeed;
+                state.lastHistogram = counts;
+                state.lastContext = { shots: shots, beaconSeed: beaconSeed, circuitText: CALIBRATION_CIRCUIT_QASM };
+                updateFeeQuote();
+
+                let sum = 0, maxDev = 0;
+                for (let i = 0; i < DRIFT_HISTOGRAM_DIM; i++) {
+                    sum += counts[i];
+                    maxDev = Math.max(maxDev, Math.abs(counts[i] / shots - ideal[i]));
+                }
+                progress('Healthy QPU sample loaded: 128 basis states totalling ' + sum.toLocaleString() + ' shots ' +
+                    '(max per-bin deviation from the qsim baseline ' + maxDev.toFixed(6) + '), circuit field set to the ' +
+                    'calibration circuit. Click "Run Audit" — the certificate is expected to classify as Fidelity Optimal.', false);
+            } catch (e) {
+                progress('Could not load the healthy sample: ' + (e && e.message ? e.message : String(e)) +
+                    '. Paste a 128-count histogram manually and click "Run Audit".', false);
+            }
         });
 
         const browseEl = document.getElementById('drift-histogram-browse');
@@ -588,6 +845,10 @@
 
         const exportJsonEl = document.getElementById('drift-export-json');
         if (exportJsonEl) exportJsonEl.addEventListener('click', exportJson);
+
+        /* Compute the fee quote immediately on first paint so the field never
+         * shows the "—" placeholder, even before the view is first entered. */
+        updateFeeQuote();
     }
 
     if (document.readyState === 'loading') {
