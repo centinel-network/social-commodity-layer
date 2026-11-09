@@ -763,6 +763,8 @@ const uint8_t* get_operation_tx_id(const Operation *op) {
             return op->data.unstake.unstake_tx_id;
         case OP_MINT_COIN:
             return op->data.mint_coin.coin.creation_tx_hash;
+        case OP_APPLY_DRIFT_CERT:
+            return op->data.apply_drift_cert.cert_tx_id;
         default:
             return NULL;
     }
