@@ -906,9 +906,14 @@ void handle_rpc_request(State *state, RpcTask *task) {
                         if (op->type == OP_TRANSFER_POINTER) {
                             /* SCL402 settlement parity with websocket_bridge.c: debit
                              * the wallet that signed the intent when the node holds its
-                             * key, and echo the serialized settlement operation so the
-                             * client can build a payment receipt against the real
-                             * mempool tx id instead of its locally computed guess. */
+                             * key, and echo the authoritative settlement identity —
+                             * [0x02 OP_TRANSFER_POINTER][32-byte mempool tx id] (33
+                             * bytes) — so the client can build a payment receipt
+                             * against the real mempool tx id instead of its locally
+                             * computed guess. Never echo the full serialized
+                             * operation (~425 KB): large frames traverse the same
+                             * load-balanced transports as the browser pipeline and
+                             * can be silently dropped there. */
                             UserWallet funding_snapshot;
                             const UserWallet *funding_wallet = &state->user_wallet;
 
@@ -920,22 +925,21 @@ void handle_rpc_request(State *state, RpcTask *task) {
                             }
                             pthread_mutex_unlock(&state->wallet_mutex);
 
-                            size_t settle_mark = arena_mark();
-                            size_t settle_cap = 15000 + (size_t)MAX_INPUTS * 8000;
-                            uint8_t *settled_op = arena_alloc(settle_cap);
-                            size_t settled_op_len = 0;
-                            int added = settled_op ? create_and_broadcast_transfer_as(state, funding_wallet,
+                            uint8_t settled_tx_id[COIN_ID_LEN];
+                            uint8_t settle_echo[1 + COIN_ID_LEN];
+                            int added = create_and_broadcast_transfer_as(state, funding_wallet,
                                         op->data.transfer_pointer.recipient_pubkey,
                                         op->data.transfer_pointer.amount, false,
-                                        settled_op, settle_cap, &settled_op_len) : -1;
-                            if (added == 0 && settled_op_len > 0) {
-                                send_rpc_ok_with_payload(state, task->conn, hdr.method_id, hdr.request_id, settled_op, settled_op_len);
-                            } else if (added == 0 || added == 2) {
-                                send_rpc_ok(state, task->conn, hdr.method_id, hdr.request_id);
+                                        NULL, 0, NULL, settled_tx_id);
+                            if (added == 0) {
+                                settle_echo[0] = 0x02;
+                                memcpy(settle_echo + 1, settled_tx_id, COIN_ID_LEN);
+                                send_rpc_ok_with_payload(state, task->conn, hdr.method_id, hdr.request_id, settle_echo, sizeof(settle_echo));
+                            } else if (added == 2) {
+                                send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id, SCL_RPC_STATUS_INVALID_ARGS, "Settlement deferred: the funding wallet's inputs are locked by a pending mempool operation. Retry after the next block.");
                             } else {
                                 send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id, SCL_RPC_STATUS_INVALID_ARGS, "Transfer failed: insufficient balance");
                             }
-                            arena_reset(settle_mark);
                             free(op);
                             break;
                         } else if (op->type == OP_STAKE) {
