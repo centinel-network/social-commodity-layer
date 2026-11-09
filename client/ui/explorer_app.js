@@ -4565,6 +4565,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const navBtnProofs = document.getElementById('nav-btn-proofs');
     const navBtnPrivacy = document.getElementById('nav-btn-privacy');
     const navBtnTos = document.getElementById('nav-btn-tos');
+    const navBtnDrift = document.getElementById('nav-btn-drift');
     const footerLinkVision = document.getElementById('footer-link-vision');
     const footerLinkValidation = document.getElementById('footer-link-validation');
     const footerLinkProofs = document.getElementById('footer-link-proofs');
@@ -4578,11 +4579,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const viewProofs = document.getElementById('view-proofs');
     const viewPrivacy = document.getElementById('view-privacy');
     const viewTos = document.getElementById('view-tos');
+    const viewDrift = document.getElementById('view-drift');
 
     /**
-     * @brief Switches the active page view between Dashboard, Vision, Blockchain Explorer, Settings, Privacy, Terms of Service, Validation, and Formal Proofs.
+     * @brief Switches the active page view between Dashboard, Vision, Blockchain Explorer, Drift Certificates, Settings, Privacy, Terms of Service, Validation, and Formal Proofs.
      *
-     * @param {string} targetView View identifier (`'dashboard'`, `'vision'`, `'blockchain'`, `'settings'`, `'privacy'`, `'tos'`, `'validation'`, `'proofs'`).
+     * @param {string} targetView View identifier (`'dashboard'`, `'vision'`, `'blockchain'`, `'drift'`, `'settings'`, `'privacy'`, `'tos'`, `'validation'`, `'proofs'`).
      * @return {void}
      */
     let visionAnimationId = null;
@@ -4698,6 +4700,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (viewProofs) viewProofs.style.display = 'none';
         if (viewPrivacy) viewPrivacy.style.display = 'none';
         if (viewTos) viewTos.style.display = 'none';
+        if (viewDrift) viewDrift.style.display = 'none';
 
         if (navBtnDashboard) navBtnDashboard.classList.remove('active');
         if (navBtnVision) navBtnVision.classList.remove('active');
@@ -4707,6 +4710,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (navBtnProofs) navBtnProofs.classList.remove('active');
         if (navBtnPrivacy) navBtnPrivacy.classList.remove('active');
         if (navBtnTos) navBtnTos.classList.remove('active');
+        if (navBtnDrift) navBtnDrift.classList.remove('active');
 
         if (targetView === 'vision') {
             if (viewVision) viewVision.style.display = 'block';
@@ -4752,6 +4756,13 @@ document.addEventListener('DOMContentLoaded', () => {
             if (viewTos) viewTos.style.display = 'block';
             if (navBtnTos) navBtnTos.classList.add('active');
             window.scrollTo({ top: 0, behavior: 'smooth' });
+        } else if (targetView === 'drift') {
+            if (viewDrift) viewDrift.style.display = 'block';
+            if (navBtnDrift) navBtnDrift.classList.add('active');
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+            if (window.SCLDriftCertificates) {
+                window.SCLDriftCertificates.onEnter();
+            }
         } else {
             if (viewDashboard) viewDashboard.style.display = 'block';
             if (navBtnDashboard) navBtnDashboard.classList.add('active');
@@ -4769,6 +4780,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (navBtnProofs) navBtnProofs.addEventListener('click', () => switchPageView('proofs'));
     if (navBtnPrivacy) navBtnPrivacy.addEventListener('click', () => switchPageView('privacy'));
     if (navBtnTos) navBtnTos.addEventListener('click', () => switchPageView('tos'));
+    if (navBtnDrift) navBtnDrift.addEventListener('click', () => switchPageView('drift'));
     if (footerLinkValidation) footerLinkValidation.addEventListener('click', () => switchPageView('validation'));
     if (footerLinkProofs) footerLinkProofs.addEventListener('click', () => switchPageView('proofs'));
     if (footerLinkPrivacy) footerLinkPrivacy.addEventListener('click', () => switchPageView('privacy'));
