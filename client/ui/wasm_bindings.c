@@ -680,6 +680,9 @@ int wasm_builder_append_args(SclRpcBuilder builder, const uint8_t* payload, size
  *                         - Direction: in
  * @param[in] tx_id        32-byte transaction identifier hash.
  *                         - Direction: in
+ * @param[in] challenge_hash 32-byte SHA-256 challenge hash of the settled SCL402 challenge;
+ *                         the server-side registry resolves receipts by this key.
+ *                         - Direction: in
  * @param[in] rate_lock_id Server-issued rate lock identifier from challenge.
  *                         - Direction: in
  *
@@ -689,8 +692,8 @@ int wasm_builder_append_args(SclRpcBuilder builder, const uint8_t* payload, size
  * @complexity Space: O(sizeof(SclRpcPaymentReceipt)) buffer expansion.
  */
 EMSCRIPTEN_KEEPALIVE
-int wasm_builder_set_payment_receipt(SclRpcBuilder builder, uint8_t payment_type, const uint8_t* tx_id, uint64_t rate_lock_id) {
-    return scl_rpc_builder_set_payment_receipt(builder, payment_type, tx_id, rate_lock_id);
+int wasm_builder_set_payment_receipt(SclRpcBuilder builder, uint8_t payment_type, const uint8_t* tx_id, const uint8_t* challenge_hash, uint64_t rate_lock_id) {
+    return scl_rpc_builder_set_payment_receipt(builder, payment_type, tx_id, challenge_hash, rate_lock_id);
 }
 
 /**
