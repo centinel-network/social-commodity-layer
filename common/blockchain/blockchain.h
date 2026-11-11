@@ -289,7 +289,7 @@ int create_and_broadcast_unstake(State *state, uint64_t amount_subunits, bool is
  * @thread_safety Synchronizes via `state->mutex` and `state->bc.rwlock`.
  * @complexity Time: O(inputs + Cost(Dilithium5)), Space: O(MAX_INPUTS * sizeof(Pointer)).
  */
-int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData *client_cert, bool is_recreation);
+int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData *client_cert, bool is_recreation, uint8_t *out_cert_tx_id);
 
 /**
  * @brief Interactive terminal routine guiding user through transfer recipient input, balance verification, and dispatch.
