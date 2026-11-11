@@ -547,7 +547,7 @@ size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size, size_t MaxSize, unsig
     if (mode == 3 && Seed % 3 == 0) { // MSG_PROPOSE_BLOCK
         Data[0] = MSG_PROPOSE_BLOCK;
         if (new_size > 1) {
-            Data[1] = (Seed >> 2) % 7;
+            Data[1] = (Seed >> 2) % 8;
         }
         return new_size;
     }
@@ -578,7 +578,7 @@ size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size, size_t MaxSize, unsig
     size_t batch_tx_count = 0;
 
     for (size_t op_idx = 0; op_idx < op_count; op_idx++) {
-        uint8_t op_type = (Seed + op_idx * 3) % 7;
+        uint8_t op_type = (Seed + op_idx * 3) % 8;
         size_t needed = 0;
         switch (op_type) {
             case 0: needed = 9892; break;  // OP_SUBMIT_VALUATION
@@ -588,6 +588,7 @@ size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size, size_t MaxSize, unsig
             case 4: needed = 10064; break; // OP_UNSTAKE
             case 5: needed = 4261; break;  // OP_REDEEM_CENTINEL
             case 6: needed = 9236; break;  // OP_CLAIM_VALIDATION
+            case 7: needed = 10216; break; // OP_APPLY_DRIFT_CERT (1 input, 48-byte MMR proof)
         }
 
         size_t estimated_tail = 8 + 8 + 32 + 8 + 128 + PUBKEY_LEN + SIGNATURE_LEN + SIGNATURE_LEN;
@@ -657,8 +658,29 @@ size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size, size_t MaxSize, unsig
         } else if (op_type == 5) {
             uint32_t zk_len_be = htobe32(128);
             memcpy(op_start + 1 + 32 + 2048 + 2048, &zk_len_be, 4);
-        } else if (op_type == 6 && global_state) {
+        } else if (op_type == 6 && global_state) { // OP_CLAIM_VALIDATION
             memcpy(op_start + 1 + 2048, global_state->user_wallet.dilithium_pubkey, PUBKEY_LEN);
+        } else if (op_type == 7) { // OP_APPLY_DRIFT_CERT
+            /* Wire: type(1) cert_tx_id(32) nonce(8) num_inputs(4,BE)
+             * client_root(32) [pointer(152) mmr_proof(48: path_len=1)]*
+             * circuit_hash(32) tvd_scaled(8,BE) shots(4,BE) status(4,BE)
+             * commitment_root(32) timestamp_us(8,BE) recipient(2592)
+             * sender(2592) amount(8,BE) inputs_merkle_root(32)
+             * cert_digest(32) signature(4595). The 88-byte digest core
+             * shifts the pubkey fields +88 past the transfer/stake layout. */
+            uint32_t num_in = htobe32(1);
+            memcpy(op_start + 1 + 32 + 8, &num_in, 4);
+            uint32_t plen_be = htobe32(1), zero_be = htobe32(0);
+            memcpy(op_start + 229, &plen_be, 4);
+            memcpy(op_start + 229 + 40, &zero_be, 4);
+            memcpy(op_start + 229 + 44, &zero_be, 4);
+            size_t off = 229 + 48 + 88;
+            if (global_state) {
+                memcpy(op_start + off, global_state->user_wallet.dilithium_pubkey, PUBKEY_LEN);
+                memcpy(op_start + off + PUBKEY_LEN, global_state->user_wallet.dilithium_pubkey, PUBKEY_LEN);
+            }
+            uint64_t amt_be = htobe64(1ULL * SUBUNITS_PER_COIN);
+            memcpy(op_start + off + 2 * PUBKEY_LEN, &amt_be, 8);
         }
 
         curr_pos += needed;
