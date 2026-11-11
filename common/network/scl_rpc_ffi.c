@@ -569,19 +569,24 @@ int scl_rpc_parser_get_payment_challenge(SclRpcParser parser, SclRpcPaymentChall
     return 0;
 }
 
-int scl_rpc_builder_set_payment_receipt(SclRpcBuilder builder, uint8_t payment_type, const uint8_t *tx_id, uint64_t rate_lock_id) {
-    if (!builder || !tx_id) return -1;
+int scl_rpc_builder_set_payment_receipt(SclRpcBuilder builder, uint8_t payment_type, const uint8_t *tx_id, const uint8_t *challenge_hash, uint64_t rate_lock_id) {
+    if (!builder || !tx_id || !challenge_hash) return -1;
     struct BuilderInternal *b = (struct BuilderInternal *)builder;
-    
+
+    /* Zero the whole struct first: the natural-alignment wire layout carries
+     * interior padding bytes, and uninitialized stack memory must never
+     * reach the wire. */
     SclRpcPaymentReceipt receipt;
+    memset(&receipt, 0, sizeof(receipt));
     receipt.payment_type = payment_type;
     memcpy(receipt.tx_id, tx_id, 32);
+    memcpy(receipt.challenge_hash, challenge_hash, 32);
     receipt.price_rate_lock_id = htobe64(rate_lock_id);
 
     // Flag the frame as carrying a receipt
     b->flags |= SCL_RPC_FLAG_PAYMENT_RECEIPT;
-    
-    // Append the 41-byte receipt structurally ahead of generic payload args
+
+    // Append the receipt structurally ahead of generic payload args
     return scl_rpc_builder_append_args(builder, (const uint8_t *)&receipt, sizeof(SclRpcPaymentReceipt));
 }
 
