@@ -544,7 +544,33 @@ if(NOT EMSCRIPTEN)
     endif()
 
     # Build libscl_rpc.so FFI
-    add_library(scl_rpc SHARED common/network/scl_rpc_ffi.c ${COMMON_SRCS})
+    # websocket_bridge.c (in COMMON_SRCS) references scl402_challenge_* defined
+    # in common/network/rpc.c (in RPC_SRCS); rpc.c in turn references
+    # create_and_broadcast_*, auto_simulate, add_valuation, etc. defined in the
+    # client sources. scl_rpc must therefore link the client library sources.
+    #
+    # scl_rpc MUST NOT link client/client.c. In non-fuzzing builds, both
+    # client.c and scl_rpc_ffi.c define global_state and global_shutdown
+    # (scl_rpc_ffi.c owns them when the library is consumed standalone via
+    # FFI; client.c owns them inside the satocialist_client executable).
+    # Linking both into libscl_rpc produces duplicate-symbol errors.
+    # Executable targets keep the full CLIENT_SRCS because client.c is the
+    # sole source of main() and the real node globals there. The fuzzer
+    # targets are unaffected because -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    # stubs the globals out of scl_rpc_ffi.c, making client.c their only
+    # provider (and client.c's main() is likewise excluded there).
+    set(CLIENT_LIB_SRCS
+        client/ui/client_aux.c
+        client/network/client_network.c
+        client/state/client_state.c
+        client/core/game_state.c
+    )
+    add_library(scl_rpc SHARED
+        common/network/scl_rpc_ffi.c
+        ${COMMON_SRCS}
+        ${CLIENT_LIB_SRCS}
+        ${RPC_SRCS}
+    )
     target_link_libraries(scl_rpc
         ${OPENSSL_CRYPTO_LIBRARY}
         ${OPENSSL_SSL_LIBRARY}
