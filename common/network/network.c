@@ -5203,14 +5203,36 @@ epoch_z_fail:
                     handle_pending_unstake(state, op);
                     break;
                 case OP_APPLY_DRIFT_CERT: {
-                    /* Mirror the mempool ingress used by claims: validate_operation
-                     * checks the canonical digest and ML-DSA-87 signature, then the op
-                     * is staged for block assembly. add_pending_operation stores its
-                     * own copy, so the deserialized op is always freed here. */
+                    /* validate_operation inside add_pending_operation checks the
+                     * canonical digest and ML-DSA-87 signature, but does NOT verify
+                     * that every funding input pointer is owned by sender_pubkey.
+                     * Without this gate, any connected peer can inject a drift cert
+                     * that spends pointers belonging to arbitrary victims (only the
+                     * signature over the digest is verified, not input ownership).
+                     * has_insufficient_balance_locked enforces ptr->owner_address ==
+                     * SHA256(sender_pubkey) on every input, mirroring the
+                     * transfer/stake/unstake mempool ingress, and rejects any
+                     * mismatch. Requires bc.rwlock in read mode per its @pre. */
+                    const ApplyDriftCertData *dc = &op->data.apply_drift_cert;
+                    if (dc->num_inputs == 0 || dc->num_inputs > MAX_INPUTS) {
+                        free(op);
+                        break;
+                    }
+                    uint64_t target_with_fee = dc->amount + calculate_fee(dc->amount, true);
+                    pthread_rwlock_rdlock(&state->bc.rwlock);
+                    int insufficient = has_insufficient_balance_locked(state, dc->sender_pubkey,
+                        dc->inputs, dc->num_inputs, target_with_fee, false);
+                    pthread_rwlock_unlock(&state->bc.rwlock);
+                    if (insufficient) {
+                        free(op);
+                        break;
+                    }
                     pthread_mutex_lock(&state->mutex);
                     int added_drift = add_pending_operation(state, op);
                     pthread_mutex_unlock(&state->mutex);
-                    free(op);
+                    if (added_drift != 0) {
+                        free(op);
+                    }
                     break;
                 }
                 default:
