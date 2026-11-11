@@ -523,7 +523,8 @@ class MmrCanvasRenderer {
                 r: size,
                 opacity: opacity,
                 isHighlighted: isHighlighted,
-                height: node.height
+                height: node.height,
+                opType: node.opType
             });
         });
 
@@ -537,6 +538,12 @@ class MmrCanvasRenderer {
                 r_col = isOrange ? (isLight ? 0.917 : 0.968) : (isLight ? 0.02 : 0.06);
                 g_col = isOrange ? (isLight ? 0.345 : 0.576) : (isLight ? 0.59 : 0.73);
                 b_col = isOrange ? (isLight ? 0.047 : 0.102) : (isLight ? 0.41 : 0.51);
+            } else if (pt.opType === 7) {
+                /* Drift Certificate leaves: rose #f43f5e (dark) / #e11d48 (light) /
+                 * #fb7185 (orange dark) / #e11d48 (orange light) */
+                r_col = isOrange ? (isLight ? 0.882 : 0.984) : (isLight ? 0.882 : 0.957);
+                g_col = isOrange ? (isLight ? 0.114 : 0.443) : (isLight ? 0.114 : 0.247);
+                b_col = isOrange ? (isLight ? 0.282 : 0.522) : (isLight ? 0.282 : 0.369);
             } else if (pt.height === 0) {
                 r_col = isOrange ? (isLight ? 0.960 : 0.984) : (isLight ? 0.01 : 0.22); // #f59e0b / #fbbf24
                 g_col = isOrange ? (isLight ? 0.619 : 0.749) : (isLight ? 0.52 : 0.74);
@@ -1214,6 +1221,11 @@ class MmrCanvasRenderer {
             const parentBorder = isOrange ? (isLight ? '#a8a29e' : '#78716c') : (isLight ? '#6d28d9' : '#7c3aed');
             const highlightColor = isOrange ? (isLight ? '#ea580c' : '#f7931a') : (isLight ? '#059669' : '#10b981');
             const highlightBorder = isOrange ? (isLight ? '#c2410c' : '#b45309') : (isLight ? '#047857' : '#059669');
+            /* Drift Certificate leaves (OP_APPLY_DRIFT_CERT): rose accent — the only
+             * hue family unused by the renderer (leaves sky-blue, peaks violet,
+             * proof highlight emerald) so anchors stand out in every theme. */
+            const driftLeafColor = isOrange ? (isLight ? '#e11d48' : '#fb7185') : (isLight ? '#e11d48' : '#f43f5e');
+            const driftLeafBorder = isOrange ? (isLight ? '#9f1239' : '#f43f5e') : (isLight ? '#9f1239' : '#e11d48');
 
             // 1. Standard Leaves
             this.ctx.beginPath();
@@ -1221,11 +1233,30 @@ class MmrCanvasRenderer {
             this.ctx.strokeStyle = leafBorder;
             for (let i = 0; i < this.nodes.length; i++) {
                 const node = this.nodes[i];
-                if (node.height === 0 && !this.highlightedNodes.has(node.position)) {
+                if (node.height === 0 && node.opType !== 7 && !this.highlightedNodes.has(node.position)) {
                     const pos = this.positions.get(node.position);
                     if (pos) {
                         const nodeScale = this.nodeScales.get(node.position) ?? 1.0;
                         const r = currentDynamicNodeRadius * nodeScale;
+                        this.ctx.moveTo(pos.x + r, pos.y);
+                        this.ctx.arc(pos.x, pos.y, r, 0, 2 * Math.PI);
+                    }
+                }
+            }
+            this.ctx.fill();
+            this.ctx.stroke();
+
+            // 1b. Drift Certificate Leaves (OP_APPLY_DRIFT_CERT)
+            this.ctx.beginPath();
+            this.ctx.fillStyle = driftLeafColor;
+            this.ctx.strokeStyle = driftLeafBorder;
+            for (let i = 0; i < this.nodes.length; i++) {
+                const node = this.nodes[i];
+                if (node.height === 0 && node.opType === 7 && !this.highlightedNodes.has(node.position)) {
+                    const pos = this.positions.get(node.position);
+                    if (pos) {
+                        const nodeScale = this.nodeScales.get(node.position) ?? 1.0;
+                        const r = currentDynamicNodeRadius * nodeScale * 1.15;
                         this.ctx.moveTo(pos.x + r, pos.y);
                         this.ctx.arc(pos.x, pos.y, r, 0, 2 * Math.PI);
                     }
@@ -1288,6 +1319,9 @@ class MmrCanvasRenderer {
                 if (isHighlighted) {
                     this.ctx.fillStyle = isOrange ? (isLight ? '#ea580c' : '#f7931a') : (isLight ? '#059669' : '#10b981');
                     this.ctx.strokeStyle = isOrange ? (isLight ? '#c2410c' : '#b45309') : (isLight ? '#047857' : '#059669');
+                } else if (node.height === 0 && node.opType === 7) {
+                    this.ctx.fillStyle = isOrange ? (isLight ? '#e11d48' : '#fb7185') : (isLight ? '#e11d48' : '#f43f5e');
+                    this.ctx.strokeStyle = isOrange ? (isLight ? '#9f1239' : '#f43f5e') : (isLight ? '#9f1239' : '#e11d48');
                 } else if (node.height === 0) {
                     this.ctx.fillStyle = isOrange ? (isLight ? '#f59e0b' : '#fbbf24') : (isLight ? '#0284c7' : '#38bdf8');
                     this.ctx.strokeStyle = isOrange ? (isLight ? '#d97706' : '#f59e0b') : (isLight ? '#0369a1' : '#0284c7');
