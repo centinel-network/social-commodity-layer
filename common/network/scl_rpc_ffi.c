@@ -56,6 +56,27 @@ State *global_state = NULL;
 SCL_WEAK int add_valuation(State *state, Valuation *valuation) { (void)state; (void)valuation; return -1; }
 SCL_WEAK void auto_simulate(State *state, User *user, const Valuation *val, int target_index) { (void)state; (void)user; (void)val; (void)target_index; }
 SCL_WEAK int calculate_current_stage(uint64_t total_rewarded_subunits, uint64_t total_staked_subunits) { (void)total_rewarded_subunits; (void)total_staked_subunits; return 2; }
+
+/* client_state_init() (in client/state/client_state.c) spawns the crypto
+ * verification worker pool by passing this function pointer to
+ * pthread_create. In the full-node build the real implementation lives in
+ * client/client.c, which is intentionally NOT linked into libscl_rpc (doing
+ * so produces duplicate definitions of global_state and global_shutdown).
+ * This weak stub provides symbol resolution for the shared-library / FFI
+ * build. Because it parks until state->crypto_verify_running clears, the
+ * pthread_join() in client_state_destroy() terminates cleanly at shutdown.
+ * FFI consumers never call crypto_verify_enqueue() on this state (that is
+ * L5 wire-path logic), so parking is behaviorally transparent. In every
+ * target that does link client.c, its strong definition overrides this
+ * weak symbol. */
+SCL_WEAK void *crypto_verify_worker_loop(void *arg) {
+    State *state = (State *)arg;
+    if (!state) return NULL;
+    while (state->crypto_verify_running && !atomic_load(&global_shutdown)) {
+        usleep(100000);
+    }
+    return NULL;
+}
 #endif
 
 SCL_WEAK void crypto_verify_enqueue(State *state, SclConnection *conn, const Message *msg, const uint8_t *sender_pubkey, const struct sockaddr_storage *sender_addr) { (void)state; (void)conn; (void)msg; (void)sender_pubkey; (void)sender_addr; }
