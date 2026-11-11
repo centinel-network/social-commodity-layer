@@ -368,31 +368,6 @@
        state.settlementInFlight = false;
        state.lastAudit = data;
 
-       /* A fresh certificate (different circuit or new attestation timestamp)
-        * owns a clean anchor slot: a previous certificate's anchoring record
-        * must never bleed into the new deliverable's Transaction ID / Ledger
-        * Status fields. */
-       if (state.anchor && state.anchorAudit &&
-           (String(state.anchorAudit.circuitHash) !== String(data.circuitHash) ||
-            Number(state.anchorAudit.timestamp) !== Number(data.timestamp))) {
-           resetAnchor();
-       }
-
-       renderCertificateCard(data);
-       persistCertificateState();
-
-       setStatus('CERTIFICATE ISSUED', STATUS_COLORS[data.status]);
-       const tvd = Number(data.tvdDouble);
-       progress('Drift certificate issued: TVD ' + tvd.toFixed(6) + ' (' + STATUS_LABELS[data.status] + '). Ready for on-chain anchoring.', false);
-    }
-
-    /**
-    * @brief Paints the certificate results card (fields, gauge, reveal) for an
-    *        issued or hydrated certificate payload. Pure DOM: no state mutation.
-    * @param {Object} data Certificate fields from DRIFT_CERT_AUDIT_RECEIVED or
-    *        the persisted deliverable record.
-    */
-    function renderCertificateCard(data) {
        const tvd = Number(data.tvdDouble);
        const pct = Math.min(100, Math.max(2, Math.round(tvd * 100)));
 
@@ -416,171 +391,9 @@
        document.getElementById('drift-results').style.display = 'block';
        document.getElementById('drift-anchor-card').style.display = 'block';
        document.getElementById('drift-export-card').style.display = 'block';
-    }
 
-    /* ========================================================================
-    * SECTION 3.5: DELIVERABLE ANCHOR LIFECYCLE (persistence & confirmation)
-    * ===================================================================== */
-
-    /** @const {string} localStorage key prefix for one persisted certificate record. */
-    const CERT_STORE_PREFIX = 'scl.driftCert.';
-
-    /** @const {string} localStorage key pointing at the latest issued certificate. */
-    const CERT_STORE_LATEST = 'scl.driftCert.latest';
-
-    /**
-    * @brief Persists the current certificate deliverable record (audit payload,
-    *        histogram, circuit context, and the on-chain anchoring record) so the
-    *        deliverable can be re-exported with an updated Transaction ID /
-    *        Ledger Status even after a page reload. BigInt-safe replacer mirrors
-    *        exportJson.
-    */
-    function persistCertificateState() {
-       if (!state.lastAudit || !state.lastAudit.circuitHash) return;
-       try {
-           const record = {
-               audit: state.lastAudit,
-               histogram: state.lastHistogram || null,
-               circuitText: state.lastContext ? (state.lastContext.circuitText || '') : '',
-               shots: state.lastContext ? (state.lastContext.shots || 0) : 0,
-               anchor: state.anchor || null,
-               anchorAudit: state.anchorAudit || null
-           };
-           const json = JSON.stringify(record, (key, value) => (typeof value === 'bigint' ? value.toString() : value));
-           localStorage.setItem(CERT_STORE_PREFIX + String(state.lastAudit.circuitHash), json);
-           localStorage.setItem(CERT_STORE_LATEST, JSON.stringify({
-               circuitHash: String(state.lastAudit.circuitHash),
-               timestamp: Number(state.lastAudit.timestamp)
-           }));
-       } catch (e) {
-           /* Storage quota exceeded or localStorage unavailable: the in-session
-            * anchor record still updates live — only reload durability is lost. */
-       }
-    }
-
-    /**
-    * @brief Restores the last persisted certificate (audit + histogram + anchor)
-    *        after a page reload, re-rendering the certificate and anchoring cards
-    *        so a post-inclusion re-export embeds the confirmed anchor fields.
-    * @return {boolean} True when a record was hydrated.
-    */
-    function hydratePersistedCertificate() {
-       if (state.lastAudit) return false;
-       try {
-           const ptrRaw = localStorage.getItem(CERT_STORE_LATEST);
-           if (!ptrRaw) return false;
-           const ptr = JSON.parse(ptrRaw);
-           if (!ptr || !ptr.circuitHash) return false;
-           const raw = localStorage.getItem(CERT_STORE_PREFIX + ptr.circuitHash);
-           if (!raw) return false;
-           const rec = JSON.parse(raw);
-           if (!rec || !rec.audit || !rec.audit.circuitHash) return false;
-           state.lastAudit = rec.audit;
-           state.lastHistogram = Array.isArray(rec.histogram) ? rec.histogram : null;
-           state.lastContext = { shots: rec.shots || Number(rec.audit.shots) || 0, beaconSeed: null, circuitText: rec.circuitText || '' };
-           state.anchor = rec.anchor || null;
-           state.anchorAudit = rec.anchorAudit || null;
-           renderCertificateCard(state.lastAudit);
-           updateAnchorCard();
-           return true;
-       } catch (e) {
-           return false;
-       }
-    }
-
-    /**
-    * @brief Clears the active anchoring record (new certificate issued) and
-    *        repaints the anchoring card back to the "Not applied." resting state.
-    */
-    function resetAnchor() {
-       if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
-       state.anchor = null;
-       state.anchorAudit = null;
-       updateAnchorCard();
-    }
-
-    /**
-    * @brief Paints the anchoring card from the current anchor record. Single
-    *        source of truth for the DOM so every lifecycle transition (submitted,
-    *        confirmed, reset, hydrated) renders identically.
-    */
-    function updateAnchorCard() {
-       const a = state.anchor;
-       const s = document.getElementById('drift-anchor-status');
-       const txEl = document.getElementById('drift-anchor-tx');
-       if (!a) {
-           if (s) { s.textContent = 'Not applied.'; s.style.color = 'var(--text-muted)'; }
-           if (txEl) txEl.style.display = 'none';
-           return;
-       }
-       if (txEl && a.txIdHex) {
-           txEl.style.display = 'block';
-           txEl.textContent = (a.confirmed ? 'Anchored on-chain. Tx: ' : 'Anchoring intent tx: ') + a.txIdHex;
-       }
-       if (s) {
-           if (a.confirmed) {
-               s.textContent = 'CONFIRMED ON-CHAIN' + (a.confirmedBlock ? ' (block ' + a.confirmedBlock + ')' : '');
-               s.style.color = 'var(--accent-green)';
-           } else if (a.txIdHex) {
-               s.textContent = 'Submitted — awaiting block inclusion…';
-               s.style.color = 'var(--text-muted)';
-           } else {
-               s.textContent = 'Not applied.';
-               s.style.color = 'var(--text-muted)';
-           }
-       }
-    }
-
-    /**
-    * @brief Marks the active anchor CONFIRMED at block inclusion: records the
-    *        confirmation metadata (block height, wall-clock time), repaints the
-    *        anchoring card, persists the deliverable record, and prompts a
-    *        re-export so the certificate embeds the on-chain Transaction ID and
-    *        Ledger Status. Idempotent; clears the inclusion watcher.
-    * @param {number|null} blockHeight Height of the including block when known.
-    */
-    function confirmAnchor(blockHeight) {
-       if (!state.anchor || state.anchor.confirmed) return;
-       state.anchor.confirmed = true;
-       state.anchor.confirmedAt = Date.now();
-       if (typeof blockHeight === 'number' && isFinite(blockHeight)) state.anchor.confirmedBlock = blockHeight;
-       if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
-       updateAnchorCard();
-       persistCertificateState();
-       progress('Drift certificate anchor confirmed on-chain' +
-           (state.anchor.confirmedBlock ? ' at block ' + state.anchor.confirmedBlock : '') +
-           '. Re-export the deliverable — the certificate now embeds the on-chain Transaction ID and a CONFIRMED Ledger Status.', false);
-    }
-
-    /**
-    * @brief Arms the block-inclusion watcher for the active anchor.
-    *
-    * The chained onBlockReceived handler confirms the anchor event-driven the
-    * instant the browser downloads the block that includes it; this poll is the
-    * safety net over the explorer's window.confirmedTxIds set. Unlike the former
-    * fixed 90-attempt cutoff, watching continues for the life of the tab, so a
-    * delayed inclusion (busy mempool, delayed proposer) still flips the anchor
-    * record to CONFIRMED and refreshes the persisted deliverable state.
-    */
-    function armAnchorPoll() {
-       if (state.pollTimer) clearInterval(state.pollTimer);
-       let attempts = 0;
-       state.pollTimer = setInterval(() => {
-           attempts++;
-           /* Read the target id dynamically: the node echoes the authoritative
-            * cert_tx_id after the custodial re-anchor (adopted in the chained
-            * onTransactionAudited handler), replacing the browser guess. */
-           const targetTxId = state.anchor ? state.anchor.txIdHex : null;
-           if (targetTxId && window.confirmedTxIds && window.confirmedTxIds.has(targetTxId)) {
-               confirmAnchor(null);
-           } else if (attempts === 90) {
-               const s = document.getElementById('drift-anchor-status');
-               if (s) {
-                   s.textContent = 'Still awaiting block inclusion after ~6 minutes — the anchor remains valid in the mempool. This tab keeps watching; the anchor record updates itself when the including block lands, and the next export embeds the confirmed status.';
-                   s.style.color = 'var(--text-muted)';
-               }
-           }
-       }, 4000);
+       setStatus('CERTIFICATE ISSUED', STATUS_COLORS[data.status]);
+       progress('Drift certificate issued: TVD ' + tvd.toFixed(6) + ' (' + STATUS_LABELS[data.status] + '). Ready for on-chain anchoring.', false);
     }
 
     /* ========================================================================
@@ -644,11 +457,6 @@
 
         const reqId = ((BigInt(Date.now()) << 16n) | BigInt(Math.floor(Math.random() * 65535))).toString();
         state.anchor = { txIdHex: null, reqId: reqId, fee: feePlusTx, appliedAt: Date.now(), confirmed: false };
-        /* Bind the anchor to the exact certificate it funds (circuit hash +
-         * attestation timestamp): a later re-audit must never inherit this
-         * record, and the persisted deliverable state must survive reloads. */
-        state.anchorAudit = { circuitHash: audit.circuitHash, timestamp: Number(audit.timestamp) };
-        persistCertificateState();
 
         client.submitTransaction(reqId, 'OP_APPLY_DRIFT_CERT', {
             circuitHashHex: audit.circuitHash,
@@ -679,17 +487,36 @@
         if (state.anchor.reqId !== undefined && frame.requestId !== undefined &&
             String(frame.requestId) !== String(state.anchor.reqId)) return;
 
-        state.anchor.txIdHex = frame.txIdHex;
-        const txEl = document.getElementById('drift-anchor-tx');
-        txEl.style.display = 'block';
-        txEl.textContent = 'Anchoring intent tx: ' + frame.txIdHex;
-        document.getElementById('drift-anchor-status').textContent = 'Submitted — awaiting block inclusion…';
-        persistCertificateState();
+       state.anchor.txIdHex = frame.txIdHex;
+       const txEl = document.getElementById('drift-anchor-tx');
+       txEl.style.display = 'block';
+       txEl.textContent = 'Anchoring intent tx: ' + frame.txIdHex;
+       document.getElementById('drift-anchor-status').textContent = 'Submitted — awaiting block inclusion…';
 
-        /* Inclusion watcher: the chained onBlockReceived handler confirms the
-         * anchor the instant its including block is downloaded (event-driven);
-         * armAnchorPoll is the safety net that keeps watching confirmedTxIds. */
-        armAnchorPoll();
+       if (state.pollTimer) clearInterval(state.pollTimer);
+       let attempts = 0;
+       state.pollTimer = setInterval(() => {
+           attempts++;
+           /* Read the target id dynamically: the node echoes the authoritative
+            * cert_tx_id after the custodial re-anchor (adopted in the chained
+            * onTransactionAudited handler below), replacing the browser guess. */
+           const targetTxId = state.anchor ? state.anchor.txIdHex : null;
+           if (targetTxId && window.confirmedTxIds && window.confirmedTxIds.has(targetTxId)) {
+               clearInterval(state.pollTimer);
+               state.pollTimer = null;
+               state.anchor.confirmed = true;
+               const s = document.getElementById('drift-anchor-status');
+               s.textContent = 'CONFIRMED ON-CHAIN';
+               s.style.color = 'var(--accent-green)';
+               txEl.textContent = 'Anchored on-chain. Tx: ' + targetTxId;
+           } else if (attempts > 90) {
+               clearInterval(state.pollTimer);
+               state.pollTimer = null;
+               const s = document.getElementById('drift-anchor-status');
+               s.textContent = 'Still awaiting block inclusion after ~6 minutes — the anchor remains valid in the mempool. Keep the tab open, or search the tx id above in the explorer.';
+               s.style.color = 'var(--text-muted)';
+           }
+       }, 4000);
     }
 
     /* ========================================================================
@@ -789,7 +616,7 @@
     <tr><td class="k">Anchoring Fee</td><td class="v">${fmtScl(ANCHOR_FEE_SUBUNITS)} (+ network fee)</td></tr>
     <tr><td class="k">Audit Fee (SCL402 settled)</td><td class="v">${fmtScl(fee)}</td></tr>
     <tr><td class="k">Transaction ID</td><td class="v">${esc(anchor.txIdHex || 'Not yet applied')}</td></tr>
-    <tr><td class="k">Ledger Status</td><td class="v">${anchor.confirmed ? ('CONFIRMED ON-CHAIN' + (anchor.confirmedBlock ? ' — block ' + esc(anchor.confirmedBlock) : '') + (anchor.confirmedAt ? ' · confirmed ' + new Date(anchor.confirmedAt).toISOString() : '')) : (anchor.txIdHex ? 'Submitted / awaiting inclusion' : 'Not applied')}</td></tr>
+    <tr><td class="k">Ledger Status</td><td class="v">${anchor.confirmed ? 'CONFIRMED ON-CHAIN' : (anchor.txIdHex ? 'Submitted / awaiting inclusion' : 'Not applied')}</td></tr>
   </table>
 
   <h2>Independent Verification Protocol</h2>
@@ -906,31 +733,12 @@
                         txDisplay.style.display = 'block';
                         txDisplay.textContent = 'Anchoring tx: ' + data.txId;
                     }
-                    persistCertificateState();
                 }
-                /* The authoritative on-chain id may arrive without a matching
-                 * WIRE_FRAME_READY (custodial re-anchor): arm the watcher here
-                 * too so inclusion tracking never depends on the wire frame. */
-                armAnchorPoll();
                 const s = document.getElementById('drift-anchor-status');
                 if (s) {
                     s.textContent = 'Anchor accepted by the node — awaiting block inclusion…';
                     s.style.color = 'var(--text-muted)';
                 }
-            }
-        };
-        /* Inclusion event: the explorer's block sync pipeline (onBlockReceived)
-         * already extracts every OP_APPLY_DRIFT_CERT id confirmed in each
-         * downloaded block (driftCertTxIds). Chain — never replace — the shared
-         * handler so this module confirms the anchor the moment its including
-         * block lands, instead of waiting on the next 4 s poll tick. */
-        const upstreamBlockReceived = client.onBlockReceived;
-        client.onBlockReceived = (data) => {
-            if (typeof upstreamBlockReceived === 'function') upstreamBlockReceived(data);
-            if (state.anchor && state.anchor.txIdHex && !state.anchor.confirmed &&
-                data && Array.isArray(data.driftCertTxIds) &&
-                data.driftCertTxIds.indexOf(state.anchor.txIdHex) !== -1) {
-                confirmAnchor(data.blockNumber);
             }
         };
         client.onPaymentRequired = (challenge) => {
@@ -1021,27 +829,13 @@
     }
 
     /**
-     * @brief View entry point invoked by explorer_app.js switchPageView('drift').
-     */
+    * @brief View entry point invoked by explorer_app.js switchPageView('drift').
+    */
     function onEnter() {
        bindClient();
        refreshBalance();
        updateFeeQuote();
        const ready = !!(window.client && window.client.socket && window.client.socket.readyState === WebSocket.OPEN);
-       /* Reloads used to wipe the in-memory certificate and its anchor record,
-        * freezing every later export on "Not applied" even after the anchor had
-        * landed on-chain. Hydrate the last persisted certificate (audit +
-        * histogram + anchor) so a post-inclusion re-export embeds the confirmed
-        * Transaction ID and Ledger Status. */
-       if (hydratePersistedCertificate()) {
-           progress('Restored the last issued certificate' +
-               (state.anchor && state.anchor.confirmed
-                   ? ' — its anchor is CONFIRMED on-chain. Re-export the deliverable to embed the on-chain transaction id.'
-                   : '. Inclusion watching resumed — the anchoring record updates itself when the including block lands.'), false);
-       }
-       if (state.anchor && state.anchor.txIdHex && !state.anchor.confirmed && ready) {
-           armAnchorPoll();
-       }
        setStatus(ready ? 'PIPELINE CONNECTED' : 'PIPELINE DISCONNECTED', ready ? 'var(--accent-green)' : 'var(--accent-red)');
     }
 
