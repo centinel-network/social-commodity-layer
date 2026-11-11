@@ -949,7 +949,11 @@ class SclAuditorClient {
                     const receipt = {
                         paymentType: 0x01, // OP_TRANSFER_POINTER
                         txIdHex: data.txId,
-                        rateLockId: replayCtx.challenge.rateLockId
+                        rateLockId: replayCtx.challenge.rateLockId,
+                        /* Bind the replay to the exact challenge the node issued:
+                         * the server-side registry resolves receipts by this hash
+                         * and enforces the 5-minute challenge TTL on replay. */
+                        challengeHashHex: replayCtx.challenge.challengeHashHex
                     };
 
                     if (typeof this.onSettlementTxAccepted === 'function') {
