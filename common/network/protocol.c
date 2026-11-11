@@ -1469,7 +1469,7 @@ int deserialize_block(Block *block, const uint8_t *buffer, size_t buffer_len) {
 
             uint8_t raw_type = *p++;
 #if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
-            raw_type %= 7;
+            raw_type %= 8;
 #endif
             block->operations[i].type = (OperationType)raw_type;
 
