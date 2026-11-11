@@ -2089,17 +2089,31 @@ void clean_pending_operations(State *state, Block *block) {
     struct ToRecreateStakeUnstake *stakes_to_recreate = calloc(100, sizeof(struct ToRecreateStakeUnstake));
     struct ToRecreateStakeUnstake *unstakes_to_recreate = calloc(100, sizeof(struct ToRecreateStakeUnstake));
 
-    if (!transfers_to_recreate || !stakes_to_recreate || !unstakes_to_recreate) {
+    struct ToRecreateDriftCert {
+        uint8_t circuit_hash[32];
+        uint8_t commitment_root[32];
+        uint64_t tvd_scaled;
+        uint32_t shots;
+        uint32_t status;
+        uint64_t timestamp_us;
+        uint8_t recipient_pubkey[PUBKEY_LEN];
+        uint64_t amount;
+    };
+    struct ToRecreateDriftCert *drifts_to_recreate = calloc(100, sizeof(struct ToRecreateDriftCert));
+
+    if (!transfers_to_recreate || !stakes_to_recreate || !unstakes_to_recreate || !drifts_to_recreate) {
         fprintf(stderr, "[Network] ERROR: Failed to allocate recreation arrays\n");
         free(transfers_to_recreate);
         free(stakes_to_recreate);
         free(unstakes_to_recreate);
+        free(drifts_to_recreate);
         return;
     }
 
     size_t transfer_recreate_count = 0;
     size_t stake_recreate_count = 0;
     size_t unstake_recreate_count = 0;
+    size_t drift_recreate_count = 0;
 
     // Scan mempool array slots
     for (int i = 0; i < MAX_PENDING_OPS; i++) {
@@ -2262,6 +2276,32 @@ void clean_pending_operations(State *state, Block *block) {
                                 }
                             }
                         }
+                    } else if (op->type == OP_APPLY_DRIFT_CERT) {
+                        ApplyDriftCertData *dc = &op->data.apply_drift_cert;
+                        if (memcmp(dc->sender_pubkey, state->user_wallet.dilithium_pubkey, PUBKEY_LEN) == 0) {
+                            if (drift_recreate_count < 100) {
+                                bool dup = false;
+                                for (size_t r = 0; r < drift_recreate_count; r++) {
+                                    if (memcmp(drifts_to_recreate[r].circuit_hash, dc->circuit_hash, 32) == 0 &&
+                                        drifts_to_recreate[r].timestamp_us == dc->timestamp_us) {
+                                        dup = true;
+                                        break;
+                                    }
+                                }
+                                if (!dup) {
+                                    memcpy(drifts_to_recreate[drift_recreate_count].circuit_hash, dc->circuit_hash, 32);
+                                    memcpy(drifts_to_recreate[drift_recreate_count].commitment_root, dc->commitment_root, 32);
+                                    drifts_to_recreate[drift_recreate_count].tvd_scaled = dc->tvd_scaled;
+                                    drifts_to_recreate[drift_recreate_count].shots = dc->shots;
+                                    drifts_to_recreate[drift_recreate_count].status = dc->status;
+                                    drifts_to_recreate[drift_recreate_count].timestamp_us = dc->timestamp_us;
+                                    memcpy(drifts_to_recreate[drift_recreate_count].recipient_pubkey, dc->recipient_pubkey, PUBKEY_LEN);
+                                    drifts_to_recreate[drift_recreate_count].amount = dc->amount;
+                                    drift_recreate_count++;
+                                    fprintf(stderr, "[Network] Collected local drift cert for recreation, amount=%llu subunits\n", dc->amount);
+                                }
+                            }
+                        }
                     }
                 }
                 free(op);
@@ -2273,7 +2313,7 @@ void clean_pending_operations(State *state, Block *block) {
 
     // Spawn background recreation tasks
     for (size_t i = 0; i < transfer_recreate_count; i++) {
-        RecreateArgs *args = malloc(sizeof(RecreateArgs));
+        RecreateArgs *args = calloc(1, sizeof(RecreateArgs));
         if (args) {
             args->state = state;
             args->amount = transfers_to_recreate[i].amount;
@@ -2287,7 +2327,7 @@ void clean_pending_operations(State *state, Block *block) {
     }
 
     for (size_t i = 0; i < stake_recreate_count; i++) {
-        RecreateArgs *args = malloc(sizeof(RecreateArgs));
+        RecreateArgs *args = calloc(1, sizeof(RecreateArgs));
         if (args) {
             args->state = state;
             args->amount = stakes_to_recreate[i].amount;
@@ -2300,7 +2340,7 @@ void clean_pending_operations(State *state, Block *block) {
     }
 
     for (size_t i = 0; i < unstake_recreate_count; i++) {
-        RecreateArgs *args = malloc(sizeof(RecreateArgs));
+        RecreateArgs *args = calloc(1, sizeof(RecreateArgs));
         if (args) {
             args->state = state;
             args->amount = unstakes_to_recreate[i].amount;
@@ -2312,9 +2352,31 @@ void clean_pending_operations(State *state, Block *block) {
         }
     }
 
+    for (size_t i = 0; i < drift_recreate_count; i++) {
+        RecreateArgs *args = calloc(1, sizeof(RecreateArgs));
+        if (args) {
+            args->state = state;
+            args->is_drift_cert = true;
+            args->is_transfer = false;
+            args->is_stake = false;
+            args->amount = drifts_to_recreate[i].amount;
+            memcpy(args->circuit_hash, drifts_to_recreate[i].circuit_hash, 32);
+            memcpy(args->commitment_root, drifts_to_recreate[i].commitment_root, 32);
+            args->tvd_scaled = drifts_to_recreate[i].tvd_scaled;
+            args->shots = drifts_to_recreate[i].shots;
+            args->status = drifts_to_recreate[i].status;
+            args->timestamp_us = drifts_to_recreate[i].timestamp_us;
+            memcpy(args->recipient_pubkey, drifts_to_recreate[i].recipient_pubkey, PUBKEY_LEN);
+            uint64_t fee = calculate_fee(args->amount, true);
+            atomic_fetch_add(&state->scheduled_consumed_subunits, args->amount + fee);
+            spawn_recreation_thread(state, args);
+        }
+    }
+
     free(transfers_to_recreate);
     free(stakes_to_recreate);
     free(unstakes_to_recreate);
+    free(drifts_to_recreate);
 }
 
 /**
