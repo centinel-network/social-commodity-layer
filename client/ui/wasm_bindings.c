@@ -1438,7 +1438,7 @@ int wasm_match_transaction(const uint8_t* op_bytes, size_t op_len, const int8_t*
  * @complexity Space: O(sizeof(Block)) temporary heap structure.
  */
 EMSCRIPTEN_KEEPALIVE
-int wasm_extract_block_commitments(const uint8_t* block_bytes, size_t block_len, uint8_t* out_hashes, size_t max_hashes) {
+int wasm_extract_block_commitments(const uint8_t* block_bytes, size_t block_len, uint8_t* out_hashes, size_t max_hashes, uint8_t* out_op_types, uint8_t* out_drift_tx_ids) {
     Block *block = calloc(1, sizeof(Block));
     if (!block) return -1;
     if (deserialize_block(block, block_bytes, block_len) != 0) {
@@ -1447,11 +1447,22 @@ int wasm_extract_block_commitments(const uint8_t* block_bytes, size_t block_len,
     }
     int count = 0;
     for (size_t i = 0; i < block->operation_count && count < (int)max_hashes; i++) {
-        if (block->operations[i].type == OP_CLAIM_VALIDATION) {
+        if (block->operations[i].type == OP_APPLY_DRIFT_CERT) {
+            // One MMR leaf per anchored drift certificate: hash_leaf(cert_tx_id, tvd_scaled).
+            // Mirrors consensus.c apply_block, which adds the identical leaf to the kernel
+            // validation_commitments accumulator, so the client-side topography canvas
+            // stays in perfect sync with the node state root.
+            const ApplyDriftCertData *dc = &block->operations[i].data.apply_drift_cert;
+            hash_leaf(dc->cert_tx_id, dc->tvd_scaled, out_hashes + count * COIN_ID_LEN);
+            if (out_op_types) out_op_types[count] = (uint8_t)OP_APPLY_DRIFT_CERT;
+            if (out_drift_tx_ids) memcpy(out_drift_tx_ids + count * COIN_ID_LEN, dc->cert_tx_id, COIN_ID_LEN);
+            count++;
+        } else if (block->operations[i].type == OP_CLAIM_VALIDATION) {
             // Hash the validation BDLOP commitment into an MMR leaf node
             uint8_t commitment_hash[COIN_ID_LEN];
             SHA256((const uint8_t*)&block->operations[i].data.claim_validation.commitment, sizeof(BdlopCommitment), commitment_hash);
             hash_leaf(commitment_hash, 0, out_hashes + count * COIN_ID_LEN);
+            if (out_op_types) out_op_types[count] = (uint8_t)OP_CLAIM_VALIDATION;
             count++;
         } else if (block->operations[i].type == OP_REDEEM_CENTINEL) {
             // Hash the non-zero transfer commitment
@@ -1459,6 +1470,7 @@ int wasm_extract_block_commitments(const uint8_t* block_bytes, size_t block_len,
                 uint8_t transfer_hash[COIN_ID_LEN];
                 SHA256((const uint8_t*)&block->operations[i].data.redeem_centinel.c_transfer, sizeof(BdlopCommitment), transfer_hash);
                 hash_leaf(transfer_hash, 0, out_hashes + count * COIN_ID_LEN);
+                if (out_op_types) out_op_types[count] = (uint8_t)OP_REDEEM_CENTINEL;
                 count++;
             }
             // Hash the non-zero change commitment if capacity permits
@@ -1466,12 +1478,14 @@ int wasm_extract_block_commitments(const uint8_t* block_bytes, size_t block_len,
                 uint8_t change_hash[COIN_ID_LEN];
                 SHA256((const uint8_t*)&block->operations[i].data.redeem_centinel.c_change, sizeof(BdlopCommitment), change_hash);
                 hash_leaf(change_hash, 0, out_hashes + count * COIN_ID_LEN);
+                if (out_op_types) out_op_types[count] = (uint8_t)OP_REDEEM_CENTINEL;
                 count++;
             }
         } else if (block->operations[i].type == OP_MINT_COIN) {
             // Hash the minted base coin into an MMR leaf node
             SCLCoin *coin = &block->operations[i].data.mint_coin.coin;
             hash_leaf(coin->coin_id, coin->remaining_subunits, out_hashes + count * COIN_ID_LEN);
+            if (out_op_types) out_op_types[count] = (uint8_t)OP_MINT_COIN;
             count++;
         }
     }
