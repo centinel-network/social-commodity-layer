@@ -142,7 +142,9 @@ int main(void) {
     /* SCL-402: Prepend an autonomous agent payment receipt */
     uint8_t dummy_tx_id[32];
     memset(dummy_tx_id, 0xAA, 32);
-    int receipt_status = scl_rpc_builder_set_payment_receipt(builder, 0x01, dummy_tx_id, 0x9988776655443322ULL);
+    uint8_t dummy_challenge_hash[32];
+    memset(dummy_challenge_hash, 0xCC, 32);
+    int receipt_status = scl_rpc_builder_set_payment_receipt(builder, 0x01, dummy_tx_id, dummy_challenge_hash, 0x9988776655443322ULL);
     TEST_ASSERT(receipt_status == 0, "Failed to append payment receipt");
     
     /* Append compressed argument bytes */
@@ -173,7 +175,7 @@ int main(void) {
     TEST_ASSERT(payload_ref_status == 0, "Failed to extract/decompress payload");
 
     /* For signed frames, the FFI parser skips the leading DILITHIUM_SIGNATURE_LEN-byte signature */
-    /* SCL-402: Skip the newly prepended 41-byte Payment Receipt */
+    /* SCL-402: Skip the prepended Payment Receipt (sizeof-tracked wire layout) */
     const char *decompressed_string = (const char *)(extracted_payload + DILITHIUM_SIGNATURE_LEN + sizeof(SclRpcPaymentReceipt));
     printf("[Test] Decompressed extracted payload: \"%s\"\n", decompressed_string);
     TEST_ASSERT(strcmp(decompressed_string, original_payload) == 0, "Payload string mismatch");
