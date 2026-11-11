@@ -1509,9 +1509,7 @@ int deserialize_block(Block *block, const uint8_t *buffer, size_t buffer_len) {
                 // For all other types, use the generic full deserializer
                 int bytes_read = deserialize_operation(p, end - p, &block->operations[i], 0); // read_type is false
                 if (bytes_read <= 0) {
-                    scl_log(LOG_LEVEL_ERROR, "Protocol",
-                            "Failed to deserialize operation %zu (type %d, %zu wire bytes remaining)",
-                            i, (int)block->operations[i].type, (size_t)(end - p));
+                    scl_log(LOG_LEVEL_ERROR, "Protocol", "Failed to deserialize operation %zu", i);
                     goto cleanup_fail;
                 }
                 p += bytes_read;
