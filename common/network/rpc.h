@@ -87,6 +87,48 @@ void *rpc_worker_loop(void *arg);
  */
 void handle_rpc_request(State *state, RpcTask *task);
 
+/* ============================================================================
+ * 2. SCL402 SERVER-SIDE CHALLENGE REGISTRY
+ * ============================================================================ */
+
+/**
+ * @brief Records a freshly issued SCL402 payment challenge in the server-side registry.
+ *
+ * @details Called at every 402 issuance (rpc.c and websocket_bridge.c). The
+ *          registry maps the 32-byte challenge_hash to the issuance-time quote
+ *          (amount, fee recipient, expiry), closing the gap where the receipt's
+ *          price_rate_lock_id echo was purely informational.
+ *
+ * @param[in,out] state Global node state container (owns the registry in @ref SclRpcEngine).
+ * @param[in] challenge_hash 32-byte salted SHA-256 challenge key (no endianness).
+ * @param[in] amount_subunits Required payment quoted at issuance (host byte order).
+ * @param[in] recipient_address 32-byte fee recipient User ID locked at issuance.
+ * @param[in] valid_until_ms Expiry timestamp in milliseconds on the issuance clock.
+ * @return true on registration; false on NULL arguments or a full registry
+ *         (the challenge is still emitted; worst case its receipts re-quote).
+ * @thread_safety Acquires the registry mutex in write mode internally.
+ */
+bool scl402_challenge_register(State *state, const uint8_t challenge_hash[COIN_ID_LEN],
+                               uint64_t amount_subunits, const uint8_t recipient_address[USER_ID_LEN],
+                               uint64_t valid_until_ms);
+
+/**
+ * @brief Resolves a live (unexpired) SCL402 challenge by its 32-byte key.
+ *
+ * @details The TTL is enforced here: an entry past its valid_until_ms is
+ *          reclaimed and reported as a miss, so stale receipts re-trigger the
+ *          402 challenge flow instead of settling forever. The entry is copied
+ *          out under the registry mutex so the caller works on a stable snapshot.
+ *
+ * @param[in,out] state Global node state container (owns the registry in @ref SclRpcEngine).
+ * @param[in] challenge_hash 32-byte challenge key echoed by the receipt.
+ * @param[out] out_entry Destination receiving the live challenge snapshot.
+ * @return true if a live challenge matched; false on miss, expiry, or NULL arguments.
+ * @thread_safety Acquires the registry mutex in write mode internally.
+ */
+bool scl402_challenge_resolve(State *state, const uint8_t challenge_hash[COIN_ID_LEN],
+                              Scl402ChallengeEntry *out_entry);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
