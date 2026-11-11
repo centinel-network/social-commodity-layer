@@ -736,15 +736,28 @@ int quantum_tvd_audit_generate_certificate(
         return -1;
     }
 
-    /* 7. Sign Certificate using ML-DSA-87 (Dilithium5) over canonical binary digest */
+    /* 7. Sign Certificate using ML-DSA-87 (Dilithium5) over canonical binary digest.
+     * Preimage (all multi-byte integers big-endian, matching the on-chain
+     * cert_digest canonicalization policy):
+     *   SHA-256(circuit_hash(32) || num_qubits(BE,4) || tvd_scaled(BE,8) ||
+     *           shots(BE,4) || status(BE,4) || tvd_commitment(2048) || timestamp(BE,8))
+     * shots and num_qubits are covered so the statistical basis of the TVD
+     * attestation cannot be substituted without invalidating the signature. */
     uint8_t digest_to_sign[64];
     SHA256_CTX sig_ctx;
     SHA256_Init(&sig_ctx);
     SHA256_Update(&sig_ctx, cert_out->circuit_hash, 32);
-    SHA256_Update(&sig_ctx, &cert_out->timestamp, sizeof(uint64_t));
-    SHA256_Update(&sig_ctx, &cert_out->tvd_scaled, sizeof(uint64_t));
-    SHA256_Update(&sig_ctx, &cert_out->status, sizeof(QuantumQpuDriftStatus));
+    uint32_t num_qubits_be = htobe32(cert_out->num_qubits);
+    SHA256_Update(&sig_ctx, &num_qubits_be, sizeof(uint32_t));
+    uint64_t tvd_be = htobe64(cert_out->tvd_scaled);
+    SHA256_Update(&sig_ctx, &tvd_be, sizeof(uint64_t));
+    uint32_t shots_be = htobe32(cert_out->shots);
+    SHA256_Update(&sig_ctx, &shots_be, sizeof(uint32_t));
+    uint32_t status_be = htobe32(static_cast<uint32_t>(cert_out->status));
+    SHA256_Update(&sig_ctx, &status_be, sizeof(uint32_t));
     SHA256_Update(&sig_ctx, &cert_out->tvd_commitment, sizeof(BdlopCommitment));
+    uint64_t ts_be = htobe64(cert_out->timestamp);
+    SHA256_Update(&sig_ctx, &ts_be, sizeof(uint64_t));
     SHA256_Final(digest_to_sign, &sig_ctx);
 
     pthread_mutex_lock(&state->wallet_mutex);
@@ -788,8 +801,9 @@ int quantum_tvd_audit_generate_certificate(
  *    Opens the homomorphic lattice commitment `cert->tvd_commitment` using `cert->commitment_blinding`
  *    and verifies that the decrypted value matches `cert->tvd_scaled`.
  * 2. ML-DSA-87 (Dilithium5) Signature Verification:
- *    Reconstructs the SHA-256 certificate digest across circuit hash, timestamp, scaled TVD, status,
- *    and commitment struct, verifying the digital signature against `validator_pubkey`.
+ *    Reconstructs the SHA-256 certificate digest across circuit hash, num_qubits, scaled TVD,
+ *    shots, status, commitment struct, and timestamp (all multi-byte integers big-endian),
+ *    verifying the digital signature against `validator_pubkey`.
  *
  * @param[in] cert Pointer to `QuantumDriftCertificate` to verify.
  * @param[in] validator_pubkey Buffer of PUBKEY_LEN bytes containing certifying validator's public key.
@@ -825,15 +839,23 @@ int quantum_tvd_audit_verify_certificate(
         return -3; /* Commitment value does not match certificate scaled TVD */
     }
 
-    /* 2. Re-verify ML-DSA-87 (Dilithium5) Digital Signature */
+    /* 2. Re-verify ML-DSA-87 (Dilithium5) Digital Signature — must mirror the
+     * generate-side preimage byte-for-byte (see step 7 above). */
     uint8_t digest_to_verify[32];
     SHA256_CTX sig_ctx;
     SHA256_Init(&sig_ctx);
     SHA256_Update(&sig_ctx, cert->circuit_hash, 32);
-    SHA256_Update(&sig_ctx, &cert->timestamp, sizeof(uint64_t));
-    SHA256_Update(&sig_ctx, &cert->tvd_scaled, sizeof(uint64_t));
-    SHA256_Update(&sig_ctx, &cert->status, sizeof(QuantumQpuDriftStatus));
+    uint32_t num_qubits_be = htobe32(cert->num_qubits);
+    SHA256_Update(&sig_ctx, &num_qubits_be, sizeof(uint32_t));
+    uint64_t tvd_be = htobe64(cert->tvd_scaled);
+    SHA256_Update(&sig_ctx, &tvd_be, sizeof(uint64_t));
+    uint32_t shots_be = htobe32(cert->shots);
+    SHA256_Update(&sig_ctx, &shots_be, sizeof(uint32_t));
+    uint32_t status_be = htobe32(static_cast<uint32_t>(cert->status));
+    SHA256_Update(&sig_ctx, &status_be, sizeof(uint32_t));
     SHA256_Update(&sig_ctx, &cert->tvd_commitment, sizeof(BdlopCommitment));
+    uint64_t ts_be = htobe64(cert->timestamp);
+    SHA256_Update(&sig_ctx, &ts_be, sizeof(uint64_t));
     SHA256_Final(digest_to_verify, &sig_ctx);
 
 #if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
