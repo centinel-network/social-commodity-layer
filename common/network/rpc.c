@@ -961,11 +961,23 @@ void handle_rpc_request(State *state, RpcTask *task) {
                             free(op);
                             break;
                         } else if (op->type == OP_APPLY_DRIFT_CERT) {
-                            int added = create_and_broadcast_apply_drift_cert(state, &op->data.apply_drift_cert, false);
-                            if (added == 0 || added == 2) {
-                                send_rpc_ok(state, task->conn, hdr.method_id, hdr.request_id);
+                            /* SCL402-anchor parity with the transfer settlement path:
+                             * echo the authoritative on-chain identity —
+                             * [0x07 OP_APPLY_DRIFT_CERT][32-byte cert_tx_id] (33 bytes) —
+                             * because the custodial re-anchor re-selects inputs and
+                             * re-signs under the node wallet, so the client's locally
+                             * computed id can never appear on-chain. */
+                            uint8_t anchored_cert_tx_id[COIN_ID_LEN];
+                            uint8_t anchor_echo[1 + COIN_ID_LEN];
+                            int added = create_and_broadcast_apply_drift_cert(state, &op->data.apply_drift_cert, false, anchored_cert_tx_id);
+                            if (added == 0) {
+                                anchor_echo[0] = 0x07;
+                                memcpy(anchor_echo + 1, anchored_cert_tx_id, COIN_ID_LEN);
+                                send_rpc_ok_with_payload(state, task->conn, hdr.method_id, hdr.request_id, anchor_echo, sizeof(anchor_echo));
+                            } else if (added == 2) {
+                                send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id, SCL_RPC_STATUS_INVALID_ARGS, "Anchoring deferred: the node wallet's inputs are locked by a pending mempool operation. Retry after the next block.");
                             } else {
-                                send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id, SCL_RPC_STATUS_INVALID_ARGS, "Drift certificate anchoring failed: insufficient balance");
+                                send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id, SCL_RPC_STATUS_INVALID_ARGS, "Drift certificate anchoring failed: the node wallet cannot cover the anchor fee plus the halved network fee.");
                             }
                             free(op);
                             break;
