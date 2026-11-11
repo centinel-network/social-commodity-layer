@@ -432,7 +432,7 @@
             return;
         }
 
-        const selectedInputs = window.selectUnspentPointers(feePlusTx, false);
+        const selectedInputs = window.selectUnspentPointers(totalNeeded, false);
         if (!selectedInputs || selectedInputs.length === 0) {
             document.getElementById('drift-anchor-status').textContent = 'No unspent pointers available for funding.';
             return;
@@ -490,17 +490,24 @@
         let attempts = 0;
         state.pollTimer = setInterval(() => {
             attempts++;
-            if (window.confirmedTxIds && window.confirmedTxIds.has(frame.txIdHex)) {
+            /* Read the target id dynamically: the node echoes the authoritative
+             * cert_tx_id after the custodial re-anchor (adopted in the chained
+             * onTransactionAudited handler below), replacing the browser guess. */
+            const targetTxId = state.anchor ? state.anchor.txIdHex : null;
+            if (targetTxId && window.confirmedTxIds && window.confirmedTxIds.has(targetTxId)) {
                 clearInterval(state.pollTimer);
                 state.pollTimer = null;
                 state.anchor.confirmed = true;
                 const s = document.getElementById('drift-anchor-status');
                 s.textContent = 'CONFIRMED ON-CHAIN';
                 s.style.color = 'var(--accent-green)';
-                txEl.textContent = 'Anchored on-chain. Tx: ' + frame.txIdHex;
+                txEl.textContent = 'Anchored on-chain. Tx: ' + targetTxId;
             } else if (attempts > 90) {
                 clearInterval(state.pollTimer);
                 state.pollTimer = null;
+                const s = document.getElementById('drift-anchor-status');
+                s.textContent = 'Still awaiting block inclusion after ~6 minutes — the anchor remains valid in the mempool. Keep the tab open, or search the tx id above in the explorer.';
+                s.style.color = 'var(--text-muted)';
             }
         }, 4000);
     }
@@ -695,7 +702,38 @@
         if (!client || state.bound) return;
         state.bound = true;
         client.onDriftCertAuditReceived = onAuditReceived;
-        client.onWireFrameReady = onWireFrameReady;
+        /* Chain (never replace) the shared wire-frame handler: explorer_app.js relies
+         * on it to re-enable the transfer/stake/unstake buttons and to record
+         * window.lastSubmittedTxId. */
+        const upstreamWireFrameReady = client.onWireFrameReady;
+        client.onWireFrameReady = (frame) => {
+            if (typeof upstreamWireFrameReady === 'function') upstreamWireFrameReady(frame);
+            onWireFrameReady(frame);
+        };
+        /* Adopt the authoritative on-chain anchor id echoed by the node
+         * ([0x07][cert_tx_id] in the SubmitTx response): the custodial re-anchor
+         * re-selects inputs and re-signs under the node wallet, so the browser-
+         * computed id can never appear on-chain. */
+        const upstreamTransactionAudited = client.onTransactionAudited;
+        client.onTransactionAudited = (data) => {
+            if (typeof upstreamTransactionAudited === 'function') upstreamTransactionAudited(data);
+            if (state.anchor && !state.anchor.confirmed && data && data.typeString === 'OP_APPLY_DRIFT_CERT' &&
+                data.txId && String(data.requestId) === String(state.anchor.reqId)) {
+                if (state.anchor.txIdHex !== data.txId) {
+                    state.anchor.txIdHex = data.txId;
+                    const txDisplay = document.getElementById('drift-anchor-tx');
+                    if (txDisplay) {
+                        txDisplay.style.display = 'block';
+                        txDisplay.textContent = 'Anchoring tx: ' + data.txId;
+                    }
+                }
+                const s = document.getElementById('drift-anchor-status');
+                if (s) {
+                    s.textContent = 'Anchor accepted by the node — awaiting block inclusion…';
+                    s.style.color = 'var(--text-muted)';
+                }
+            }
+        };
         client.onPaymentRequired = (challenge) => {
             if (Number(challenge.methodId) === 0x000D) {
                 state.settlementInFlight = true;
@@ -745,6 +783,18 @@
         const upstreamRpcError = client.onRpcError;
         client.onRpcError = (data) => {
             if (typeof upstreamRpcError === 'function') upstreamRpcError(data);
+            if (data && Number(data.methodId) === 0x0003 && state.anchor && !state.anchor.confirmed &&
+                !state.settlementInFlight && String(data.requestId || '') === String(state.anchor.reqId)) {
+                /* The anchoring intent itself was rejected by the node — surface it
+                 * instead of freezing on "Submitted — awaiting block inclusion…". */
+                setStatus('ANCHOR REJECTED', 'var(--accent-red)');
+                progress('The node rejected the on-chain anchoring (status 0x' +
+                    Number(data.status).toString(16).padStart(4, '0') + '): ' +
+                    (data.error || 'no diagnostics returned') + '. The anchor fee was not spent. ' +
+                    'Resolve the stated reason and click "Apply On-Chain" again.', false);
+                if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+                return;
+            }
             if (data && Number(data.methodId) === 0x0003 && state.settlementInFlight) {
                 /* The node refused the settlement transaction itself — surface it
                  * instead of freezing on "Settling autonomously…" forever. */
