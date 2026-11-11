@@ -280,6 +280,10 @@ class SclAuditorClient {
         this._pending402Replays = new Map();
         /** @type {number} SCL402 auto-settlement attempts for the current query (loop guard). */
         this._settlementAttempts = 0;
+        /** @type {Object|null} At-least-once SCL402 settlement delivery state: cached
+         * SubmitTx wire frame (ArrayBuffer), its 402 replay key, attempt count and
+         * retransmission interval — null when no settlement intent is in flight. */
+        this._settlementRetransmit = null;
         /** @type {Function|null} Callback invoked when a settlement tx is accepted by the node mempool. */
         this.onSettlementTxAccepted = null;
         /** @type {Function|null} Callback invoked when autonomous SCL402 settlement cannot proceed. */
@@ -537,6 +541,7 @@ class SclAuditorClient {
                     clearInterval(this.pollInterval);
                     this.pollInterval = null;
                 }
+                this._disarmSettlementRetransmit(); // never retransmit a settlement into a dropped pipeline
                 
                 // Exponential backoff auto-reconnect ensuring UI never permanently halts
                 if (!this.manualDisconnect) {
@@ -866,6 +871,22 @@ class SclAuditorClient {
                     if (data && data.requestId !== undefined &&
                         this._pending402Replays && this._pending402Replays.has(String(data.requestId))) {
                         this._settlementDispatchedAt = Date.now();
+
+                        /* At-least-once settlement delivery: the scl-ws-map load
+                         * balancer / TLS front ends / proxies silently drop frames
+                         * in transit, and a SubmitTx settlement lost that way
+                         * previously left the audit stalled until the 120 s
+                         * watchdog fired ("No drift certificate within 120s — the
+                         * request was lost in transit"). Retransmit the identical
+                         * cached frame every 5 s while the 402 replay entry is
+                         * still pending (every terminal event — settlement echo,
+                         * rejection, worker failure, disconnect — removes the
+                         * entry or the socket and the loop below goes quiet).
+                         * Double-settlement safe: the node memoizes SubmitTx
+                         * echoes by request id, so a retransmitted intent is
+                         * re-echoed the authoritative settlement tx id instead
+                         * of executing the custodial transfer a second time. */
+                        this._armSettlementRetransmit(String(data.requestId), data.wireBytes);
                     }
                 } else if (data && data.requestId !== undefined &&
                     this._pending402Replays && this._pending402Replays.has(String(data.requestId))) {
@@ -1039,6 +1060,12 @@ class SclAuditorClient {
                 }
                 break;
             case 'RPC_ERROR':
+                /* SCL402: the node explicitly answered this SubmitTx (rejected
+                 * settlement or anchor) — stop retransmitting the intent; the
+                 * drift view's onRpcError handler surfaces the rejection. */
+                if (data && Number(data.methodId) === 0x0003) {
+                    this._disarmSettlementRetransmit();
+                }
                 if (this.onRpcError) {
                     this.onRpcError(data);
                 }
@@ -1228,6 +1255,47 @@ class SclAuditorClient {
     }
 
     /**
+     * @brief Arms the at-least-once retransmission loop for an in-flight SCL402
+     *        settlement SubmitTx frame whose delivery may be lost in transit
+     *        (load balancer / proxy / node).
+     * @param {string} requestId 402 replay key of the settlement intent.
+     * @param {ArrayBuffer} wireBytes Exact signed frame bytes already dispatched once.
+     */
+    _armSettlementRetransmit(requestId, wireBytes) {
+        this._disarmSettlementRetransmit();
+        const st = { requestId: requestId, frame: wireBytes, attempts: 0, timer: null };
+        this._settlementRetransmit = st;
+        st.timer = setInterval(() => {
+            if (this._settlementRetransmit !== st) return; // superseded or disarmed
+            /* Terminal events (TRANSACTION_AUDITED echo, RPC_ERROR rejection,
+             * settlement failure, pipeline drop) remove the 402 replay entry or
+             * close the socket — every such case ends retransmission here. */
+            if (!this._pending402Replays || !this._pending402Replays.has(st.requestId) ||
+                !this.socket || this.socket.readyState !== WebSocket.OPEN) {
+                this._disarmSettlementRetransmit();
+                return;
+            }
+            if (st.attempts >= 20) { // bounded by the 120 s settlement watchdog window
+                this._disarmSettlementRetransmit();
+                return;
+            }
+            st.attempts++;
+            this.socket.send(st.frame);
+            console.warn('[Agent Bridge] SCL402 settlement unacknowledged — retransmitting SubmitTx intent (attempt ' + st.attempts + ')');
+        }, 5000);
+    }
+
+    /**
+     * @brief Cancels any active settlement retransmission loop.
+     */
+    _disarmSettlementRetransmit() {
+        if (this._settlementRetransmit && this._settlementRetransmit.timer) {
+            clearInterval(this._settlementRetransmit.timer);
+        }
+        this._settlementRetransmit = null;
+    }
+
+    /**
      * Request Centinel proof generation from the WebWorker.
      * @param {Object} data - Centinel proof parameters
      */
@@ -1299,6 +1367,23 @@ class SclAuditorClient {
                 return;
             }
 
+            /* SCL402 transport fix: the node's custodial settlement path
+             * (create_and_broadcast_transfer_as) consumes ONLY the sender,
+             * recipient and amount of this intent — it re-selects inputs and
+             * re-signs, so the serialized client input list is dead weight on
+             * the wire. A fragmented wallet ships 164 bytes per pointer
+             * (152-byte Pointer + 12-byte empty MMR-proof shell, up to 1,024
+             * inputs ≈ 168 KB), inflating the SubmitTx frame past what the
+             * scl-ws-map load balancer / TLS front ends reliably forward — the
+             * frame leaves the browser, is silently dropped in transit, the
+             * node never echoes the settlement, and the audit watchdog fires
+             * with "No drift certificate within 120s". Ship exactly one
+             * structural input (the largest, first in the greedy selection):
+             * identical op structure for the node's deserializer and a fixed
+             * ~19.4 KB frame the transport demonstrably forwards — the same
+             * precedent as the 128-byte ZK-placeholder fix in the worker. */
+            const settlementInputs = [selectedInputs[0]];
+
             let privKeyHex = null;
             let pubKeyHex = null;
             if (typeof window.resolveWalletCredentials === 'function') {
@@ -1368,7 +1453,7 @@ class SclAuditorClient {
                 senderPubkeyHex: pubKeyHex,
                 privkeyHex: privKeyHex,
                 amountSubunits: challenge.amountSubunits,
-                inputs: selectedInputs
+                inputs: settlementInputs
             });
         } catch (e) {
             settleFail('internal error — ' + (e && e.message ? e.message : String(e)));
@@ -1403,6 +1488,7 @@ class SclAuditorClient {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
+        this._disarmSettlementRetransmit();
         if (this.pollInterval) {
             clearInterval(this.pollInterval);
             this.pollInterval = null;
