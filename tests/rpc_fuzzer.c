@@ -751,7 +751,7 @@ size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size, size_t MaxSize, unsig
             }
         } else if (method == 0x0003) { // SubmitTx
             hdr->flags |= SCL_RPC_FLAG_SIGNED;
-            uint8_t op_type = (Seed >> 3) % 7;
+            uint8_t op_type = (Seed >> 3) % 8;
             size_t needed = 0;
             switch (op_type) {
                 case 0: needed = 9892; break; // OP_SUBMIT_VALUATION
@@ -761,6 +761,7 @@ size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size, size_t MaxSize, unsig
                 case 4: needed = 10028; break; // OP_UNSTAKE
                 case 5: needed = 4261; break;  // OP_REDEEM_CENTINEL
                 case 6: needed = 9236; break;  // OP_CLAIM_VALIDATION
+                case 7: needed = 10180; break; // OP_APPLY_DRIFT_CERT (1 input, 12-byte MMR proof)
             }
             size_t sig_len = DILITHIUM_SIGNATURE_LEN;
             if (sizeof(SclRpcHeader) + err_len + sig_len + needed <= MaxSize) {
@@ -795,6 +796,21 @@ size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size, size_t MaxSize, unsig
                         memcpy(op_start + 1 + 32 + 4096, &zk_len_be, 4);
                     } else if (op_type == 6) { // OP_CLAIM_VALIDATION
                         memcpy(op_start + 1 + 2048, global_fuzz_pubkey, 2592);
+                    } else if (op_type == 7) { // OP_APPLY_DRIFT_CERT
+                        /* Wire: type(1) cert_tx_id(32) nonce(8) num_inputs(4,BE)
+                         * client_root(32) [pointer(152) mmr_proof(12)]*
+                         * circuit_hash(32) tvd_scaled(8,BE) shots(4,BE)
+                         * status(4,BE) commitment_root(32) timestamp_us(8,BE)
+                         * recipient(2592) sender(2592) amount(8,BE)
+                         * inputs_merkle_root(32) cert_digest(32) signature(4595).
+                         * The 88-byte digest core sits between the proof and
+                         * recipient, so the pubkey offsets are shifted +88
+                         * relative to the transfer/stake layout. */
+                        uint32_t num_in = htobe32(1);
+                        memcpy(op_start + 1 + 32 + 8, &num_in, 4);
+                        size_t off = 1 + 32 + 8 + 4 + 32 + sizeof(Pointer) + 12 + 88;
+                        memcpy(op_start + off, global_fuzz_pubkey, 2592);
+                        memcpy(op_start + off + 2592, global_fuzz_pubkey, 2592);
                     }
                 }
             } else {
