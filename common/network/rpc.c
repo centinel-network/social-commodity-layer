@@ -1743,6 +1743,25 @@ void handle_rpc_request(State *state, RpcTask *task) {
             const uint8_t *ap_payload = msg->payload + sizeof(SclRpcHeader) + hdr.error_msg_len + ap_sig_len;
             uint32_t ap_args_len = hdr.payload_len - (uint32_t)ap_sig_len;
             if (ap_args_len == 9) {
+                /* Operator authentication for config MUTATION. Without this gate,
+                 * any connected P2P peer could toggle autopilot or rewrite
+                 * submission budgets on any node that accepts their RPC stream
+                 * (the PQ transport authenticates the peer's key, but not their
+                 * authorization to mutate local config). task->sender_pubkey is
+                 * set by the connection layer for every established connection:
+                 * loopback (CLI / WS bridge) submits as the local peer key,
+                 * remote peers submit as their own key. The 0-byte status query
+                 * below remains unauthenticated so the explorer panel keeps
+                 * working. */
+                if (is_zeroed(task->sender_pubkey, PUBKEY_LEN) ||
+                    memcmp(task->sender_pubkey,
+                           state->p2p_network.local_peer.peer_wallet.dilithium_pubkey,
+                           PUBKEY_LEN) != 0) {
+                    send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id,
+                        SCL_RPC_STATUS_UNAUTHORIZED,
+                        "Autopilot config mutation requires local operator authentication");
+                    break;
+                }
                 bool enable = (ap_payload[0] != 0);
                 
                 uint32_t val_per_hr_raw;
