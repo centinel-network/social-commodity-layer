@@ -221,6 +221,89 @@ static void send_rpc_error(State *state, SclConnection *conn, uint16_t method_id
     }
 }
 
+/* ============================================================================
+ * SECTION 2.5: SCL402 SERVER-SIDE CHALLENGE REGISTRY
+ * ============================================================================ */
+
+bool scl402_challenge_register(State *state, const uint8_t challenge_hash[COIN_ID_LEN],
+                               uint64_t amount_subunits, const uint8_t recipient_address[USER_ID_LEN],
+                               uint64_t valid_until_ms) {
+    if (!state || !challenge_hash || !recipient_address) return false;
+
+    Scl402ChallengeRegistry *reg = &state->rpc_engine.scl402_registry;
+    uint64_t now_ms = get_time_ms();
+
+    pthread_mutex_lock(&reg->mutex);
+
+    /* Opportunistic TTL sweep: reclaim slots whose challenges already expired. */
+    for (size_t i = 0; i < SCL402_CHALLENGE_REGISTRY_CAP; i++) {
+        if (reg->entries[i].in_use && reg->entries[i].valid_until_ms < now_ms) {
+            reg->entries[i].in_use = 0;
+            if (reg->count > 0) reg->count--;
+        }
+    }
+
+    /* Full table: evict the soonest-expiring live entry (keys are salted
+     * SHA-256, so eviction is anonymous — the affected client simply re-quotes). */
+    if (reg->count >= SCL402_CHALLENGE_REGISTRY_CAP) {
+        size_t evict_idx = SCL402_CHALLENGE_REGISTRY_CAP;
+        uint64_t earliest = UINT64_MAX;
+        for (size_t i = 0; i < SCL402_CHALLENGE_REGISTRY_CAP; i++) {
+            if (reg->entries[i].in_use && reg->entries[i].valid_until_ms < earliest) {
+                earliest = reg->entries[i].valid_until_ms;
+                evict_idx = i;
+            }
+        }
+        if (evict_idx != SCL402_CHALLENGE_REGISTRY_CAP) {
+            reg->entries[evict_idx].in_use = 0;
+            reg->count--;
+        }
+    }
+
+    /* First free slot wins (flat array; challenge keys are uniform salted SHA-256). */
+    for (size_t i = 0; i < SCL402_CHALLENGE_REGISTRY_CAP; i++) {
+        if (!reg->entries[i].in_use) {
+            memcpy(reg->entries[i].challenge_hash, challenge_hash, COIN_ID_LEN);
+            reg->entries[i].amount_subunits = amount_subunits;
+            reg->entries[i].valid_until_ms = valid_until_ms;
+            memcpy(reg->entries[i].recipient_address, recipient_address, USER_ID_LEN);
+            reg->entries[i].in_use = 1;
+            reg->count++;
+            pthread_mutex_unlock(&reg->mutex);
+            return true;
+        }
+    }
+
+    pthread_mutex_unlock(&reg->mutex);
+    return false; /* Unreachable after eviction, but keeps the contract total. */
+}
+
+bool scl402_challenge_resolve(State *state, const uint8_t challenge_hash[COIN_ID_LEN],
+                              Scl402ChallengeEntry *out_entry) {
+    if (!state || !challenge_hash || !out_entry) return false;
+
+    Scl402ChallengeRegistry *reg = &state->rpc_engine.scl402_registry;
+    uint64_t now_ms = get_time_ms();
+    bool found = false;
+
+    pthread_mutex_lock(&reg->mutex);
+    for (size_t i = 0; i < SCL402_CHALLENGE_REGISTRY_CAP && !found; i++) {
+        if (!reg->entries[i].in_use) continue;
+        if (memcmp(reg->entries[i].challenge_hash, challenge_hash, COIN_ID_LEN) != 0) continue;
+
+        if (reg->entries[i].valid_until_ms >= now_ms) {
+            memcpy(out_entry, &reg->entries[i], sizeof(Scl402ChallengeEntry));
+            found = true;
+        } else {
+            /* Expired: reclaim the slot so the challenge cannot settle later. */
+            reg->entries[i].in_use = 0;
+            if (reg->count > 0) reg->count--;
+        }
+    }
+    pthread_mutex_unlock(&reg->mutex);
+    return found;
+}
+
 static void send_rpc_payment_required(State *state, SclConnection *conn, uint16_t method_id, uint64_t req_id, uint64_t required_subunits) {
     if (!conn) return;
 
@@ -263,8 +346,16 @@ static void send_rpc_payment_required(State *state, SclConnection *conn, uint16_
     memcpy(seed_buf + 10, &salt, 8);
     SHA256(seed_buf, sizeof(seed_buf), challenge->challenge_hash);
 
-    challenge->valid_until_timestamp = htobe64(get_time_ms() + 300000); // 5 minutes TTL
+    uint64_t valid_until_ms = get_time_ms() + SCL402_CHALLENGE_TTL_MS; // 5 minutes TTL
+    challenge->valid_until_timestamp = htobe64(valid_until_ms);
     challenge->accepted_payment_types = htobe16(0x0003); // Accepts Transfer (0x01) and Centinel (0x02)
+
+    /* Server-side challenge registry: remember what this node actually issued
+     * (amount, recipient, expiry) keyed by challenge_hash, so replay-side
+     * verification (step 5 below) can enforce the challenge TTL — previously
+     * unenforced — and bind settlements to the issuance-time quote. */
+    scl402_challenge_register(state, challenge->challenge_hash, required_subunits,
+                              challenge->recipient_address, valid_until_ms);
 
     // Compute checksum over challenge payload and queue response
     uint64_t checksum = compute_rpc_checksum(resp->payload, 0, (uint32_t)challenge_len, conn->rpc_siphash_key);
@@ -528,14 +619,25 @@ void handle_rpc_request(State *state, RpcTask *task) {
         memcpy(&receipt_storage, msg->payload + prefix_len + sig_len, receipt_len);
         const SclRpcPaymentReceipt *receipt = &receipt_storage;
         
-        /* SCL402 challenge binding: compute the metered method's required
-         * amount from the replayed request's own arguments (mirroring the
-         * 0x000A / 0x000D gates below) so the receipt can be verified against
-         * the challenge it actually settles. required == 0 means the method is
-         * unmetered for this node (or non-daemon), and existence alone
-         * suffices — exactly the legacy behaviour. */
+        /* SCL402 challenge binding: resolve the challenge this receipt claims
+         * to settle against the server-side registry (challenge_hash key),
+         * then compute the metered method's required amount from the replayed
+         * request's own arguments (mirroring the 0x000A / 0x000D gates below).
+         * The effective demand is the MAXIMUM of the issuance-time quote and
+         * the replay-derived cost, so cheaper replay args cannot discount the
+         * challenged fee while heavier replays still pay their own cost.
+         * required == 0 means the method is unmetered for this node (or
+         * non-daemon), and existence alone suffices — exactly the legacy
+         * behaviour. */
         uint64_t scl402_required_subunits = 0;
+        Scl402ChallengeEntry scl402_challenge = {0};
+        bool scl402_challenge_live = false;
         if (state->config.is_daemon) {
+            /* TTL enforcement (previously unenforced on replay): an unknown or
+             * expired challenge_hash leaves payment_verified false and the
+             * metering gate below re-issues a fresh 402 challenge. */
+            scl402_challenge_live = scl402_challenge_resolve(state, receipt->challenge_hash, &scl402_challenge);
+
             const uint8_t *scl402_args = msg->payload + prefix_len + sig_len + receipt_len;
             uint32_t scl402_args_len = hdr.payload_len - (uint32_t)sig_len - (uint32_t)receipt_len;
             if (hdr.method_id == 0x000D) {
@@ -549,6 +651,10 @@ void handle_rpc_request(State *state, RpcTask *task) {
             } else if (hdr.method_id == 0x000A && scl402_args_len > 36) {
                 scl402_required_subunits = 160000000ULL; /* 1 SCL fee (parity with the 0x000A gate) */
             }
+
+            if (scl402_challenge_live && scl402_challenge.amount_subunits > scl402_required_subunits) {
+                scl402_required_subunits = scl402_challenge.amount_subunits;
+            }
         }
 
         /* Fee recipient the challenge demanded: SHA-256 of the node wallet's
@@ -558,7 +664,11 @@ void handle_rpc_request(State *state, RpcTask *task) {
         SHA256(state->user_wallet.dilithium_pubkey, DILITHIUM_PUBKEY_LEN, scl402_fee_address);
         pthread_mutex_unlock(&state->wallet_mutex);
 
-        if (receipt->payment_type == 0x02) { // OP_REDEEM_CENTINEL
+        if (state->config.is_daemon && !scl402_challenge_live) {
+            /* Unknown or expired challenge: this receipt settles nothing the
+             * node actually issued within its TTL. Leave payment_verified
+             * false; the metering gate below re-issues a fresh 402 challenge. */
+        } else if (receipt->payment_type == 0x02) { // OP_REDEEM_CENTINEL
             /* Private redemption: amount and destination are sealed inside BDLOP
              * commitments by design, so only nullifier spentness is enforceable
              * on the transparent RPC surface. */
@@ -607,8 +717,13 @@ void handle_rpc_request(State *state, RpcTask *task) {
                     } else if (scl402_is_transfer) {
                         uint8_t paid_address[USER_ID_LEN];
                         SHA256(scl402_paid_recipient, PUBKEY_LEN, paid_address);
+                        /* Challenge-authoritative recipient when a live registry
+                         * entry exists; wallet-derived address otherwise (legacy
+                         * non-daemon parity). */
+                        const uint8_t *scl402_required_recipient =
+                            scl402_challenge_live ? scl402_challenge.recipient_address : scl402_fee_address;
                         payment_verified = (scl402_paid_amount >= scl402_required_subunits) &&
-                                           (memcmp(paid_address, scl402_fee_address, USER_ID_LEN) == 0);
+                                           (memcmp(paid_address, scl402_required_recipient, USER_ID_LEN) == 0);
                     }
                 }
             } else if (scl402_required_subunits == 0) {
@@ -642,8 +757,13 @@ void handle_rpc_request(State *state, RpcTask *task) {
                         if (bop->type == OP_TRANSFER_POINTER) {
                             uint8_t paid_address[USER_ID_LEN];
                             SHA256(bop->data.transfer_pointer.recipient_pubkey, PUBKEY_LEN, paid_address);
+                            /* Challenge-authoritative recipient when a live registry
+                             * entry exists; wallet-derived address otherwise (legacy
+                             * non-daemon parity). */
+                            const uint8_t *scl402_required_recipient =
+                                scl402_challenge_live ? scl402_challenge.recipient_address : scl402_fee_address;
                             payment_verified = (bop->data.transfer_pointer.amount >= scl402_required_subunits) &&
-                                               (memcmp(paid_address, scl402_fee_address, USER_ID_LEN) == 0);
+                                               (memcmp(paid_address, scl402_required_recipient, USER_ID_LEN) == 0);
                         }
                         break;
                     }
@@ -1553,7 +1673,17 @@ void handle_rpc_request(State *state, RpcTask *task) {
              * feeds the explorer's TVD panel and must stay unmetered like the
              * other telemetry methods, or the panel sticks on
              * "Awaiting Telemetry" on zero-balance testnet wallets. */
-            bool tvd_custom_circuit = (hdr.payload_len > 36);
+            /* Signed-frame alignment (parity with step 5's receipt-side
+             * computation and SubmitTx 0x0003): true method args begin at
+             * prefix + sig_len once the receipt slot has been stripped, and
+             * the args length is payload_len - sig_len. Parsing at the bare
+             * prefix only worked because browser replay frames are unsigned. */
+            size_t sig_len = (hdr.flags & SCL_RPC_FLAG_SIGNED) ? DILITHIUM_SIGNATURE_LEN : 0;
+            if (hdr.payload_len < sig_len) {
+                send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id, SCL_RPC_STATUS_INVALID_ARGS, "Signed payload length mismatch");
+                break;
+            }
+            bool tvd_custom_circuit = (hdr.payload_len > sig_len + 36);
             if (tvd_custom_circuit && !payment_verified && state->config.is_daemon) {
                 // Require a 1 SCL fee (160,000,000 subunits) for expensive QPU audits
                 send_rpc_payment_required(state, task->conn, hdr.method_id, hdr.request_id, 160000000ULL);
@@ -1561,8 +1691,8 @@ void handle_rpc_request(State *state, RpcTask *task) {
             }
             
             // Dispatch execution to Quantum TVD audit subsystem
-            const uint8_t *tvd_payload = msg->payload + sizeof(SclRpcHeader) + hdr.error_msg_len;
-            size_t tvd_payload_len = hdr.payload_len;
+            const uint8_t *tvd_payload = msg->payload + sizeof(SclRpcHeader) + hdr.error_msg_len + sig_len;
+            size_t tvd_payload_len = hdr.payload_len - sig_len;
             handle_rpc_quantum_tvd_audit(state, task, &hdr, tvd_payload, tvd_payload_len);
             break;
         }
@@ -1647,8 +1777,16 @@ void handle_rpc_request(State *state, RpcTask *task) {
              * histogram and are therefore always metered (SCL402). Fee schedule
              * mirrors the explorer quote exactly: 1 SCL base + 0.2 SCL per
              * commenced 10,000 shots (160,000,000 subunits = 1 SCL). */
-            const uint8_t *dc_payload = msg->payload + sizeof(SclRpcHeader) + hdr.error_msg_len;
-            size_t dc_payload_len = hdr.payload_len;
+            /* Signed-frame alignment (parity with step 5's receipt-side
+             * computation and SubmitTx 0x0003): true method args begin at
+             * prefix + sig_len once the receipt slot has been stripped. */
+            size_t sig_len = (hdr.flags & SCL_RPC_FLAG_SIGNED) ? DILITHIUM_SIGNATURE_LEN : 0;
+            if (hdr.payload_len < sig_len) {
+                send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id, SCL_RPC_STATUS_INVALID_ARGS, "Signed payload length mismatch");
+                break;
+            }
+            const uint8_t *dc_payload = msg->payload + sizeof(SclRpcHeader) + hdr.error_msg_len + sig_len;
+            size_t dc_payload_len = hdr.payload_len - sig_len;
 
             if (!payment_verified && state->config.is_daemon) {
                 uint32_t dc_shots = 15000;
