@@ -101,6 +101,12 @@
 /** @brief Maximum concurrent in-flight RPC requests permitted per peer connection before rate-limiting triggers. */
 #define MAX_CONCURRENT_RPCS_PER_CONN 3
 
+/** @brief SCL402 payment challenge TTL in milliseconds (5 minutes), shared by challenge issuance and the server-side registry. */
+#define SCL402_CHALLENGE_TTL_MS 300000
+
+/** @brief Capacity of the server-side SCL402 challenge registry (flat array of live challenges). */
+#define SCL402_CHALLENGE_REGISTRY_CAP 256
+
 #if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && !defined(SCL_UNIT_TEST)
     /** @brief Maximum items returned in a single paginated query during fuzzing runs (reduced for speed). */
     #define MAX_PAGINATION_RANGE 16
