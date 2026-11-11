@@ -430,7 +430,7 @@ function handleProcessFrame(wireBytes) {
             }
             postMessage({
                 type: 'RPC_ERROR',
-                data: { methodId, status, version, error: errorText }
+                data: { methodId, status, version, error: errorText, requestId: wasmInstance._wasm_parser_get_request_id(parserCtx).toString() }
             });
             return;
         }
@@ -961,24 +961,37 @@ function handleProcessFrame(wireBytes) {
                 if (payloadLen >= 8) {
                     const maxHashes = 1000;
                     const outHashesPtr = wasmInstance._wasm_malloc(maxHashes * 32);
-                    const numHashes = wasmInstance._wasm_extract_block_commitments(payloadPtr, payloadLen, outHashesPtr, maxHashes);
+                    const outTypesPtr = wasmInstance._wasm_malloc(maxHashes);
+                    const outDriftIdsPtr = wasmInstance._wasm_malloc(maxHashes * 32);
+                    const numHashes = wasmInstance._wasm_extract_block_commitments(payloadPtr, payloadLen, outHashesPtr, maxHashes, outTypesPtr, outDriftIdsPtr);
                     
                     const payloadBytes = getLiveHeapU8().subarray(payloadPtr, payloadPtr + payloadLen).slice(0);
                     const viewPayload = new DataView(payloadBytes.buffer, payloadBytes.byteOffset, payloadLen);
                     const blockNumber = Number(viewPayload.getBigUint64(0, false));
                     
                     const commitments = [];
+                    const opTypes = [];
+                    const driftCertTxIds = [];
                     if (numHashes > 0) {
                         const hashesBytes = getLiveHeapU8().subarray(outHashesPtr, outHashesPtr + numHashes * 32);
+                        const typesBytes = getLiveHeapU8().subarray(outTypesPtr, outTypesPtr + numHashes);
+                        const driftIdsBytes = getLiveHeapU8().subarray(outDriftIdsPtr, outDriftIdsPtr + numHashes * 32);
                         for (let i = 0; i < numHashes; i++) {
                             commitments.push(Array.from(hashesBytes.slice(i * 32, (i + 1) * 32)));
+                            opTypes.push(typesBytes[i]);
+                            if (typesBytes[i] === 7) { // OP_APPLY_DRIFT_CERT
+                                const idHex = Array.from(driftIdsBytes.slice(i * 32, (i + 1) * 32)).map(b => b.toString(16).padStart(2, '0')).join('');
+                                driftCertTxIds.push(idHex);
+                            }
                         }
                     }
                     wasmInstance._wasm_free(outHashesPtr);
+                    wasmInstance._wasm_free(outTypesPtr);
+                    wasmInstance._wasm_free(outDriftIdsPtr);
                     
                     postMessage({
                         type: 'BLOCK_RECEIVED',
-                        data: { blockNumber, commitments }
+                        data: { blockNumber, commitments, opTypes, driftCertTxIds }
                     });
                 }
             }
@@ -1042,12 +1055,13 @@ function handleProcessFrame(wireBytes) {
                     else if (type === 4) txTypeString = "OP_UNSTAKE";
                     else if (type === 5) txTypeString = "OP_REDEEM_CENTINEL";
                     else if (type === 6) txTypeString = "OP_CLAIM_VALIDATION";
+                    else if (type === 7) txTypeString = "OP_APPLY_DRIFT_CERT";
 
                     let txIdHex = "";
                     if (type === 1 && outLen >= 2657 + 32) {
                         const txIdBytes = payloadBytes.subarray(2657, 2657 + 32);
                         txIdHex = Array.from(txIdBytes).map(b => b.toString(16).padStart(2, '0')).join('');
-                    } else if (type === 2 || type === 3 || type === 4 || type === 5 || type === 6) {
+                    } else if (type === 2 || type === 3 || type === 4 || type === 5 || type === 6 || type === 7) {
                         const txIdBytes = payloadBytes.subarray(1, 33);
                         txIdHex = Array.from(txIdBytes).map(b => b.toString(16).padStart(2, '0')).join('');
                     }
@@ -1378,7 +1392,7 @@ function handleProcessFrame(wireBytes) {
                             matchFound: matchFound,
                             nullifier: computedNullifierHex,
                             methodId: methodId,
-                            parsedTx: (type >= 0 && type <= 6) ? parseTransactionPayload(finalSafePayloadBytes, methodId) : null
+                            parsedTx: (type >= 0 && type <= 7) ? parseTransactionPayload(finalSafePayloadBytes, methodId) : null
                         }
                     });
                 }
@@ -2537,6 +2551,82 @@ function parseTransactionPayload(payloadBytes, methodId = 0) {
                 prevTxHashHex: commHex,
                 generatedPointers: [],
                 opLen: 9236
+            };
+        }
+
+        if (type === 7) { // OP_APPLY_DRIFT_CERT
+            /* Wire layout (protocol.c serialize_operation):
+             * [0]=type, [1..33)=cert_tx_id, [33..41)=nonce, [41..45)=num_inputs,
+             * [45..77)=client_root, per-input Pointer(152B)+MMRProof, then
+             * circuit_hash(32) tvd_scaled(8) shots(4) status(4) commitment_root(32)
+             * timestamp_us(8) recipient(2592) sender(2592) amount(8)
+             * inputs_merkle_root(32) cert_digest(32) signature(4595). */
+            const hexAt = (off, n) => Array.from(payloadBytes.subarray(off, off + n)).map(b => b.toString(16).padStart(2, '0')).join('');
+            const txIdHex = hexAt(1, 32);
+            if (payloadBytes.length < 77 + 9939) {
+                /* 33-byte SubmitTx echo [0x07][cert_tx_id]: the authoritative on-chain
+                 * anchor id returned by the node after the custodial re-anchor. */
+                return {
+                    txIdHex: txIdHex,
+                    numInputs: 0,
+                    amount: 0,
+                    recipientPubkeyHex: '',
+                    senderPubkeyHex: '',
+                    recipientAddressHex: '',
+                    senderAddressHex: '',
+                    parentCoinIdHex: '',
+                    inputPointerIds: [],
+                    generatedPointers: [],
+                    driftCert: null,
+                    prevTxHashHex: txIdHex,
+                    opLen: payloadBytes.length
+                };
+            }
+            let off = 33 + 8; // type + cert_tx_id + nonce
+            const numInputs = view.getUint32(off, false); off += 4;
+            off += 32; // client_root
+            const inputPointerIds = [];
+            let parentCoinIdBytes = null;
+            for (let i = 0; i < numInputs; i++) {
+                if (i === 0) parentCoinIdBytes = payloadBytes.subarray(off + 32, off + 64);
+                inputPointerIds.push(hexAt(off, 32));
+                off += 152;
+                off = parseMmrProof(view, off);
+            }
+            const circuitHashHex = hexAt(off, 32); off += 32;
+            const tvdScaled = view.getBigUint64(off, false); off += 8;
+            const shots = view.getUint32(off, false); off += 4;
+            const status = view.getUint32(off, false); off += 4;
+            const commitmentRootHex = hexAt(off, 32); off += 32;
+            const timestampUs = view.getBigUint64(off, false); off += 8;
+            const recipientPubkeyHex = hexAt(off, 2592); off += 2592;
+            const senderPubkeyHex = hexAt(off, 2592); off += 2592;
+            const amount = Number(view.getBigUint64(off, false)); off += 8;
+            off += 32; // inputs_merkle_root
+            const certDigestHex = hexAt(off, 32); off += 32;
+            return {
+                txIdHex: txIdHex,
+                numInputs: numInputs,
+                inputPointerIds: inputPointerIds,
+                amount: amount,
+                recipientPubkeyHex: recipientPubkeyHex,
+                senderPubkeyHex: senderPubkeyHex,
+                recipientAddressHex: '',
+                senderAddressHex: '',
+                parentCoinIdHex: parentCoinIdBytes ? Array.from(parentCoinIdBytes).map(b => b.toString(16).padStart(2, '0')).join('') : '',
+                generatedPointers: [],
+                driftCert: {
+                    circuitHashHex: circuitHashHex,
+                    tvdScaled: tvdScaled.toString(),
+                    tvdDouble: Number(tvdScaled) / 1e9,
+                    shots: shots,
+                    status: status,
+                    commitmentRootHex: commitmentRootHex,
+                    timestampUs: timestampUs.toString(),
+                    certDigestHex: certDigestHex
+                },
+                prevTxHashHex: txIdHex,
+                opLen: off + 4595
             };
         }
 
