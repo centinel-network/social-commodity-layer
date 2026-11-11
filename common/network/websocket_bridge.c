@@ -1011,6 +1011,7 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                         else if (op->type == OP_MINT_COIN) auth_pubkey = op->data.mint_coin.owner_pubkey;
                         else if (op->type == OP_SUBMIT_VALUATION) auth_pubkey = op->data.submit_valuation.pubkey;
                         else if (op->type == OP_CLAIM_VALIDATION) auth_pubkey = op->data.claim_validation.pubkey;
+                        else if (op->type == OP_APPLY_DRIFT_CERT) auth_pubkey = op->data.apply_drift_cert.sender_pubkey;
                         else if (op->type == OP_REDEEM_CENTINEL) auth_pubkey = state->user_wallet.dilithium_pubkey;
 
                         if (auth_pubkey) {
@@ -1141,6 +1142,38 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                             int added = create_and_broadcast_unstake(state, op->data.unstake.amount, false);
                             if (added != 0 && added != 2) {
                                 rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
+                            }
+                            free(op);
+                            break;
+                        } else if (op->type == OP_APPLY_DRIFT_CERT) {
+                            /* Enterprise drift-certificate anchoring — parity with the P2P
+                             * engine (rpc.c case 0x0003) and the SCL402 settlement model:
+                             * the browser cannot build state-root MMR inclusion proofs, so
+                             * the node re-selects inputs and re-signs custodially, then
+                             * echoes the authoritative on-chain identity —
+                             * [0x07 OP_APPLY_DRIFT_CERT][32-byte cert_tx_id] (33 bytes) —
+                             * so the client polls block inclusion against the real
+                             * operation id instead of its locally computed guess. */
+                            uint8_t anchored_cert_tx_id[COIN_ID_LEN];
+                            int dc_added = create_and_broadcast_apply_drift_cert(state, &op->data.apply_drift_cert, false, anchored_cert_tx_id);
+                            if (dc_added == 0) {
+                                resp_buf[32] = 0x07;
+                                memcpy(resp_buf + 33, anchored_cert_tx_id, COIN_ID_LEN);
+                                actual_payload_len = 1 + COIN_ID_LEN;
+                            } else if (dc_added == 2) {
+                                rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
+                                const char *err_msg = "Anchoring deferred: the node wallet's inputs are locked by a pending mempool operation. Retry after the next block.";
+                                size_t err_len = strlen(err_msg) + 1;
+                                rh->error_msg_len = htobe16((uint16_t)err_len);
+                                memcpy(resp_buf + 32, err_msg, err_len);
+                                actual_payload_len = err_len;
+                            } else {
+                                rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
+                                const char *err_msg = "Drift certificate anchoring failed: the node wallet cannot cover the anchor fee plus the halved network fee.";
+                                size_t err_len = strlen(err_msg) + 1;
+                                rh->error_msg_len = htobe16((uint16_t)err_len);
+                                memcpy(resp_buf + 32, err_msg, err_len);
+                                actual_payload_len = err_len;
                             }
                             free(op);
                             break;
