@@ -78,6 +78,7 @@ static void init_mock_state(State *s) {
     pthread_mutex_init(&s->block_proposers_lock, NULL);
     pthread_mutex_init(&s->processed_blocks_mutex, NULL);
     pthread_mutex_init(&s->threshold_mutex, NULL);
+    pthread_mutex_init(&s->rpc_engine.scl402_registry.mutex, NULL);
 
     blockchain_init(&s->bc);
 
@@ -563,15 +564,19 @@ int LLVMFuzzerInitialize(int *argc, char ***argv) {
     memcpy(ap_seed_payload + 5, &ap_ratio_be, 4);
     write_seed_file(corpus_dir, "seed24_autopilot_config.bin", SCL_RPC_VERSION_1, 0, SCL_RPC_STATUS_OK, 0x000B, 10024, 0, ap_seed_payload, 9);
 
-    // Seed 25: Quantum TVD Audit with Payment Receipt (Method 0x000A)
-    uint8_t tvd_receipt_payload[36 + 41];
+    // Seed 25: Quantum TVD Audit with Payment Receipt (Method 0x000A).
+    // sizeof-tracked so the seed always mirrors the live wire layout
+    // (challenge_hash included; registry lookups miss and re-402 by design).
+    uint8_t tvd_receipt_payload[36 + sizeof(SclRpcPaymentReceipt)];
     SclRpcPaymentReceipt dummy_receipt;
+    memset(&dummy_receipt, 0, sizeof(dummy_receipt));
     dummy_receipt.payment_type = 0x01;
     memset(dummy_receipt.tx_id, 0xBB, 32);
+    memset(dummy_receipt.challenge_hash, 0xCC, 32);
     dummy_receipt.price_rate_lock_id = htobe64(123456789);
-    memcpy(tvd_receipt_payload, &dummy_receipt, 41);
-    memcpy(tvd_receipt_payload + 41, tvd_payload, 36);
-    write_seed_file(corpus_dir, "seed25_quantum_tvd_audit_receipt.bin", SCL_RPC_VERSION_1, SCL_RPC_FLAG_PAYMENT_RECEIPT, SCL_RPC_STATUS_OK, 0x000A, 10025, 0, tvd_receipt_payload, 77);
+    memcpy(tvd_receipt_payload, &dummy_receipt, sizeof(dummy_receipt));
+    memcpy(tvd_receipt_payload + sizeof(dummy_receipt), tvd_payload, 36);
+    write_seed_file(corpus_dir, "seed25_quantum_tvd_audit_receipt.bin", SCL_RPC_VERSION_1, SCL_RPC_FLAG_PAYMENT_RECEIPT, SCL_RPC_STATUS_OK, 0x000A, 10025, 0, tvd_receipt_payload, (uint32_t)(36 + sizeof(SclRpcPaymentReceipt)));
 
     // Provide a realistic dummy payload for compression seeds (like GetValuations response)
     uint8_t dummy_response_payload[1024];
