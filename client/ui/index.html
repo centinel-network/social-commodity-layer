@@ -223,6 +223,10 @@
             --accent-green-border: #047857;
             --accent-red: #ef4444;
             --accent-drift: #f43f5e;
+            /* MMR topography palette (mirrors mmr_canvas_renderer.js dark theme) */
+            --mmr-leaf: #38bdf8;
+            --mmr-internal: #a78bfa;
+            --mmr-highlight: #10b981;
             --border-color: #334155;
         }
 
@@ -235,6 +239,10 @@
             --accent-green-border: #047857;
             --accent-red: #dc2626;
             --accent-drift: #e11d48;
+            /* MMR topography palette (mirrors mmr_canvas_renderer.js light theme) */
+            --mmr-leaf: #0284c7;
+            --mmr-internal: #7c3aed;
+            --mmr-highlight: #059669;
             --border-color: #e2e8f0;
         }
 
@@ -248,6 +256,10 @@
             --accent-green-border: #b45309;
             --accent-red: #ef4444;
             --accent-drift: #fb7185;
+            /* MMR topography palette (mirrors mmr_canvas_renderer.js orange dark theme) */
+            --mmr-leaf: #fbbf24;
+            --mmr-internal: #a89f91;
+            --mmr-highlight: #f7931a;
             --border-color: #342a21;
         }
 
@@ -260,6 +272,10 @@
             --accent-green-border: #c2410c;
             --accent-red: #dc2626;
             --accent-drift: #e11d48;
+            /* MMR topography palette (mirrors mmr_canvas_renderer.js orange light theme) */
+            --mmr-leaf: #f59e0b;
+            --mmr-internal: #d6d3d1;
+            --mmr-highlight: #ea580c;
             --border-color: #e7e5e4;
         }
 
@@ -2657,10 +2673,10 @@
                         </div>
                     </div>
                     <div id="mmr-legend" style="display: flex; gap: 16px; align-items: center; justify-content: center; font-size: 0.72rem; color: var(--text-muted); margin-top: 10px; font-family: monospace; flex-wrap: wrap;">
-                        <span><span style="display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #38bdf8; margin-right: 4px; vertical-align: middle;"></span>Leaf (Commitment / UTXO)</span>
-                        <span><span style="display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #a78bfa; margin-right: 4px; vertical-align: middle;"></span>Internal / Peak</span>
-                        <span><span style="display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #10b981; margin-right: 4px; vertical-align: middle;"></span>Proof Highlight</span>
-                        <span><span style="display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--accent-drift, #f43f5e); margin-right: 4px; vertical-align: middle;"></span>Drift Certificate</span>
+                        <span><span style="display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--mmr-leaf, #38bdf8); margin-right: 4px; vertical-align: middle;"></span>Leaf (Commitment / UTXO)</span>
+                        <span><span style="display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--mmr-internal, #a78bfa); margin-right: 4px; vertical-align: middle;"></span>Internal / Peak</span>
+                        <span><span style="display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--mmr-highlight, #10b981); margin-right: 4px; vertical-align: middle;"></span>Proof Highlight</span>
+                        <span><span style="display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--accent-drift, #f43f5e); margin-right: 4px; vertical-align: middle;"></span>Drift Certificate (OP_APPLY_DRIFT_CERT)</span>
                     </div>
                     <div class="canvas-container" style="margin-top: 12px;">
                         <canvas id="mmr-canvas" width="1150" height="450"></canvas>
