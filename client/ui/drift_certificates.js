@@ -615,7 +615,7 @@
   <h2>Independent Verification Protocol</h2>
   <ol>
     <li><b>Recompute the TVD.</b> Simulate the circuit (digest above) with any qsim-compatible simulator to obtain the ideal distribution P, then evaluate (1/2)&middot;&Sigma;|P(x) &minus; h(x)/shots| over all 128 basis states using the histogram embedded below. The result must match the certified value.</li>
-    <li><b>Verify the signature.</b> Validate the ML-DSA-87 (FIPS 204) validator signature over the canonical digest SHA-256(circuit_hash &Vert; tvd_scaled &Vert; shots &Vert; status &Vert; commitment_root &Vert; timestamp) using the node's published Dilithium5 public key.</li>
+    <li><b>Verify the validator signature.</b> Validate the ML-DSA-87 (FIPS 204) validator signature over the canonical digest SHA-256(circuit_hash &Vert; num_qubits &Vert; tvd_scaled &Vert; shots &Vert; status &Vert; full 2048-byte BDLOP commitment &Vert; timestamp_us) &mdash; every multi-byte integer big-endian &mdash; using the node's published Dilithium5 public key. Fetch the full commitment and signature bytes from the node's 0x000A / 0x000D audit responses (only their first 256 bits are printed above). This is distinct from the on-chain anchoring digest, where the funding wallet separately signs SHA-256(circuit_hash &Vert; tvd_scaled &Vert; shots &Vert; status &Vert; commitment_root &Vert; timestamp_us), with commitment_root being the first 256 bits of the commitment c1.</li>
     <li><b>Open the commitment.</b> The BDLOP commitment must open to exactly the certified fixed-point TVD under the homomorphic binding property.</li>
     <li><b>Confirm the anchor.</b> Resolve the Transaction ID above in the Centinel blockchain explorer; the operation must carry this certificate's digest fields.</li>
   </ol>
