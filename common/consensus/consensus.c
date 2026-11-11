@@ -824,6 +824,19 @@ Block *create_block(uint64_t block_number, const uint8_t *prev_block_hash, Opera
         } else if (operations[i].type == OP_SUBMIT_VALUATION) {
             memcpy(&block->operations[i].data.submit_valuation,
                    &operations[i].data.submit_valuation, sizeof(ValuationData));
+        } else if (operations[i].type == OP_APPLY_DRIFT_CERT) {
+            ApplyDriftCertData *src = &operations[i].data.apply_drift_cert;
+            ApplyDriftCertData *dst = &block->operations[i].data.apply_drift_cert;
+            if (src->num_inputs == 0 || src->num_inputs > MAX_INPUTS) {
+                fprintf(stderr, "[Consensus] Invalid num_inputs for OP_APPLY_DRIFT_CERT: %u\n", src->num_inputs);
+                free(block->operations);
+                free(block);
+                return NULL;
+            }
+            /* Plain-old-data struct copy (mirrors add_pending_operation): cert_tx_id,
+             * nonce, inputs, proofs, inputs_merkle_root, client_root, digest fields,
+             * pubkeys, amount, signature and cert_digest are all inline arrays/scalars. */
+            *dst = *src;
         } else {
             fprintf(stderr, "[Consensus] Invalid operation type: %d\n", operations[i].type);
             free(block->operations);
