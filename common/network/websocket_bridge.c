@@ -1135,6 +1135,9 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                 
                 Block *b = calloc(1, sizeof(Block));
                 if (!b || deserialize_block(b, ser_block, ser_len) != 0) {
+                    scl_log(LOG_LEVEL_ERROR, "Bridge",
+                            "Stored block %llu failed wire deserialization (%zu bytes) — skipped in GetBlock stream",
+                            (unsigned long long)i, ser_len);
                     if (b) free_block(b);
                     free(ser_block);
                     continue;
