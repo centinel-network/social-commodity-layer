@@ -1094,7 +1094,7 @@ int deserialize_operation(const uint8_t *buffer, size_t buf_size, Operation *op,
     if (read_type) {
         if (remaining < 1) return -1;
 #if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
-        op->type = (OperationType)((*p++) % 7);
+        op->type = (OperationType)((*p++) % 8);
 #else
         op->type = (OperationType)*p++;
 #endif
