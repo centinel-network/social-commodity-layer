@@ -1024,7 +1024,7 @@ cleanup:
  *
  * @complexity Time: O(inputs + Cost(Dilithium5)), Space: O(MAX_INPUTS * sizeof(Pointer)).
  */
-int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData *client_cert, bool is_recreation) {
+int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData *client_cert, bool is_recreation, uint8_t *out_cert_tx_id) {
     int result = -1;
     Pointer *selected = NULL;
     ApplyDriftCertData *dc = NULL;
@@ -1192,6 +1192,12 @@ int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData
             dc->cert_tx_id[4], dc->cert_tx_id[5], dc->cert_tx_id[6], dc->cert_tx_id[7]);
 
     result = 0;
+
+    /* Export the authoritative on-chain identity so ingress paths can echo
+     * [0x07][cert_tx_id] back to the submitting client. */
+    if (out_cert_tx_id) {
+        memcpy(out_cert_tx_id, dc->cert_tx_id, COIN_ID_LEN);
+    }
 
 cleanup:
     if (selected) free(selected);
