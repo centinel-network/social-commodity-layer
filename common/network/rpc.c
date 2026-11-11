@@ -1065,7 +1065,7 @@ void handle_rpc_request(State *state, RpcTask *task) {
 
                     if (b->block_number >= start_height) {
                         size_t rpc_mark = arena_mark();
-                        Message *resp = (Message *)arena_alloc(offsetof(Message, payload) + sizeof(SclRpcHeader) + MAX_MESSAGE_SIZE);
+                        Message *resp = (Message *)arena_alloc(MAX_MESSAGE_SIZE);
                         if (resp) {
                             resp->type = MSG_RPC_RESPONSE;
                             int offset = process_block_data(b, resp->payload + sizeof(SclRpcHeader), NULL, true);
