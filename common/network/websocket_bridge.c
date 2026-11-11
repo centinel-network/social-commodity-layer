@@ -786,9 +786,35 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                 }
             }
 
+            /* Single-use challenges (mirror of rpc.c): a settled receipt
+             * consumes the registry entry, so a captured challenge_hash
+             * cannot settle a second metered call before TTL expiry.
+             * Unsettled attempts keep the entry live — no double-billing. */
+            if (payment_verified && receipt_challenge_live) {
+                scl402_challenge_consume(state, receipt_storage.challenge_hash);
+            }
+
             final_payload += sig_len + receipt_len;
             final_payload_len -= (uint32_t)(sig_len + receipt_len);
         }
+    }
+
+    /* First-time signed metered frames (0x000A/0x000B/0x000D): the wasm
+     * builder prepends the ML-DSA-87 signature at payload[0], so true method
+     * args begin at final_payload + sig_len. Replay frames already advanced
+     * past sig + receipt above. Stripping globally would break SubmitTx
+     * (0x0003), whose handler consumes the signature in place at
+     * final_payload[0] — so the offset is applied to the metered methods
+     * only, mirroring rpc.c's per-handler sig alignment. */
+    if ((hdr->flags & SCL_RPC_FLAG_SIGNED) && !(hdr->flags & SCL_RPC_FLAG_PAYMENT_RECEIPT) &&
+        (method_id == 0x000A || method_id == 0x000B || method_id == 0x000D)) {
+        if (final_payload_len < DILITHIUM_SIGNATURE_LEN) {
+            free(resp_buf);
+            if (decomp_buf) free(decomp_buf);
+            return;
+        }
+        final_payload += DILITHIUM_SIGNATURE_LEN;
+        final_payload_len -= DILITHIUM_SIGNATURE_LEN;
     }
 
     /* SCL402 scope fix: meter only client-supplied OpenQASM circuits
@@ -1725,8 +1751,11 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
             break;
         }
         case 0x000B: { // Autopilot Config & Status
-            // Apply autopilot reconfiguration and compile telemetry response
-            if (final_payload_len >= 9) {
+            /* Exact-length guard (parity with rpc.c 0x000B and the 0x0001/
+             * 0x0007 handlers): a 9-byte config update or a 0-byte status
+             * query; anything else — including trailing garbage — is
+             * rejected. First-time signed frames were sig-stripped above. */
+            if (final_payload_len == 9) {
                 bool enable = (final_payload[0] != 0);
                 uint32_t val_per_hr = be32toh(*(const uint32_t *)(final_payload + 1));
                 uint32_t stake_ratio = be32toh(*(const uint32_t *)(final_payload + 5));
@@ -1743,6 +1772,14 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                 } else {
                     stop_autopilot_thread(state);
                 }
+            } else if (final_payload_len != 0) {
+                rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
+                const char *err_msg = "Invalid args for Autopilot";
+                size_t err_len = strlen(err_msg) + 1;
+                rh->error_msg_len = htobe16((uint16_t)err_len);
+                memcpy(resp_buf + 32, err_msg, err_len);
+                actual_payload_len = err_len;
+                break;
             }
 
             uint8_t resp_payload[21] = {0};
