@@ -2536,7 +2536,11 @@ void propose_block(State *state, const Operation *provided_mint) {
         return;
     }
 
-    if (verify_block_heavy_crypto(block) != CRYPTO_SUCCESS) {
+    pthread_mutex_unlock(&state->mutex);
+    int heavy_verify_rc = verify_block_heavy_crypto(block);
+    pthread_mutex_lock(&state->mutex);
+
+    if (heavy_verify_rc != CRYPTO_SUCCESS) {
         fprintf(stderr, "[ProposeBlock] Heavy crypto validation failed on our own proposed block!\n");
         free_block(block);
         free(operations);
