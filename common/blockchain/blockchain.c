@@ -2149,6 +2149,15 @@ uint64_t calculate_pending_consumed_subunits(State *state, const uint8_t *pubkey
                 is_consuming = true;
                 amount = op->data.stake.amount + calculate_fee(op->data.stake.amount, true);
                 op_pubkey = op->data.stake.inputs[0].owner_address;
+            } else if (op->type == OP_APPLY_DRIFT_CERT && op->data.apply_drift_cert.num_inputs > 0) {
+                /* Drift certificate anchoring spends liquid pointers under the
+                 * halved (staking-grade) fee schedule — mirror the mempool's
+                 * fee accounting (add_pending_operation / validate_operation)
+                 * so in-flight anchors reserve amount + fee exactly like
+                 * transfers and stakes. */
+                is_consuming = true;
+                amount = op->data.apply_drift_cert.amount + calculate_fee(op->data.apply_drift_cert.amount, true);
+                op_pubkey = op->data.apply_drift_cert.inputs[0].owner_address;
             }
         } else {
             if (op->type == OP_UNSTAKE) {
