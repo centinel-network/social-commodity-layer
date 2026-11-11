@@ -444,10 +444,11 @@ int scl_rpc_parser_get_payment_challenge(SclRpcParser parser, SclRpcPaymentChall
  * @param[in,out] builder Opaque builder handle.
  * @param[in] payment_type 0x01 (Transfer) or 0x02 (Centinel Redemption).
  * @param[in] tx_id 32-byte Transaction ID or Nullifier.
- * @param[in] rate_lock_id Ephemeral price lock ID matching the challenge.
+ * @param[in] challenge_hash 32-byte SHA-256 challenge_hash of the SCL402 challenge being settled.
+ * @param[in] rate_lock_id Ephemeral price lock ID matching the challenge (informational echo).
  * @return 0 on success; -1 on memory expansion failure.
  */
-int scl_rpc_builder_set_payment_receipt(SclRpcBuilder builder, uint8_t payment_type, const uint8_t *tx_id, uint64_t rate_lock_id);
+int scl_rpc_builder_set_payment_receipt(SclRpcBuilder builder, uint8_t payment_type, const uint8_t *tx_id, const uint8_t *challenge_hash, uint64_t rate_lock_id);
 
 #ifdef __cplusplus
 } // extern "C"
