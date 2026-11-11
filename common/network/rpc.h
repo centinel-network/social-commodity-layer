@@ -129,6 +129,23 @@ bool scl402_challenge_register(State *state, const uint8_t challenge_hash[COIN_I
 bool scl402_challenge_resolve(State *state, const uint8_t challenge_hash[COIN_ID_LEN],
                               Scl402ChallengeEntry *out_entry);
 
+/**
+ * @brief Consumes (single-uses) a live SCL402 challenge entry after its receipt verified.
+ *
+ * @details Hardening companion to @ref scl402_challenge_resolve: the resolver
+ *          stays non-consuming so unsettled retries (races against mempool
+ *          inclusion, lost responses) keep working within the TTL, while this
+ *          call reclaims the slot once a receipt has actually settled the
+ *          challenge — a captured challenge_hash can no longer settle a
+ *          second metered call before expiry.
+ *
+ * @param[in,out] state Global node state container (owns the registry in @ref SclRpcEngine).
+ * @param[in] challenge_hash 32-byte challenge key echoed by the verified receipt.
+ * @return true if a live entry was reclaimed; false on miss or NULL arguments.
+ * @thread_safety Acquires the registry mutex in write mode internally.
+ */
+bool scl402_challenge_consume(State *state, const uint8_t challenge_hash[COIN_ID_LEN]);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
