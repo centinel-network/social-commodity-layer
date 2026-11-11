@@ -222,6 +222,7 @@
             --accent-green: #10b981;
             --accent-green-border: #047857;
             --accent-red: #ef4444;
+            --accent-drift: #f43f5e;
             --border-color: #334155;
         }
 
@@ -233,6 +234,7 @@
             --accent-green: #059669;
             --accent-green-border: #047857;
             --accent-red: #dc2626;
+            --accent-drift: #e11d48;
             --border-color: #e2e8f0;
         }
 
@@ -245,6 +247,7 @@
             --accent-green: #f7931a;
             --accent-green-border: #b45309;
             --accent-red: #ef4444;
+            --accent-drift: #fb7185;
             --border-color: #342a21;
         }
 
@@ -256,6 +259,7 @@
             --accent-green: #ea580c;
             --accent-green-border: #c2410c;
             --accent-red: #dc2626;
+            --accent-drift: #e11d48;
             --border-color: #e7e5e4;
         }
 
@@ -2652,6 +2656,12 @@
                             <button id="btn-toggle-3d" class="btn" style="padding: 4px 12px; font-size: 0.75rem; height: auto; line-height: normal;">Toggle 3D Mode</button>
                         </div>
                     </div>
+                    <div id="mmr-legend" style="display: flex; gap: 16px; align-items: center; font-size: 0.72rem; color: var(--text-muted); margin-top: 10px; font-family: monospace; flex-wrap: wrap;">
+                        <span><span style="display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #38bdf8; margin-right: 4px; vertical-align: middle;"></span>Leaf (Commitment / UTXO)</span>
+                        <span><span style="display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #a78bfa; margin-right: 4px; vertical-align: middle;"></span>Internal / Peak</span>
+                        <span><span style="display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #10b981; margin-right: 4px; vertical-align: middle;"></span>Proof Highlight</span>
+                        <span><span style="display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--accent-drift, #f43f5e); margin-right: 4px; vertical-align: middle;"></span>Drift Certificate (OP_APPLY_DRIFT_CERT)</span>
+                    </div>
                     <div class="canvas-container" style="margin-top: 12px;">
                         <canvas id="mmr-canvas" width="1150" height="450"></canvas>
                     </div>
@@ -3293,6 +3303,7 @@
                         <label class="checkbox-label"><input type="checkbox" class="tx-type-filter" value="OP_UNSTAKE"> Unstake</label>
                         <label class="checkbox-label"><input type="checkbox" class="tx-type-filter" value="FEE_RECYCLED"> Fee Recycled</label>
                         <label class="checkbox-label"><input type="checkbox" class="tx-type-filter" value="SPENT"> Spent</label>
+                        <label class="checkbox-label"><input type="checkbox" class="tx-type-filter" value="OP_APPLY_DRIFT_CERT"> Drift Certificate</label>
                     </div>
                 </div>
             </div>
