@@ -2113,13 +2113,7 @@ function handleBuildDriftCertAudit(requestId, shots, beaconSeed, histogram, circ
         if (!builderPtr) throw new Error("WASM builder creation failed");
 
         if (receipt) {
-            const txIdBytes = hexToBytes(receipt.txIdHex, 32);
-            txIdPtr = wasmInstance._wasm_malloc(32);
-            getLiveHeapU8().set(txIdBytes, txIdPtr);
-            const challengeHashBytes = hexToBytes(receipt.challengeHashHex, 32);
-            challengeHashPtr = wasmInstance._wasm_malloc(32);
-            getLiveHeapU8().set(challengeHashBytes, challengeHashPtr);
-            wasmInstance._wasm_builder_set_payment_receipt(builderPtr, receipt.paymentType, txIdPtr, challengeHashPtr, BigInt(receipt.rateLockId));
+            appendPaymentReceiptWire(builderPtr, receipt.paymentType, receipt.txIdHex, receipt.challengeHashHex, receipt.rateLockId);
         }
 
         const bSeed = (beaconSeed && beaconSeed.length === 32) ? beaconSeed : new Uint8Array(32);
