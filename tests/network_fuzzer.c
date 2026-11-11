@@ -1265,7 +1265,7 @@ size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size, size_t MaxSize, unsig
                     hdr->payload_len = 0;
                 } else if (cur_method == 0x0003 && max_payload >= DILITHIUM_SIGNATURE_LEN + 1) { // SubmitTx
                     hdr->flags |= SCL_RPC_FLAG_SIGNED;
-                    uint8_t op_type = (Seed >> 4) % 7;
+                    uint8_t op_type = (Seed >> 4) % 8;
                     size_t op_offset = 5 + sizeof(SclRpcHeader) + err_len + DILITHIUM_SIGNATURE_LEN;
                     if (chunk_len > op_offset) {
                         ptr[op_offset] = op_type;
