@@ -2017,6 +2017,7 @@ function handleBuildQuantumTvdAudit(requestId, shots, beaconSeed, circuitBytes, 
     let outLenPtr = 0;
     let builderPtr = 0;
     let txIdPtr = 0;
+    let challengeHashPtr = 0;
     let argsPtr = 0;
 
     try {
@@ -2028,7 +2029,10 @@ function handleBuildQuantumTvdAudit(requestId, shots, beaconSeed, circuitBytes, 
             const txIdBytes = hexToBytes(receipt.txIdHex, 32);
             txIdPtr = wasmInstance._wasm_malloc(32);
             getLiveHeapU8().set(txIdBytes, txIdPtr);
-            wasmInstance._wasm_builder_set_payment_receipt(builderPtr, receipt.paymentType, txIdPtr, BigInt(receipt.rateLockId));
+            const challengeHashBytes = hexToBytes(receipt.challengeHashHex, 32);
+            challengeHashPtr = wasmInstance._wasm_malloc(32);
+            getLiveHeapU8().set(challengeHashBytes, challengeHashPtr);
+            wasmInstance._wasm_builder_set_payment_receipt(builderPtr, receipt.paymentType, txIdPtr, challengeHashPtr, BigInt(receipt.rateLockId));
         }
 
         const bSeed = (beaconSeed && beaconSeed.length === 32) ? beaconSeed : new Uint8Array(32);
@@ -2066,6 +2070,7 @@ function handleBuildQuantumTvdAudit(requestId, shots, beaconSeed, circuitBytes, 
         postMessage({ type: 'ERROR', message: 'Build quantum TVD audit failed: ' + e.message });
     } finally {
         if (txIdPtr) wasmInstance._wasm_free(txIdPtr);
+        if (challengeHashPtr) wasmInstance._wasm_free(challengeHashPtr);
         if (argsPtr) wasmInstance._wasm_free(argsPtr);
         if (outFramePtr) wasmInstance._wasm_free(outFramePtr);
         if (outLenPtr) wasmInstance._wasm_free(outLenPtr);
@@ -2085,7 +2090,7 @@ function handleBuildQuantumTvdAudit(requestId, shots, beaconSeed, circuitBytes, 
  * @param {Uint8Array|null} beaconSeed 32-byte DKG consensus beacon seed.
  * @param {Uint8Array|null} histogram 512-byte wire histogram (128 x u32 BE).
  * @param {Uint8Array|null} circuitBytes Optional serialized OpenQASM circuit byte stream.
- * @param {Object|null} receipt Optional SCL402 payment receipt {paymentType, txIdHex, rateLockId}.
+ * @param {Object|null} receipt Optional SCL402 payment receipt {paymentType, txIdHex, rateLockId, challengeHashHex}.
  * @return {void}
  * @complexity Time: O(circuit_length), Space: O(1).
  */
@@ -2100,6 +2105,7 @@ function handleBuildDriftCertAudit(requestId, shots, beaconSeed, histogram, circ
     let outLenPtr = 0;
     let builderPtr = 0;
     let txIdPtr = 0;
+    let challengeHashPtr = 0;
     let argsPtr = 0;
 
     try {
@@ -2122,7 +2128,10 @@ function handleBuildDriftCertAudit(requestId, shots, beaconSeed, histogram, circ
             const txIdBytes = hexToBytes(receipt.txIdHex, 32);
             txIdPtr = wasmInstance._wasm_malloc(32);
             getLiveHeapU8().set(txIdBytes, txIdPtr);
-            wasmInstance._wasm_builder_set_payment_receipt(builderPtr, receipt.paymentType, txIdPtr, BigInt(receipt.rateLockId));
+            const challengeHashBytes = hexToBytes(receipt.challengeHashHex, 32);
+            challengeHashPtr = wasmInstance._wasm_malloc(32);
+            getLiveHeapU8().set(challengeHashBytes, challengeHashPtr);
+            wasmInstance._wasm_builder_set_payment_receipt(builderPtr, receipt.paymentType, txIdPtr, challengeHashPtr, BigInt(receipt.rateLockId));
         }
 
         const bSeed = (beaconSeed && beaconSeed.length === 32) ? beaconSeed : new Uint8Array(32);
@@ -2163,6 +2172,7 @@ function handleBuildDriftCertAudit(requestId, shots, beaconSeed, histogram, circ
         postMessage({ type: 'ERROR', message: 'Build drift certificate audit failed: ' + e.message });
     } finally {
         if (txIdPtr) wasmInstance._wasm_free(txIdPtr);
+        if (challengeHashPtr) wasmInstance._wasm_free(challengeHashPtr);
         if (argsPtr) wasmInstance._wasm_free(argsPtr);
         if (outFramePtr) wasmInstance._wasm_free(outFramePtr);
         if (outLenPtr) wasmInstance._wasm_free(outLenPtr);
