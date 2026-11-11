@@ -715,12 +715,18 @@ typedef struct __attribute__((aligned(1))) {
 /**
  * @struct SclRpcPaymentReceipt
  * @brief Proof of payment attached by caller when replaying a metered request.
- * Total size: 1 + 32 + 8 = 41 bytes.
+ * @details Field bytes: 1 + 32 + 8 + 32 = 73; 80 bytes on the wire under natural
+ *          alignment (the 64-bit fields keep their historical offsets — rate lock
+ *          id at 40, challenge hash appended at 48). The trailing
+ *          challenge_hash is the settlement binding: replay-side verification
+ *          resolves it against the server-side challenge registry and enforces
+ *          the challenge TTL.
  */
 typedef struct __attribute__((aligned(1))) {
     uint8_t  payment_type;             /** 0x01 = OP_TRANSFER_POINTER, 0x02 = OP_REDEEM_CENTINEL. */
     uint8_t  tx_id[COIN_ID_LEN];       /** Transaction ID or ZK Nullifier confirming payment. */
-    uint64_t price_rate_lock_id;       /** Echos challenge price_rate_lock_id (Big-Endian). */
+    uint64_t price_rate_lock_id;       /** Echos challenge price_rate_lock_id (Big-Endian, informational). */
+    uint8_t  challenge_hash[32];       /** SHA-256 challenge_hash of the settled SCL402 challenge (registry key). */
 } SclRpcPaymentReceipt;
 
 /* ============================================================================ */
@@ -966,6 +972,11 @@ typedef struct {
     int spent;                           /** Spending status: 0=Unspent, 1=Spent, 2=Fee pool recycled. */
     int staked;                          /** Staking status: 0=Liquid, 1=Locked under threshold stake. */
 } Pointer;
+
+/* Load-bearing layout lock: every wire offset (serialized operations, MMR
+ * leaf encodings) and the libFuzzer seed generators hard-code this exact
+ * 152-byte layout (32+32+8+8+32+32+4+4, natural alignment). */
+static_assert(sizeof(Pointer) == 152, "Pointer must be exactly 152 bytes: serialized operation offsets and fuzzer seed encodings are hard-wired to this layout");
 
 /**
  * @struct MintData
@@ -1640,6 +1651,37 @@ typedef struct {
 } WorkStealingQueue;
 
 /**
+ * @struct Scl402ChallengeEntry
+ * @brief Server-side record of one issued SCL402 payment challenge.
+ * @details Keyed by the 32-byte challenge_hash (a salted SHA-256, so registry
+ *          keys are unguessable, unlike the informational price_rate_lock_id).
+ *          The amount, fee recipient, and expiry are locked at issuance so
+ *          replay-side verification can enforce the challenge TTL — previously
+ *          unenforced — and bind settlements to the issuance-time quote.
+ */
+typedef struct {
+    uint8_t  challenge_hash[COIN_ID_LEN]; /** Registry key: SHA256(req_id || method_id || salt). */
+    uint64_t amount_subunits;             /** Required payment quoted at challenge issuance (host order). */
+    uint64_t valid_until_ms;               /** Expiry in milliseconds on the issuance clock (host order). */
+    uint8_t  recipient_address[USER_ID_LEN]; /** Fee recipient User ID locked at issuance. */
+    uint8_t  in_use;                       /** 1 = slot occupied; 0 = free (zero-initialized with State). */
+} Scl402ChallengeEntry;
+
+/**
+ * @struct Scl402ChallengeRegistry
+ * @brief Bounded server-side registry of live SCL402 challenges.
+ * @details Flat slot array guarded by @ref mutex (O(capacity) scan per
+ *          resolve/insert is negligible at 402 challenge rates). Expired
+ *          entries are reclaimed opportunistically; a full table evicts the
+ *          soonest-expiring entry, which only forces the client to re-quote.
+ */
+typedef struct {
+    Scl402ChallengeEntry entries[SCL402_CHALLENGE_REGISTRY_CAP]; /** Open slot array (zeroed with State). */
+    size_t               count;    /** Occupied slot count (bounded by capacity). */
+    pthread_mutex_t      mutex;    /** Serializes issue/resolve across RPC workers and the WS bridge. */
+} Scl402ChallengeRegistry;
+
+/**
  * @struct SclRpcEngine
  * @brief Multi-threaded execution engine processing inbound L5 RPC commands.
  */
@@ -1655,6 +1697,7 @@ typedef struct {
     _Atomic(uint64_t)  method_requests_ok[16];   /** Per-method success counters (incl. 0x000D drift audits). */
     _Atomic(uint64_t)  method_requests_err[16];  /** Per-method error counters (incl. 0x000D drift audits). */
     _Atomic(uint64_t)  method_latency[16];       /** Per-method cumulative latency (incl. 0x000D drift audits). */
+    Scl402ChallengeRegistry scl402_registry;     /** Server-side SCL402 challenge registry (TTL-authoritative receipt binding). */
 } SclRpcEngine;
 
 /**
