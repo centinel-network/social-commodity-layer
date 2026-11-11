@@ -1953,6 +1953,27 @@ void *recreation_worker_loop(void *vargs) {
                 success = create_and_broadcast_transfer(args->state, args->recipient_pubkey, args->amount, true);
             } else if (args->is_stake) {
                 success = create_and_broadcast_stake(args->state, args->amount, true);
+            } else if (args->is_drift_cert) {
+                /* Re-anchor a deferred drift certificate from the persisted
+                 * identity core. ApplyDriftCertData is heap-allocated (~4.4 MB
+                 * at MAX_INPUTS=1024) to keep the worker stack bounded; the
+                 * builder re-selects funding pointers, recomputes the digest
+                 * chain, and re-signs under the node wallet. */
+                ApplyDriftCertData *retry_cert = calloc(1, sizeof(ApplyDriftCertData));
+                if (retry_cert) {
+                    memcpy(retry_cert->circuit_hash, args->circuit_hash, 32);
+                    retry_cert->tvd_scaled = args->tvd_scaled;
+                    retry_cert->shots = args->shots;
+                    retry_cert->status = args->status;
+                    memcpy(retry_cert->commitment_root, args->commitment_root, 32);
+                    retry_cert->timestamp_us = args->timestamp_us;
+                    memcpy(retry_cert->recipient_pubkey, args->recipient_pubkey, PUBKEY_LEN);
+                    retry_cert->amount = args->amount;
+                    success = create_and_broadcast_apply_drift_cert(args->state, retry_cert, true, NULL);
+                    free(retry_cert);
+                } else {
+                    fprintf(stderr, "[Recreation] Memory allocation failed for drift certificate retry, aborting.\n");
+                }
             } else {
                 success = create_and_broadcast_unstake(args->state, args->amount, true);
             }
@@ -1969,7 +1990,10 @@ void *recreation_worker_loop(void *vargs) {
                 uint64_t fee = calculate_fee(args->amount, !args->is_transfer);
                 uint64_t total_amount = args->amount + fee;
                 
-                if (args->is_transfer || args->is_stake) {
+                if (args->is_transfer || args->is_stake || args->is_drift_cert) {
+                    /* Transfers, stakes, and drift-certificate anchors all spend
+                     * liquid subunits (anchor fee is charged at the halved
+                     * staking-grade rate via !is_transfer above). */
                     uint64_t current = atomic_load(&args->state->scheduled_consumed_subunits);
                     if (current >= total_amount) atomic_fetch_sub(&args->state->scheduled_consumed_subunits, total_amount);
                     else atomic_store(&args->state->scheduled_consumed_subunits, 0);
