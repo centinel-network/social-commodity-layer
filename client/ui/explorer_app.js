@@ -457,7 +457,7 @@ class RealMmrTree {
      * @return {void}
      * @complexity Time: O(log N) amortized peak merges, Space: O(1) amortized growth.
      */
-    addLeafHash(hashBytes) {
+    addLeafHash(hashBytes, opType) {
         const position = this.nodes.length;
         const node = {
             hash: hashBytes,
@@ -465,7 +465,8 @@ class RealMmrTree {
             height: 0,
             parent: -1,
             leftChild: -1,
-            rightChild: -1
+            rightChild: -1,
+            opType: (opType === undefined ? null : opType)
         };
         this.nodes.push(node);
         this.peaks.push(position);
@@ -901,7 +902,7 @@ document.addEventListener('DOMContentLoaded', () => {
         } else {
             // 2. Fallback to MMR accumulator leaves minus known nullifiers during initial sync
             const mmrLeaves = (typeof mmrTree !== 'undefined' && mmrTree.nodes)
-                ? mmrTree.nodes.filter(n => n.height === 0).length
+                ? mmrTree.nodes.filter(n => n.height === 0 && n.opType !== 7).length
                 : 0;
             const spentCount = window.globalSpentNullifiers ? window.globalSpentNullifiers.size : 0;
             unspentCommitments = Math.max(0, mmrLeaves - spentCount);
@@ -2080,13 +2081,19 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     client.onBlockReceived = (data) => {
-        const { blockNumber, commitments } = data;
+        const { blockNumber, commitments, opTypes, driftCertTxIds } = data;
         if (commitments && commitments.length > 0) {
             if (!window.confirmedTxIds) window.confirmedTxIds = new Set();
             commitments.forEach(c => {
                 const hexC = c.map(b => b.toString(16).padStart(2, '0')).join('');
                 window.confirmedTxIds.add(hexC);
             });
+        }
+        /* Drift certificate anchors confirm by their authoritative on-chain
+         * cert_tx_id (the leaf itself is hash_leaf(cert_tx_id, tvd_scaled)). */
+        if (driftCertTxIds && driftCertTxIds.length > 0) {
+            if (!window.confirmedTxIds) window.confirmedTxIds = new Set();
+            driftCertTxIds.forEach(hexId => window.confirmedTxIds.add(hexId));
         }
 
         // Reset the block-sync watchdog timer to prevent premature timeouts during active stream ingestion
@@ -2131,13 +2138,13 @@ document.addEventListener('DOMContentLoaded', () => {
             renderer.setNodes([]);
             advanced = true;
         } else if (blockNumber > syncedBlockHeight) {
-            pendingBlocks.set(blockNumber, commitments);
+            pendingBlocks.set(blockNumber, { commitments: commitments, opTypes: opTypes || [] });
         }
 
         while (pendingBlocks.has(syncedBlockHeight + 1)) {
             const nextBlockNum = syncedBlockHeight + 1;
-            const nextCommitments = pendingBlocks.get(nextBlockNum);
-            nextCommitments.forEach(c => mmrTree.addLeafHash(new Uint8Array(c)));
+            const nextBlock = pendingBlocks.get(nextBlockNum);
+            nextBlock.commitments.forEach((c, i) => mmrTree.addLeafHash(new Uint8Array(c), nextBlock.opTypes[i]));
             syncedBlockHeight = nextBlockNum;
             pendingBlocks.delete(nextBlockNum);
             advanced = true;
@@ -2356,7 +2363,29 @@ document.addEventListener('DOMContentLoaded', () => {
         const opClassColor = isLight ? '#7c3aed' : '#a78bfa';
 
         let parsedDetailsHtml = '';
-        if (parsedTx && typeString !== 'OP_SUBMIT_VALUATION') {
+        if (parsedTx && typeString === 'OP_APPLY_DRIFT_CERT') {
+            const d = parsedTx.driftCert;
+            const driftStatusLabels = ['Fidelity Optimal', 'Drift Tolerable', 'Decoherence Exceeded', 'Tampering Suspected'];
+            if (d) {
+                parsedDetailsHtml = `
+                <div style="font-size: 0.75rem; margin-top: 4px; color: var(--text-main);">
+                    🛡️ Drift Certificate Anchor — Circuit SHA-256: <span style="font-family: monospace; color: var(--accent-drift, #f43f5e);">${escapeHTML(d.circuitHashHex.substring(0, 32))}…</span>
+                </div>
+                <div style="font-size: 0.7rem; color: var(--text-muted); font-family: monospace; margin-top: 2px;">
+                    • TVD: ${(Number(d.tvdScaled) / 1e9).toFixed(6)} | Shots: ${escapeHTML(String(d.shots))} | Classification: ${escapeHTML(driftStatusLabels[d.status] || ('code ' + d.status))}
+                </div>
+                <div style="font-size: 0.7rem; color: var(--text-muted); font-family: monospace; margin-top: 1px;">
+                    • Certificate Digest: ${escapeHTML(d.certDigestHex.substring(0, 32))}… | Anchor Fee: ¢${formatScl(Number(parsedTx.amount) / 160000000, 4)}
+                </div>
+                `;
+            } else {
+                parsedDetailsHtml = `
+                <div style="font-size: 0.75rem; margin-top: 4px; color: var(--text-main);">
+                    🛡️ Drift Certificate Anchor accepted into the mempool — awaiting block inclusion.
+                </div>
+                `;
+            }
+        } else if (parsedTx && typeString !== 'OP_SUBMIT_VALUATION') {
             const amountScl = formatScl(Number(parsedTx.amount) / 160000000, 4);
             parsedDetailsHtml = `
                 <div style="font-size: 0.75rem; margin-top: 4px; color: var(--text-main);">
@@ -2533,7 +2562,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 item.innerHTML = `
                     <span class="match-method" style="color: ${isDeepStorage ? 'var(--accent-red)' : 'var(--accent-green)'}">[MMR Inclusion Audit Proof]</span>
-                    <span class="match-hash">Leaf Node #${node.position} (${isDeepStorage ? 'Deep Storage' : 'Standard'} UTXO)</span>
+                    <span class="match-hash">Leaf Node #${node.position}${node.opType === 7 ? ' (Drift Certificate Anchor)' : ` (${isDeepStorage ? 'Deep Storage' : 'Standard'} UTXO)`}</span>
                     <div style="font-size: 0.75rem; margin-top: 4px; color: var(--text-main); font-weight: bold;">
                         Total Sibling Steps: ${proofPath.length} | Peak Count: ${peaks.length}
                     </div>
@@ -5421,6 +5450,8 @@ bootstrap_nodes=${cfg.bootstrap_nodes}
                 blockchainStore.transactions.push({
                     txId: txId || parsedTx.txIdHex,
                     typeString: typeString,
+                    circuitHash: (parsedTx.driftCert ? parsedTx.driftCert.circuitHashHex : null),
+                    certDigest: (parsedTx.driftCert ? parsedTx.driftCert.certDigestHex : null),
                     amount: parsedTx.amount,
                     recipientPubkeyHex: parsedTx.recipientPubkeyHex,
                     senderPubkeyHex: parsedTx.senderPubkeyHex,
@@ -5541,7 +5572,8 @@ bootstrap_nodes=${cfg.bootstrap_nodes}
         const isFiltering = selectedTypes.size > 0 || !!coinQuery || !!pointerQuery || !!userQuery;
         const filteredTxs = isFiltering ? blockchainStore.transactions.filter(tx => {
             if (selectedTypes.size > 0 && !selectedTypes.has(tx.typeString)) return false;
-            if (coinQuery && !tx.parentCoinId?.toLowerCase().includes(coinQuery) && !tx.txId?.toLowerCase().includes(coinQuery)) return false;
+            if (coinQuery && !tx.parentCoinId?.toLowerCase().includes(coinQuery) && !tx.txId?.toLowerCase().includes(coinQuery)
+                && !tx.circuitHash?.toLowerCase().includes(coinQuery) && !tx.certDigest?.toLowerCase().includes(coinQuery)) return false;
             if (pointerQuery && !tx.pointerId?.toLowerCase().includes(pointerQuery)) return false;
             if (userQuery) {
                 const sender = (tx.senderPubkeyHex || '').toLowerCase();
@@ -5563,7 +5595,7 @@ bootstrap_nodes=${cfg.bootstrap_nodes}
                 html += `
                     <div class="blockchain-coin-card" style="border-left: 4px solid var(--accent-green);">
                         <div style="display: flex; justify-content: space-between; font-family: monospace; font-size: 0.8rem; flex-wrap: wrap; gap: 8px;">
-                            <span>Op Type: <strong style="color: ${opTypeColor};">${tx.typeString}</strong></span>
+                            <span>Op Type: <strong style="color: ${tx.typeString === 'OP_APPLY_DRIFT_CERT' ? 'var(--accent-drift, #f43f5e)' : opTypeColor};">${tx.typeString}</strong></span>
                             <span>Tx ID: <strong style="color: var(--text-main);">${tx.txId}</strong></span>
                             <span>Amount: <strong style="color: var(--accent-green);">¢${sclAmt}</strong></span>
                         </div>
