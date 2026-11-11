@@ -438,6 +438,13 @@
             return;
         }
 
+        /* Same custodial-transport fix as the SCL402 settlement: the node's
+         * OP_APPLY_DRIFT_CERT handler re-selects inputs and re-signs, so the
+         * serialized input list is dead weight that inflates the SubmitTx
+         * frame towards the load-balancer drop threshold. Ship exactly one
+         * structural input (the largest, first in the greedy selection). */
+        const anchorInputs = [selectedInputs[0]];
+
         const creds = window.resolveWalletCredentials();
         if (!creds || !creds.privKeyHex || !creds.pubKeyHex) {
             document.getElementById('drift-anchor-status').textContent = 'Wallet credentials unavailable (unlock the vault).';
@@ -462,7 +469,7 @@
             senderPubkeyHex: creds.pubKeyHex,
             privkeyHex: creds.privKeyHex,
             amountSubunits: feePlusTx.toString(),
-            inputs: selectedInputs
+            inputs: anchorInputs
         });
     }
 
