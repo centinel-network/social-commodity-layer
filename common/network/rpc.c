@@ -304,6 +304,29 @@ bool scl402_challenge_resolve(State *state, const uint8_t challenge_hash[COIN_ID
     return found;
 }
 
+bool scl402_challenge_consume(State *state, const uint8_t challenge_hash[COIN_ID_LEN]) {
+    if (!state || !challenge_hash) return false;
+
+    Scl402ChallengeRegistry *reg = &state->rpc_engine.scl402_registry;
+
+    pthread_mutex_lock(&reg->mutex);
+    for (size_t i = 0; i < SCL402_CHALLENGE_REGISTRY_CAP; i++) {
+        if (!reg->entries[i].in_use) continue;
+        if (memcmp(reg->entries[i].challenge_hash, challenge_hash, COIN_ID_LEN) != 0) continue;
+        /* Single-use settlement: reclaim the slot so the same challenge_hash
+         * cannot settle a second metered call. Only invoked after a receipt
+         * has actually verified, so failed attempts (races against mempool
+         * inclusion) never burn the challenge — the TTL-only registry's
+         * double-billing tolerance is preserved for unsettled retries. */
+        reg->entries[i].in_use = 0;
+        if (reg->count > 0) reg->count--;
+        pthread_mutex_unlock(&reg->mutex);
+        return true;
+    }
+    pthread_mutex_unlock(&reg->mutex);
+    return false;
+}
+
 static void send_rpc_payment_required(State *state, SclConnection *conn, uint16_t method_id, uint64_t req_id, uint64_t required_subunits) {
     if (!conn) return;
 
@@ -771,6 +794,15 @@ void handle_rpc_request(State *state, RpcTask *task) {
                 }
                 pthread_rwlock_unlock(&state->bc.rwlock);
             }
+        }
+
+        /* Single-use challenges (hardening): a receipt that actually settled
+         * its challenge consumes the registry entry, so a captured
+         * challenge_hash cannot settle a second metered call before TTL
+         * expiry. Unsettled attempts (races against mempool inclusion)
+         * leave the entry live — no double-billing. */
+        if (payment_verified && scl402_challenge_live) {
+            scl402_challenge_consume(state, receipt->challenge_hash);
         }
 
         // Remaining args length excluding signature and receipt
@@ -1697,9 +1729,20 @@ void handle_rpc_request(State *state, RpcTask *task) {
             break;
         }
         case 0x000B: { // Autopilot Config & Status
-            // Update autopilot configuration if inbound parameters were provided
-            const uint8_t *ap_payload = msg->payload + sizeof(SclRpcHeader) + hdr.error_msg_len;
-            if (hdr.payload_len >= 9) {
+            /* Signed-frame alignment (parity with 0x0003/0x000A/0x000D): true
+             * method args begin at prefix + sig_len. The previous bare-prefix
+             * parse read a signed frame's signature bytes as autopilot config.
+             * Exact-payload_len guard (parity with 0x0001/0x0007): a 9-byte
+             * config update or a 0-byte status query; anything else —
+             * including trailing garbage — is rejected. */
+            size_t ap_sig_len = (hdr.flags & SCL_RPC_FLAG_SIGNED) ? DILITHIUM_SIGNATURE_LEN : 0;
+            if (hdr.payload_len < ap_sig_len) {
+                send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id, SCL_RPC_STATUS_INVALID_ARGS, "Signed payload length mismatch");
+                break;
+            }
+            const uint8_t *ap_payload = msg->payload + sizeof(SclRpcHeader) + hdr.error_msg_len + ap_sig_len;
+            uint32_t ap_args_len = hdr.payload_len - (uint32_t)ap_sig_len;
+            if (ap_args_len == 9) {
                 bool enable = (ap_payload[0] != 0);
                 
                 uint32_t val_per_hr_raw;
@@ -1722,6 +1765,9 @@ void handle_rpc_request(State *state, RpcTask *task) {
                 } else {
                     stop_autopilot_thread(state);
                 }
+            } else if (ap_args_len != 0) {
+                send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id, SCL_RPC_STATUS_INVALID_ARGS, "Invalid args for Autopilot");
+                break;
             }
 
             // Assemble autopilot status telemetry: running flag, rates, tier ceiling, and timestamp
