@@ -1061,6 +1061,8 @@ int process_block_data(const Block *block, uint8_t *out_buf, EVP_MD_CTX *ctx, bo
                     required_size += op->data.unstake.num_inputs * 8000;
                 } else if (op->type == OP_MINT_COIN) {
                     required_size += 55000;
+                } else if (op->type == OP_APPLY_DRIFT_CERT) {
+                    required_size += op->data.apply_drift_cert.num_inputs * 8000;
                 }
                             
                 target_buf = arena_alloc(required_size);
