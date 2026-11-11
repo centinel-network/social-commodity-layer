@@ -533,6 +533,67 @@ static int ws_encode_frame(const uint8_t *payload, size_t len, uint8_t *out_buf,
 }
 
 /* ============================================================================ */
+/* SECTION 2b: SCL402 IDEMPOTENT SETTLEMENT MEMO                               */
+/* ============================================================================ */
+
+/** @brief Cached SubmitTx custodial echo: request id + authoritative identity. */
+typedef struct {
+    uint64_t request_id;            /** SubmitTx request id of the settlement / anchor intent. */
+    uint8_t  op_type;               /** 0x02 = OP_TRANSFER_POINTER settlement, 0x07 = OP_APPLY_DRIFT_CERT anchor. */
+    uint8_t  tx_id[COIN_ID_LEN];    /** Authoritative mempool tx id echoed for that request. */
+    bool     used;                  /** Slot occupancy flag. */
+} SettlementMemoEntry;
+
+/** @brief Ring of recently echoed custodial settlements. The browser
+ *  retransmits an unacknowledged SubmitTx intent every 5 s (at-least-once
+ *  delivery across the scl-ws-map load balancer / TLS front ends / proxies);
+ *  64 entries comfortably span a full 20-attempt retransmission window plus
+ *  concurrent browser sessions. */
+static SettlementMemoEntry g_settlement_memos[64];
+static size_t g_settlement_memo_cursor = 0;
+static pthread_mutex_t g_settlement_memo_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/**
+ * @brief Looks up the cached custodial echo for a SubmitTx request id.
+ * @param[in] request_id SubmitTx request id from the RPC header.
+ * @param[out] op_type Operation discriminator of the memoized echo.
+ * @param[out] tx_id Authoritative mempool tx id previously echoed.
+ * @return true when this request id was already executed (echo is replayable).
+ */
+static bool settlement_memo_lookup(uint64_t request_id, uint8_t *op_type, uint8_t *tx_id) {
+    bool found = false;
+    pthread_mutex_lock(&g_settlement_memo_mutex);
+    for (size_t i = 0; i < sizeof(g_settlement_memos) / sizeof(g_settlement_memos[0]); i++) {
+        if (g_settlement_memos[i].used && g_settlement_memos[i].request_id == request_id) {
+            *op_type = g_settlement_memos[i].op_type;
+            memcpy(tx_id, g_settlement_memos[i].tx_id, COIN_ID_LEN);
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_settlement_memo_mutex);
+    return found;
+}
+
+/**
+ * @brief Records the authoritative custodial identity produced for a SubmitTx request id.
+ * @param[in] request_id SubmitTx request id from the RPC header.
+ * @param[in] op_type Operation discriminator (0x02 settlement / 0x07 anchor).
+ * @param[in] tx_id Authoritative mempool tx id to re-echo on retransmission.
+ */
+static void settlement_memo_store(uint64_t request_id, uint8_t op_type, const uint8_t *tx_id) {
+    pthread_mutex_lock(&g_settlement_memo_mutex);
+    SettlementMemoEntry *slot = &g_settlement_memos[g_settlement_memo_cursor];
+    slot->used = true;
+    slot->request_id = request_id;
+    slot->op_type = op_type;
+    memcpy(slot->tx_id, tx_id, COIN_ID_LEN);
+    g_settlement_memo_cursor = (g_settlement_memo_cursor + 1) %
+                               (sizeof(g_settlement_memos) / sizeof(g_settlement_memos[0]));
+    pthread_mutex_unlock(&g_settlement_memo_mutex);
+}
+
+/* ============================================================================ */
 /* SECTION 3: DIRECT LOCAL RPC DISPATCHING & RESPONSE SYNTHESIS                 */
 /* ============================================================================ */
 
@@ -1234,17 +1295,25 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                         }
 
                         if (op->type == OP_TRANSFER_POINTER) {
-                            /* SCL402 settlement: the browser cannot build state-root
-                             * MMR inclusion proofs, so the node re-selects inputs and
-                             * re-signs custodially — but it must (a) debit the wallet
-                             * that signed this intent whenever the node holds its key
-                             * (operator wallet or the published testnet identity
-                             * wallet), and (b) echo the resulting operation so the
-                             * client's payment receipt references the real mempool
-                             * tx id. The previous implementation silently discarded
-                             * the client tx and returned an empty OK, so every
-                             * receipt missed and the node re-issued the 402
-                             * challenge forever (Run Audit never completed). */
+                            /* Idempotent retransmission (SCL402 at-least-once
+                             * delivery): the browser re-sends the identical
+                             * SubmitTx intent every 5 s until the settlement
+                             * echo arrives, because the scl-ws-map load balancer
+                             * / TLS front ends / proxies can silently drop the
+                             * frame in transit. If this request id already
+                             * executed, replay the cached authoritative tx id
+                             * instead of running the custodial transfer a second
+                             * time — one settlement, billed exactly once. */
+                            uint8_t memo_op_type = 0;
+                            uint8_t memo_tx_id[COIN_ID_LEN];
+                            if (settlement_memo_lookup(req_id, &memo_op_type, memo_tx_id) && memo_op_type == 0x02) {
+                                resp_buf[32] = 0x02;
+                                memcpy(resp_buf + 33, memo_tx_id, COIN_ID_LEN);
+                                actual_payload_len = 1 + COIN_ID_LEN;
+                                free(op);
+                                break;
+                            }
+
                             UserWallet funding_snapshot;
                             const UserWallet *funding_wallet = &state->user_wallet;
 
@@ -1275,6 +1344,7 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                                 resp_buf[32] = 0x02;
                                 memcpy(resp_buf + 33, settled_tx_id, COIN_ID_LEN);
                                 actual_payload_len = 1 + COIN_ID_LEN;
+                                settlement_memo_store(req_id, 0x02, settled_tx_id);
                             } else if (added == 2) {
                                 rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
                                 const char *err_msg = "Settlement deferred: the funding wallet's inputs are locked by a pending mempool operation. Retry after the next block.";
@@ -1307,20 +1377,26 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                             free(op);
                             break;
                         } else if (op->type == OP_APPLY_DRIFT_CERT) {
-                            /* Enterprise drift-certificate anchoring — parity with the P2P
-                             * engine (rpc.c case 0x0003) and the SCL402 settlement model:
-                             * the browser cannot build state-root MMR inclusion proofs, so
-                             * the node re-selects inputs and re-signs custodially, then
-                             * echoes the authoritative on-chain identity —
-                             * [0x07 OP_APPLY_DRIFT_CERT][32-byte cert_tx_id] (33 bytes) —
-                             * so the client polls block inclusion against the real
-                             * operation id instead of its locally computed guess. */
                             uint8_t anchored_cert_tx_id[COIN_ID_LEN];
+                            /* Idempotent retransmission (mirror of the settlement
+                             * path above): a re-sent anchoring intent re-receives
+                             * the cached cert tx id instead of re-anchoring and
+                             * double-charging the anchor fee. */
+                            uint8_t memo_op_type = 0;
+                            uint8_t memo_tx_id[COIN_ID_LEN];
+                            if (settlement_memo_lookup(req_id, &memo_op_type, memo_tx_id) && memo_op_type == 0x07) {
+                                resp_buf[32] = 0x07;
+                                memcpy(resp_buf + 33, memo_tx_id, COIN_ID_LEN);
+                                actual_payload_len = 1 + COIN_ID_LEN;
+                                free(op);
+                                break;
+                            }
                             int dc_added = create_and_broadcast_apply_drift_cert(state, &op->data.apply_drift_cert, false, anchored_cert_tx_id);
                             if (dc_added == 0) {
                                 resp_buf[32] = 0x07;
                                 memcpy(resp_buf + 33, anchored_cert_tx_id, COIN_ID_LEN);
                                 actual_payload_len = 1 + COIN_ID_LEN;
+                                settlement_memo_store(req_id, 0x07, anchored_cert_tx_id);
                             } else if (dc_added == 2) {
                                 /* Inputs locked: persist the certificate identity
                                  * core and let the background recreation worker
