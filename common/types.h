@@ -1339,7 +1339,7 @@ typedef struct {
     uint64_t tvd_scaled;                     /** Nano-scale fixed-point TVD in [0, 10^9]. */
     uint32_t shots;                          /** Measurement shot budget evaluated. */
     uint32_t status;                         /** Drift classification (QuantumQpuDriftStatus semantics: 0..3). */
-    uint8_t commitment_root[32];             /** SHA-256 of the BDLOP homomorphic TVD commitment. */
+    uint8_t commitment_root[32];             /** Raw first 256 bits of the BDLOP commitment c1 (NOT a hash): the client anchors cert->tvd_commitment.c1[0..31] and the node stores it verbatim. */
     uint64_t timestamp_us;                   /** Microsecond attestation timestamp. */
     uint8_t recipient_pubkey[PUBKEY_LEN];    /** Enterprise client's public key. */
     uint8_t sender_pubkey[PUBKEY_LEN];       /** Paying wallet's public key. */
@@ -1895,7 +1895,19 @@ typedef struct {
     uint64_t amount;                      /** Transfer or stake amount in subunits. */
     bool is_stake;                        /** True for stake, false for unstake. */
     bool is_transfer;                     /** True if operation is a standard transfer. */
+    bool is_drift_cert;                   /** True if operation is an OP_APPLY_DRIFT_CERT anchor. */
     uint8_t recipient_pubkey[PUBKEY_LEN]; /** Recipient public key. */
+    /* OP_APPLY_DRIFT_CERT identity core. create_and_broadcast_apply_drift_cert
+     * re-selects funding pointers, regenerates MMR proofs, and re-signs under
+     * the node wallet, so only the certificate digest fields and fee need
+     * persisting here — never the full ~425 KB ApplyDriftCertData payload
+     * (inputs / proofs / signature are rebuilt on every retry). */
+    uint8_t circuit_hash[32];             /** SHA-256 digest of the audited OpenQASM circuit. */
+    uint8_t commitment_root[32];          /** Raw first 256 bits of the BDLOP commitment c1. */
+    uint64_t tvd_scaled;                  /** Nano-scale fixed-point TVD in [0, 10^9]. */
+    uint32_t shots;                       /** Measurement shot budget evaluated. */
+    uint32_t status;                      /** Drift classification code (0..3). */
+    uint64_t timestamp_us;                /** Microsecond attestation timestamp. */
 } RecreateArgs;
 
 /** @brief Generic worker thread initialization argument. */
