@@ -265,6 +265,13 @@ int client_state_init(State *state, int is_bootstrap) {
     pthread_mutex_init(&state->rpc_engine.incoming_rpc_queue.mutex, NULL);
     state->rpc_engine.incoming_rpc_queue.head = NULL;
     state->rpc_engine.incoming_rpc_queue.tail = NULL;
+
+    // Initialize SCL402 challenge registry (server-side 402 challenge accounting)
+    pthread_mutex_init(&state->rpc_engine.scl402_registry.mutex, NULL);
+    state->rpc_engine.scl402_registry.count = 0;
+    for (size_t i = 0; i < SCL402_CHALLENGE_REGISTRY_CAP; i++) {
+        state->rpc_engine.scl402_registry.entries[i].in_use = 0;
+    }
     atomic_init(&state->rpc_engine.active_global_queries, 0);
     atomic_init(&state->rpc_engine.requests_total, 0);
     atomic_init(&state->rpc_engine.rejected_rate_limit, 0);
@@ -610,6 +617,7 @@ void client_state_destroy(State *state) {
         }
     }
     pthread_mutex_destroy(&state->rpc_engine.incoming_rpc_queue.mutex);
+    pthread_mutex_destroy(&state->rpc_engine.scl402_registry.mutex);
     
     pthread_mutex_destroy(&state->recreation_sleep_mutex);
     pthread_cond_destroy(&state->recreation_cond);
