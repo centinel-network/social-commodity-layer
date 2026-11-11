@@ -930,6 +930,170 @@ static void test_integration_block_lifecycle(void) {
 }
 
 /**
+ * @brief Validates the complete OP_APPLY_DRIFT_CERT anchoring lifecycle.
+ *
+ * @details
+ * Exercises the end-to-end drift-certificate pipeline the RPC/consensus fuzzers
+ * can only reach with mutation residue: custodial anchor construction
+ * (`create_and_broadcast_apply_drift_cert` — canonical cert_digest, deterministic
+ * cert_tx_id, funding-wallet ML-DSA-87 signature, heavy-crypto self-check),
+ * mempool admission (`add_pending_operation`), block proposal (`create_block`),
+ * heavy cryptographic verification (`verify_block_heavy_crypto`), ledger commit
+ * (`apply_block` → `validate_operation` + `update_transfer_state` + validation-
+ * commitments MMR leaf), and the processed_txs replay-gate hit.
+ *
+ * @pre Clean client state with a funded node wallet.
+ * @post State transitioned and fully reclaimed.
+ *
+ * @complexity
+ * - Time: O(DilithiumSign + DilithiumVerify + ApplyBlock)
+ * - Space: O(sizeof(State) + sizeof(ApplyDriftCertData))
+ */
+static void test_integration_drift_cert_anchor_lifecycle(void) {
+    State *state = calloc(1, sizeof(State));
+    ASSERT_TRUE(state != NULL, "Failed to allocate State");
+
+    int res = client_state_init(state, 0);
+    ASSERT_EQUAL_INT(res, 0, "client_state_init failed");
+
+    // Purge any auto-hydrated disk state to guarantee hermetic test execution
+    scl_db_delete_blocks_after(0);
+    state->current_block_number = 0;
+    memset(state->current_block_hash, 0, COIN_ID_LEN);
+    state->bc.sync_epoch = 1;
+
+    int key_res = create_user_wallet(&state->user_wallet);
+    ASSERT_EQUAL_INT(key_res, 1, "create_user_wallet failed");
+
+    // Initialize mock funding balance for the node wallet (mirrors the block lifecycle test)
+    uint8_t dummy_tx_hash[32];
+    memset(dummy_tx_hash, 0x55, 32);
+    SCLCoin coin = create_coin(dummy_tx_hash, state->user_wallet.dilithium_pubkey);
+    coin.total_subunits = 1000 * SUBUNITS_PER_COIN;
+    coin.remaining_subunits = 1000 * SUBUNITS_PER_COIN;
+
+    pthread_rwlock_wrlock(&state->bc.rwlock);
+    SCLCoin *coin_heap = malloc(sizeof(SCLCoin));
+    *coin_heap = coin;
+    hash_table_insert(state->bc.coin_table, coin.coin_id, coin_heap, HASH_ENTRY_COIN);
+
+    // Create a pointer spanning the entire range
+    Pointer ptr = {0};
+    memcpy(ptr.parent_coin_id, coin.coin_id, COIN_ID_LEN);
+    ptr.start_subunit = 0;
+    ptr.end_subunit = coin.total_subunits - 1;
+    ptr.staked = 0;
+    ptr.spent = 0;
+    memcpy(ptr.owner_address, coin.owner_address, USER_ID_LEN);
+    memcpy(ptr.prev_tx_hash, coin.creation_tx_hash, COIN_ID_LEN);
+    uint8_t pointer_data[COIN_ID_LEN + USER_ID_LEN + sizeof(uint64_t) * 2 + COIN_ID_LEN];
+    uint8_t *pd = pointer_data;
+    memcpy(pd, ptr.parent_coin_id, COIN_ID_LEN); pd += COIN_ID_LEN;
+    memcpy(pd, ptr.owner_address, USER_ID_LEN); pd += USER_ID_LEN;
+    uint64_t start_be = htobe64(ptr.start_subunit);
+    memcpy(pd, &start_be, sizeof(uint64_t)); pd += sizeof(uint64_t);
+    uint64_t end_be = htobe64(ptr.end_subunit);
+    memcpy(pd, &end_be, sizeof(uint64_t)); pd += sizeof(uint64_t);
+    memcpy(pd, ptr.prev_tx_hash, COIN_ID_LEN); pd += COIN_ID_LEN;
+    SHA256(pointer_data, sizeof(pointer_data), ptr.pointer_id);
+    hash_table_insert(state->bc.pointer_table, ptr.pointer_id, &ptr, HASH_ENTRY_POINTER);
+    add_pointer_id_to_coin(state->bc.coin_pointers, ptr.parent_coin_id, ptr.pointer_id);
+
+    state->bc.insert_order_capacity = 4;
+    state->bc.insert_order = calloc(state->bc.insert_order_capacity, sizeof(SCLCoin *));
+    state->bc.insert_order[0] = coin_heap;
+    state->bc.insert_order_count = 1;
+
+    mmr_add(state->bc.mmr, coin.coin_id, coin.remaining_subunits);
+    pthread_rwlock_unlock(&state->bc.rwlock);
+
+    // Enterprise recipient wallet
+    uint8_t enterprise_pubkey[DILITHIUM_PUBKEY_LEN];
+    memset(enterprise_pubkey, 0xEE, DILITHIUM_PUBKEY_LEN);
+
+    // Client anchoring intent: only the certificate identity core and fee are
+    // meaningful — the node re-selects inputs, regenerates proofs, recomputes
+    // the digest chain, and re-signs custodially.
+    ApplyDriftCertData intent;
+    memset(&intent, 0, sizeof(intent));
+    const char *circuit_qasm = "OPENQASM 3.0; include \"stdgates.inc\"; qubit[7] q; h q; measure q;";
+    SHA256((const uint8_t *)circuit_qasm, strlen(circuit_qasm), intent.circuit_hash);
+    intent.tvd_scaled = 42000000ULL; /* 0.042 nano-scale fixed-point */
+    intent.shots = 15000;
+    intent.status = 0;               /* QPU_STATUS_FIDELITY_OPTIMAL */
+    memset(intent.commitment_root, 0xA5, 32); /* raw c1 prefix (client convention) */
+    intent.timestamp_us = 1700000000000000ULL;
+    memcpy(intent.recipient_pubkey, enterprise_pubkey, PUBKEY_LEN);
+    intent.amount = 10 * SUBUNITS_PER_COIN; /* anchor fee principal */
+
+    // 1. SubmitTx-grade custodial anchor: build, sign, heavy-verify, mempool-admit
+    uint8_t anchored_cert_tx_id[COIN_ID_LEN];
+    int anchor_res = create_and_broadcast_apply_drift_cert(state, &intent, false, anchored_cert_tx_id);
+    ASSERT_EQUAL_INT(anchor_res, 0, "create_and_broadcast_apply_drift_cert failed");
+    ASSERT_EQUAL_INT(atomic_load(&state->pending_operations_count), 1, "Drift-cert op should occupy one mempool slot");
+
+    // 2. Snapshot the mempool operation the anchor produced (proposal input)
+    Operation *mempool_op = NULL;
+    for (int i = 0; i < MAX_PENDING_OPS; i++) {
+        Operation *pop = atomic_load_explicit(&state->pending_operations[i], memory_order_acquire);
+        if (pop) {
+            const uint8_t *pid = get_operation_tx_id(pop);
+            if (pid && memcmp(pid, anchored_cert_tx_id, COIN_ID_LEN) == 0) {
+                mempool_op = malloc(sizeof(Operation));
+                ASSERT_TRUE(mempool_op != NULL, "Failed to snapshot mempool op");
+                *mempool_op = *pop;
+                break;
+            }
+        }
+    }
+    ASSERT_TRUE(mempool_op != NULL, "Anchored drift-cert op must be resolvable in the mempool");
+    ASSERT_EQUAL_INT(mempool_op->type, OP_APPLY_DRIFT_CERT, "Mempool op type mismatch");
+
+    // 3. Propose a block carrying the anchor (no transfers => empty ZK batch)
+    Block *proposed_block = create_block(
+        1,
+        state->current_block_hash,
+        mempool_op,
+        1,
+        state->user_wallet.dilithium_pubkey,
+        state->user_wallet.dilithium_privkey,
+        12345,
+        0,
+        NULL,
+        NULL,
+        0
+    );
+    ASSERT_TRUE(proposed_block != NULL, "Failed to create block with OP_APPLY_DRIFT_CERT");
+
+    // 4. Heavy cryptographic verification of the proposed block
+    int verify_status = verify_block_heavy_crypto(proposed_block);
+    ASSERT_EQUAL_INT(verify_status, 0, "verify_block_heavy_crypto failed on drift-cert block");
+
+    // 5. Ledger commit: validate_operation (digest, tx id, signature, Merkle root,
+    //    ownership, solvency) + update_transfer_state + commitments MMR leaf
+    int apply_res = apply_block(state, proposed_block);
+    ASSERT_EQUAL_INT(apply_res, 0, "apply_block failed to commit drift-cert block");
+
+    // 6. processed_txs replay-gate hit: the anchor id must be spend-resistant
+    pthread_rwlock_rdlock(&state->bc.rwlock);
+    void *replay_entry = hash_table_lookup(state->processed_txs, anchored_cert_tx_id, true);
+    pthread_rwlock_unlock(&state->bc.rwlock);
+    ASSERT_TRUE(replay_entry != NULL, "cert_tx_id should be present in processed_txs");
+
+    // 7. Validation-commitments accumulator carries the anchor leaf (cert_tx_id, tvd_scaled)
+    ASSERT_TRUE(mmr_get_leaf_position(state->bc.centinel.validation_commitments,
+                                      anchored_cert_tx_id, intent.tvd_scaled) >= 0,
+               "Drift-cert anchor leaf missing from validation_commitments MMR");
+
+    // Clean up
+    free(coin_heap);
+    free(mempool_op);
+    free_block(proposed_block);
+    client_state_destroy(state);
+    free(state);
+}
+
+/**
  * @brief Validates PoS2 reward minting and canonical audit state anchor verification.
  *
  * @details
@@ -1194,6 +1358,7 @@ int main(void) {
 
     /* Integration Tests - Section 5: Ledger Lifecycle & WebAssembly Bridges */
     RUN_TEST(test_integration_block_lifecycle);
+    RUN_TEST(test_integration_drift_cert_anchor_lifecycle);
     RUN_TEST(test_integration_supply_reward_invariant);
     RUN_TEST(test_integration_wasm_ffi_interface);
     RUN_TEST(test_integration_autopilot_logic);
