@@ -5202,6 +5202,17 @@ epoch_z_fail:
                 case OP_UNSTAKE:
                     handle_pending_unstake(state, op);
                     break;
+                case OP_APPLY_DRIFT_CERT: {
+                    /* Mirror the mempool ingress used by claims: validate_operation
+                     * checks the canonical digest and ML-DSA-87 signature, then the op
+                     * is staged for block assembly. add_pending_operation stores its
+                     * own copy, so the deserialized op is always freed here. */
+                    pthread_mutex_lock(&state->mutex);
+                    int added_drift = add_pending_operation(state, op);
+                    pthread_mutex_unlock(&state->mutex);
+                    free(op);
+                    break;
+                }
                 default:
                     free(op);
                     break;
