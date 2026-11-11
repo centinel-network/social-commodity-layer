@@ -67,6 +67,7 @@ extern User *global_user;
 #include "network.h"
 #include "database.h"
 #include "quantum_tvd.h"
+#include "rpc.h"
 
 /** @brief RFC 6455 WebSocket handshake GUID salt string. */
 #define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -623,11 +624,11 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
 
     /* ------------------------------------------------------------------
      * SCL402 (receipt strip): Payment Receipt Extraction & Verification.
-     * Mirror rpc.c:472-524. The wasm builder prepends a 41-byte
-     * SclRpcPaymentReceipt ahead of the method args when
-     * SCL_RPC_FLAG_PAYMENT_RECEIPT is set; consume and strip it here so
-     * handlers parse real arguments at final_payload[0]. Without this the
-     * 0x000A handler reads receipt bytes as `shots` -> INVALID_ARGS.
+     * Mirror rpc.c. The wasm builder prepends a SclRpcPaymentReceipt
+     * (sizeof-tracked, natural-alignment wire layout) ahead of the method
+     * args when SCL_RPC_FLAG_PAYMENT_RECEIPT is set; consume and strip it
+     * here so handlers parse real arguments at final_payload[0]. Without
+     * this the 0x000A handler reads receipt bytes as `shots` -> INVALID_ARGS.
      * ------------------------------------------------------------------ */
     bool payment_verified = false;
     if (hdr->flags & SCL_RPC_FLAG_PAYMENT_RECEIPT) {
@@ -638,13 +639,25 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
             SclRpcPaymentReceipt receipt_storage;
             memcpy(&receipt_storage, final_payload + sig_len, receipt_len);
 
-            /* SCL402 challenge binding (mirror of rpc.c): compute the metered
-             * method's required amount from the replayed request's own
-             * arguments so the receipt can be verified against the challenge
-             * it actually settles. required == 0 means the method is unmetered
-             * for this node (or non-daemon) and existence alone suffices. */
+            /* SCL402 challenge binding (mirror of rpc.c): resolve the challenge
+             * this receipt claims to settle against the server-side registry
+             * (challenge_hash key), then compute the metered method's required
+             * amount from the replayed request's own arguments. The effective
+             * demand is the MAXIMUM of the issuance-time quote and the
+             * replay-derived cost, so cheaper replay args cannot discount the
+             * challenged fee while heavier replays still pay their own cost.
+             * required == 0 means the method is unmetered for this node (or
+             * non-daemon) and existence alone suffices — exactly the legacy
+             * behaviour. */
             uint64_t receipt_required_subunits = 0;
+            Scl402ChallengeEntry receipt_challenge = {0};
+            bool receipt_challenge_live = false;
             if (state->config.is_daemon) {
+                /* TTL enforcement (previously unenforced on replay): an unknown
+                 * or expired challenge_hash leaves payment_verified false and
+                 * the metering gate below re-issues a fresh 402 challenge. */
+                receipt_challenge_live = scl402_challenge_resolve(state, receipt_storage.challenge_hash, &receipt_challenge);
+
                 const uint8_t *scl402_args = final_payload + sig_len + receipt_len;
                 uint32_t scl402_args_len = final_payload_len - (uint32_t)sig_len - (uint32_t)receipt_len;
                 if (method_id == 0x000D) {
@@ -658,6 +671,10 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                 } else if (method_id == 0x000A && scl402_args_len > 36) {
                     receipt_required_subunits = 160000000ULL; /* 1 SCL fee (parity with the gate below) */
                 }
+
+                if (receipt_challenge_live && receipt_challenge.amount_subunits > receipt_required_subunits) {
+                    receipt_required_subunits = receipt_challenge.amount_subunits;
+                }
             }
 
             /* Fee recipient the challenge demanded: SHA-256 of the node wallet's
@@ -667,7 +684,11 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
             SHA256(state->user_wallet.dilithium_pubkey, DILITHIUM_PUBKEY_LEN, scl402_fee_address);
             pthread_mutex_unlock(&state->wallet_mutex);
 
-            if (receipt_storage.payment_type == 0x02) { // OP_REDEEM_CENTINEL
+            if (state->config.is_daemon && !receipt_challenge_live) {
+                /* Unknown or expired challenge: this receipt settles nothing the
+                 * node actually issued within its TTL. Leave payment_verified
+                 * false; the metering gate below re-issues a fresh 402 challenge. */
+            } else if (receipt_storage.payment_type == 0x02) { // OP_REDEEM_CENTINEL
                 /* Private redemption: amount and destination are sealed inside
                  * BDLOP commitments by design, so only nullifier spentness is
                  * enforceable on the transparent RPC surface. */
@@ -712,8 +733,13 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                         } else if (scl402_is_transfer) {
                             uint8_t paid_address[USER_ID_LEN];
                             SHA256(scl402_paid_recipient, PUBKEY_LEN, paid_address);
+                            /* Challenge-authoritative recipient when a live registry
+                             * entry exists; wallet-derived address otherwise (legacy
+                             * non-daemon parity). */
+                            const uint8_t *receipt_required_recipient =
+                                receipt_challenge_live ? receipt_challenge.recipient_address : scl402_fee_address;
                             payment_verified = (scl402_paid_amount >= receipt_required_subunits) &&
-                                               (memcmp(paid_address, scl402_fee_address, USER_ID_LEN) == 0);
+                                               (memcmp(paid_address, receipt_required_recipient, USER_ID_LEN) == 0);
                         }
                     }
                 } else if (receipt_required_subunits == 0) {
@@ -744,8 +770,13 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                             if (bop->type == OP_TRANSFER_POINTER) {
                                 uint8_t paid_address[USER_ID_LEN];
                                 SHA256(bop->data.transfer_pointer.recipient_pubkey, PUBKEY_LEN, paid_address);
+                                /* Challenge-authoritative recipient when a live registry
+                                 * entry exists; wallet-derived address otherwise (legacy
+                                 * non-daemon parity). */
+                                const uint8_t *receipt_required_recipient =
+                                    receipt_challenge_live ? receipt_challenge.recipient_address : scl402_fee_address;
                                 payment_verified = (bop->data.transfer_pointer.amount >= receipt_required_subunits) &&
-                                                   (memcmp(paid_address, scl402_fee_address, USER_ID_LEN) == 0);
+                                                   (memcmp(paid_address, receipt_required_recipient, USER_ID_LEN) == 0);
                             }
                             break;
                         }
@@ -808,8 +839,16 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
         memcpy(seed_buf + 10, &salt, 8);
         SHA256(seed_buf, sizeof(seed_buf), challenge->challenge_hash);
 
-        challenge->valid_until_timestamp = htobe64(get_time_ms() + 300000); /* 5-minute TTL */
+        uint64_t valid_until_ms = get_time_ms() + SCL402_CHALLENGE_TTL_MS; /* 5-minute TTL */
+        challenge->valid_until_timestamp = htobe64(valid_until_ms);
         challenge->accepted_payment_types = htobe16(0x0003); /* Transfer (0x01) + Centinel (0x02) */
+
+        /* Server-side challenge registry (mirror of rpc.c): remember what this
+         * node actually issued (amount, recipient, expiry) keyed by
+         * challenge_hash, so replay-side verification above can enforce the
+         * challenge TTL and bind settlements to the issuance-time quote. */
+        scl402_challenge_register(state, challenge->challenge_hash, scl402_required_subunits,
+                                  challenge->recipient_address, valid_until_ms);
 
         rh->payload_len = htobe32((uint32_t)sizeof(SclRpcPaymentChallenge));
         size_t challenge_resp_len = 32 + sizeof(SclRpcPaymentChallenge);
