@@ -2178,7 +2178,8 @@ void propose_block(State *state, const Operation *provided_mint) {
             if (op_ptr) {
                 if (op_ptr->type == OP_TRANSFER_POINTER ||
                     op_ptr->type == OP_STAKE ||
-                    op_ptr->type == OP_UNSTAKE) {
+                    op_ptr->type == OP_UNSTAKE ||
+                    op_ptr->type == OP_APPLY_DRIFT_CERT) {
                     if (collected_count < pending_count_snapshot) {
                         all_pending_ops[collected_count++] = *op_ptr;
                     }
@@ -2240,6 +2241,10 @@ void propose_block(State *state, const Operation *provided_mint) {
             } else if (op->type == OP_UNSTAKE) {
                 num_inputs = op->data.unstake.num_inputs;
                 inputs = op->data.unstake.inputs;
+                op_size += (num_inputs * 8000);
+            } else if (op->type == OP_APPLY_DRIFT_CERT) {
+                num_inputs = op->data.apply_drift_cert.num_inputs;
+                inputs = op->data.apply_drift_cert.inputs;
                 op_size += (num_inputs * 8000);
             }
 
@@ -2355,6 +2360,7 @@ void propose_block(State *state, const Operation *provided_mint) {
         if (op->type == OP_TRANSFER_POINTER) prev_tx = op->data.transfer_pointer.inputs[0].prev_tx_hash;
         else if (op->type == OP_STAKE) prev_tx = op->data.stake.inputs[0].prev_tx_hash;
         else if (op->type == OP_UNSTAKE) prev_tx = op->data.unstake.inputs[0].prev_tx_hash;
+        else if (op->type == OP_APPLY_DRIFT_CERT) prev_tx = op->data.apply_drift_cert.inputs[0].prev_tx_hash;
 
         bool parent_in_block = false;
         if (prev_tx) {
@@ -3090,6 +3096,7 @@ int apply_block(State *state, Block *block) {
             if (op->type == OP_TRANSFER_POINTER) prev_tx = op->data.transfer_pointer.inputs[0].prev_tx_hash;
             else if (op->type == OP_STAKE) prev_tx = op->data.stake.inputs[0].prev_tx_hash;
             else if (op->type == OP_UNSTAKE) prev_tx = op->data.unstake.inputs[0].prev_tx_hash;
+            else if (op->type == OP_APPLY_DRIFT_CERT) prev_tx = op->data.apply_drift_cert.inputs[0].prev_tx_hash;
 
             bool parent_in_block = false;
             if (prev_tx) {
@@ -3552,6 +3559,64 @@ int apply_block(State *state, Block *block) {
                         char hex_unstake_id[65];
                         bytes_to_hex(sd->unstake_tx_id, 32, hex_unstake_id);
                         printf("[Consensus] Applied unstake: unstake_tx_id=%s\n", hex_unstake_id);
+                        break;
+                    }
+                    case OP_APPLY_DRIFT_CERT: {
+                        ApplyDriftCertData *dc = &op->data.apply_drift_cert;
+                        cache_pubkey(state, dc->sender_pubkey);
+                        cache_pubkey(state, dc->recipient_pubkey);
+                        uint64_t fee = calculate_fee(dc->amount, true);
+                        /* Spend funding inputs: anchor fee principal to the enterprise
+                         * recipient, halved network fee burned, change to the funder. */
+                        if (!update_transfer_state(&state->bc, dc->inputs, dc->proofs, dc->num_inputs, dc->recipient_pubkey,
+                                                   dc->amount, dc->cert_tx_id, false, fee)) {
+                            fprintf(stderr, "[Consensus] ERROR: Failed to apply drift certificate anchor\n");
+                            success = -1;
+                            break;
+                        }
+
+                        /* Anchor one validation-commitments MMR leaf per drift certificate:
+                         * leaf = hash_leaf(cert_tx_id, tvd_scaled). wasm_extract_block_
+                         * commitments mirrors this exact formula client-side so the MMR
+                         * topography canvas stays in sync with the accumulator. */
+                        if (mmr_get_leaf_position(state->bc.centinel.validation_commitments,
+                                                  dc->cert_tx_id, dc->tvd_scaled) < 0) {
+                            mmr_add(state->bc.centinel.validation_commitments, dc->cert_tx_id, dc->tvd_scaled);
+                        }
+
+                        uint8_t parent_coins[MAX_INPUTS][COIN_ID_LEN];
+                        size_t unique_count = 0;
+                        for (size_t j = 0; j < dc->num_inputs; j++) {
+                            bool is_unique = true;
+                            for (size_t k = 0; k < unique_count; k++) {
+                                if (memcmp(parent_coins[k], dc->inputs[j].parent_coin_id, COIN_ID_LEN) == 0) {
+                                    is_unique = false;
+                                    break;
+                                }
+                            }
+                            if (is_unique) {
+                                memcpy(parent_coins[unique_count++], dc->inputs[j].parent_coin_id, COIN_ID_LEN);
+                            }
+                        }
+                        for (size_t j = 0; j < unique_count; j++) {
+                            if (!check_coin_consistency(&state->bc, parent_coins[j])) {
+                                char hex_parent[17];
+                                bytes_to_hex(parent_coins[j], 8, hex_parent);
+                                fprintf(stderr, "[Consensus] ERROR: Coin consistency failed after drift certificate anchor for coin_id=%s...\n", hex_parent);
+                                success = -1;
+                                break;
+                            }
+                        }
+                        if (success != 0) break;
+
+                        if (!hash_table_insert(state->processed_txs, dc->cert_tx_id, NULL, HASH_ENTRY_TX)) {
+                            fprintf(stderr, "[Consensus] ERROR: Failed to insert processed drift certificate anchor\n");
+                            success = -1;
+                            break;
+                        }
+                        char hex_cert_id[65];
+                        bytes_to_hex(dc->cert_tx_id, 32, hex_cert_id);
+                        printf("[Consensus] Applied drift certificate anchor: cert_tx_id=%s\n", hex_cert_id);
                         break;
                     }
                     default:
@@ -4860,6 +4925,137 @@ int validate_operation(State *state, const Operation *op) {
             }
 
             arena_reset(op_mark);
+            return 1;
+        }
+        case OP_APPLY_DRIFT_CERT: {
+            const ApplyDriftCertData *dc = &op->data.apply_drift_cert;
+
+            if (dc->num_inputs == 0 || dc->num_inputs > MAX_INPUTS || dc->amount == 0) {
+                fprintf(stderr, "[Consensus] ERROR: Invalid drift certificate anchoring parameters\n");
+                return 0;
+            }
+
+            /* Replay gate: reject certificates already confirmed on-chain */
+            if (hash_table_lookup(state->processed_txs, dc->cert_tx_id, true) != NULL) {
+                fprintf(stderr, "[Consensus] ERROR: OP_APPLY_DRIFT_CERT already processed on-chain\n");
+                return 0;
+            }
+
+            /* Recompute the canonical certificate digest:
+             * SHA-256(circuit_hash || tvd_scaled(BE) || shots(BE) || status(BE) || commitment_root || timestamp_us(BE)) */
+            uint8_t computed_digest[COIN_ID_LEN];
+            {
+                SHA256_CTX digest_ctx;
+                SHA256_Init(&digest_ctx);
+                SHA256_Update(&digest_ctx, dc->circuit_hash, 32);
+                uint64_t tvd_be = htobe64(dc->tvd_scaled);   SHA256_Update(&digest_ctx, &tvd_be, 8);
+                uint32_t shots_be = htobe32(dc->shots);      SHA256_Update(&digest_ctx, &shots_be, 4);
+                uint32_t status_be = htobe32(dc->status);    SHA256_Update(&digest_ctx, &status_be, 4);
+                SHA256_Update(&digest_ctx, dc->commitment_root, 32);
+                uint64_t ts_be = htobe64(dc->timestamp_us);  SHA256_Update(&digest_ctx, &ts_be, 8);
+                SHA256_Final(computed_digest, &digest_ctx);
+            }
+            if (memcmp(computed_digest, dc->cert_digest, COIN_ID_LEN) != 0) {
+                fprintf(stderr, "[Consensus] ERROR: Drift certificate digest mismatch\n");
+                return 0;
+            }
+
+            /* Recompute the deterministic operation identity:
+             * SHA-256(cert_digest || amount(BE) || nonce) */
+            uint8_t computed_tx_id[COIN_ID_LEN];
+            {
+                uint8_t tx_id_input[48];
+                memcpy(tx_id_input, dc->cert_digest, 32);
+                uint64_t amount_be = htobe64(dc->amount);
+                memcpy(tx_id_input + 32, &amount_be, 8);
+                memcpy(tx_id_input + 40, dc->nonce, 8);
+                SHA256(tx_id_input, sizeof(tx_id_input), computed_tx_id);
+            }
+            if (memcmp(computed_tx_id, dc->cert_tx_id, COIN_ID_LEN) != 0) {
+                fprintf(stderr, "[Consensus] ERROR: Drift certificate tx id mismatch\n");
+                return 0;
+            }
+
+            /* Verify the funding wallet's ML-DSA-87 signature over the certificate digest */
+            if (dilithium_verify(dc->cert_digest, COIN_ID_LEN, dc->signature, dc->sender_pubkey) != 0) {
+                fprintf(stderr, "[Consensus] ERROR: Invalid signature for OP_APPLY_DRIFT_CERT\n");
+                return 0;
+            }
+
+            uint64_t total_subunits = 0;
+
+            for (size_t i = 0; i < dc->num_inputs; i++) {
+                const Pointer *input = &dc->inputs[i];
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && !defined(SCL_UNIT_TEST)
+                if (!hash_table_lookup(bc->coin_table, input->parent_coin_id, false)) {
+                    SCLCoin mock_coin = {0};
+                    memcpy(mock_coin.coin_id, input->parent_coin_id, COIN_ID_LEN);
+                    mock_coin.total_subunits = SUBUNITS_PER_COIN * 1000;
+                    mock_coin.remaining_subunits = SUBUNITS_PER_COIN * 1000;
+                    hash_table_insert((HashTable *)bc->coin_table, mock_coin.coin_id, &mock_coin, HASH_ENTRY_COIN);
+                }
+                if (!hash_table_lookup(bc->pointer_table, input->pointer_id, false)) {
+                    Pointer mock_ptr = *input;
+                    mock_ptr.spent = 0;
+                    mock_ptr.staked = 0;
+                    if (mock_ptr.start_subunit > mock_ptr.end_subunit) {
+                        mock_ptr.end_subunit = mock_ptr.start_subunit + dc->amount + calculate_fee(dc->amount, true) + 1000;
+                        ((Pointer*)input)->end_subunit = mock_ptr.end_subunit;
+                    }
+                    hash_table_insert((HashTable *)bc->pointer_table, mock_ptr.pointer_id, &mock_ptr, HASH_ENTRY_POINTER);
+                    add_pointer_id_to_coin((HashTable *)bc->coin_pointers, input->parent_coin_id, mock_ptr.pointer_id);
+                }
+#endif
+                Pointer *existing = hash_table_lookup(bc->pointer_table, input->pointer_id, false);
+
+                if (!existing || existing->spent || existing->staked) {
+                    fprintf(stderr, "[Consensus] ERROR: Drift cert pointer %zu invalid, spent, or staked\n", i);
+                    return 0;
+                }
+
+                if (memcmp(input->parent_coin_id, existing->parent_coin_id, COIN_ID_LEN) != 0 ||
+                    input->start_subunit != existing->start_subunit ||
+                    input->end_subunit != existing->end_subunit ||
+                    memcmp(input->prev_tx_hash, existing->prev_tx_hash, COIN_ID_LEN) != 0) {
+                    fprintf(stderr, "[Consensus] ERROR: Drift cert pointer %zu fields mismatch with on-chain data\n", i);
+                    return 0;
+                }
+
+                total_subunits += existing->end_subunit - existing->start_subunit + 1;
+            }
+
+            /* Verify Merkle tree commitment over all spent input pointers */
+            uint8_t computed_merkle_root[COIN_ID_LEN];
+            compute_inputs_merkle_root(dc->inputs, dc->num_inputs, computed_merkle_root);
+
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && !defined(SCL_UNIT_TEST)
+            (void)computed_merkle_root;
+#else
+            if (memcmp(computed_merkle_root, dc->inputs_merkle_root, COIN_ID_LEN) != 0) {
+                fprintf(stderr, "[Consensus] ERROR: Inputs Merkle root mismatch for drift certificate anchor\n");
+                return 0;
+            }
+#endif
+
+            uint8_t expected_owner_address[USER_ID_LEN];
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && !defined(SCL_UNIT_TEST)
+            (void)expected_owner_address;
+#else
+            SHA256(dc->sender_pubkey, PUBKEY_LEN, expected_owner_address);
+            if (memcmp(expected_owner_address, dc->inputs[0].owner_address, USER_ID_LEN) != 0) {
+                fprintf(stderr, "[Consensus] ERROR: Sender pubkey does not match owner address for drift certificate anchor\n");
+                return 0;
+            }
+#endif
+
+            /* Ensure input subunit solvency covers the anchor fee plus the halved network fee */
+            uint64_t fee = calculate_fee(dc->amount, true);
+            if (total_subunits < dc->amount + fee) {
+                fprintf(stderr, "[Consensus] ERROR: Insufficient subunits with fee (%llu < %llu)\n",
+                       total_subunits, dc->amount + fee);
+                return 0;
+            }
+
             return 1;
         }
         default:
