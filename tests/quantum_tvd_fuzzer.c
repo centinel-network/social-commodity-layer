@@ -617,7 +617,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             if (res == 0) {
                 assert(quantum_tvd_audit_verify_certificate(&cert, g_fuzz_state->user_wallet.dilithium_pubkey) == 0);
 
-                uint8_t tamper_choice = (data[1] >> 4) % 11;
+                uint8_t tamper_choice = (data[1] >> 4) % 13;
                 switch (tamper_choice) {
                     case 0:
                         assert(quantum_tvd_audit_verify_certificate(NULL, g_fuzz_state->user_wallet.dilithium_pubkey) == -1);
@@ -676,6 +676,19 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                             assert(cache_res == 0);
                             assert(cached_cert.tvd_scaled == cert.tvd_scaled);
                         }
+                        break;
+                    case 11:
+                        /* shots is covered by the validator signature preimage:
+                         * substituting the statistical basis must fail verification. */
+                        cert.shots++;
+                        assert(quantum_tvd_audit_verify_certificate(&cert, g_fuzz_state->user_wallet.dilithium_pubkey) != 0);
+                        cert.shots--;
+                        break;
+                    case 12:
+                        /* num_qubits is likewise covered by the signed digest. */
+                        cert.num_qubits ^= 0xFF;
+                        assert(quantum_tvd_audit_verify_certificate(&cert, g_fuzz_state->user_wallet.dilithium_pubkey) != 0);
+                        cert.num_qubits ^= 0xFF;
                         break;
                 }
             }
