@@ -2125,7 +2125,7 @@ void clean_pending_operations(State *state, Block *block) {
                 spent_invalid = true;
                 scl_log(LOG_LEVEL_DEBUG, "Network", "Detected spent nullifier in pending operation, removing");
             }
-        } else if (keep && (op->type == OP_TRANSFER_POINTER || op->type == OP_STAKE || op->type == OP_UNSTAKE)) {
+        } else if (keep && (op->type == OP_TRANSFER_POINTER || op->type == OP_STAKE || op->type == OP_UNSTAKE || op->type == OP_APPLY_DRIFT_CERT)) {
             uint32_t num_inputs;
             Pointer *inputs;
             bool expect_staked = (op->type == OP_UNSTAKE);
@@ -2138,6 +2138,10 @@ void clean_pending_operations(State *state, Block *block) {
                 StakeData *sd = &op->data.stake;
                 num_inputs = sd->num_inputs;
                 inputs = sd->inputs;
+            } else if (op->type == OP_APPLY_DRIFT_CERT) {
+                ApplyDriftCertData *dd = &op->data.apply_drift_cert;
+                num_inputs = dd->num_inputs;
+                inputs = dd->inputs;
             } else {
                 UnstakeData *sd = &op->data.unstake;
                 num_inputs = sd->num_inputs;
@@ -2467,10 +2471,12 @@ static bool operations_share_inputs(const Operation *op1, const Operation *op2) 
     if (op1->type == OP_TRANSFER_POINTER) { num1 = op1->data.transfer_pointer.num_inputs; in1 = op1->data.transfer_pointer.inputs; }
     else if (op1->type == OP_STAKE) { num1 = op1->data.stake.num_inputs; in1 = op1->data.stake.inputs; }
     else if (op1->type == OP_UNSTAKE) { num1 = op1->data.unstake.num_inputs; in1 = op1->data.unstake.inputs; }
+    else if (op1->type == OP_APPLY_DRIFT_CERT) { num1 = op1->data.apply_drift_cert.num_inputs; in1 = op1->data.apply_drift_cert.inputs; }
 
     if (op2->type == OP_TRANSFER_POINTER) { num2 = op2->data.transfer_pointer.num_inputs; in2 = op2->data.transfer_pointer.inputs; }
     else if (op2->type == OP_STAKE) { num2 = op2->data.stake.num_inputs; in2 = op2->data.stake.inputs; }
     else if (op2->type == OP_UNSTAKE) { num2 = op2->data.unstake.num_inputs; in2 = op2->data.unstake.inputs; }
+    else if (op2->type == OP_APPLY_DRIFT_CERT) { num2 = op2->data.apply_drift_cert.num_inputs; in2 = op2->data.apply_drift_cert.inputs; }
 
     for (uint32_t i = 0; i < num1; i++) {
         for (uint32_t j = 0; j < num2; j++) {
@@ -3375,12 +3381,23 @@ int add_pending_operation(State *state, const Operation *op) {
         memcpy(dest->threshold_signature, src->threshold_signature, SIGNATURE_LEN);
     } else if (op->type == OP_MINT_COIN) {
         op_copy->data.mint_coin = op->data.mint_coin;
+    } else if (op->type == OP_APPLY_DRIFT_CERT) {
+        const ApplyDriftCertData *src = &op->data.apply_drift_cert;
+        if (src->num_inputs > MAX_INPUTS) {
+            free(op_copy);
+            return -1;
+        }
+        /* Plain-old-data struct copy: cert_tx_id, nonce, inputs, proofs,
+         * inputs_merkle_root, client_root, digest fields, pubkeys, amount,
+         * signature and cert_digest are all inline arrays/scalars. */
+        op_copy->data.apply_drift_cert = *src;
     }
 
     uint64_t new_fee = 0;
     if (op->type == OP_TRANSFER_POINTER) new_fee = calculate_fee(op->data.transfer_pointer.amount, false);
     else if (op->type == OP_STAKE) new_fee = calculate_fee(op->data.stake.amount, true);
     else if (op->type == OP_UNSTAKE) new_fee = calculate_fee(op->data.unstake.amount, true);
+    else if (op->type == OP_APPLY_DRIFT_CERT) new_fee = calculate_fee(op->data.apply_drift_cert.amount, true);
 
     int empty_slot = -1;
     uint64_t lowest_fee = UINT64_MAX;
@@ -3410,6 +3427,7 @@ int add_pending_operation(State *state, const Operation *op) {
             if (pop->type == OP_TRANSFER_POINTER) old_fee = calculate_fee(pop->data.transfer_pointer.amount, false);
             else if (pop->type == OP_STAKE) old_fee = calculate_fee(pop->data.stake.amount, true);
             else if (pop->type == OP_UNSTAKE) old_fee = calculate_fee(pop->data.unstake.amount, true);
+            else if (pop->type == OP_APPLY_DRIFT_CERT) old_fee = calculate_fee(pop->data.apply_drift_cert.amount, true);
             
             if (new_fee > old_fee) {
                 if (atomic_compare_exchange_strong_explicit(&state->pending_operations[i], &pop, op_copy, memory_order_release, memory_order_relaxed)) {
@@ -3433,6 +3451,7 @@ int add_pending_operation(State *state, const Operation *op) {
         if (pop->type == OP_TRANSFER_POINTER) entry_fee = calculate_fee(pop->data.transfer_pointer.amount, false);
         else if (pop->type == OP_STAKE) entry_fee = calculate_fee(pop->data.stake.amount, true);
         else if (pop->type == OP_UNSTAKE) entry_fee = calculate_fee(pop->data.unstake.amount, true);
+        else if (pop->type == OP_APPLY_DRIFT_CERT) entry_fee = calculate_fee(pop->data.apply_drift_cert.amount, true);
         
         if (entry_fee < lowest_fee) {
             lowest_fee = entry_fee;
