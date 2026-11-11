@@ -638,24 +638,120 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
             SclRpcPaymentReceipt receipt_storage;
             memcpy(&receipt_storage, final_payload + sig_len, receipt_len);
 
-            pthread_rwlock_rdlock(&state->bc.rwlock);
-            if (receipt_storage.payment_type == 0x01) { // OP_TRANSFER_POINTER
-                if (hash_table_lookup(state->processed_txs, receipt_storage.tx_id, true)) payment_verified = true;
-            } else if (receipt_storage.payment_type == 0x02) { // OP_REDEEM_CENTINEL
-                if (hash_table_lookup(state->bc.centinel.nullifier_set, receipt_storage.tx_id, true)) payment_verified = true;
+            /* SCL402 challenge binding (mirror of rpc.c): compute the metered
+             * method's required amount from the replayed request's own
+             * arguments so the receipt can be verified against the challenge
+             * it actually settles. required == 0 means the method is unmetered
+             * for this node (or non-daemon) and existence alone suffices. */
+            uint64_t receipt_required_subunits = 0;
+            if (state->config.is_daemon) {
+                const uint8_t *scl402_args = final_payload + sig_len + receipt_len;
+                uint32_t scl402_args_len = final_payload_len - (uint32_t)sig_len - (uint32_t)receipt_len;
+                if (method_id == 0x000D) {
+                    uint32_t dc_shots = 15000;
+                    if (scl402_args_len >= 4) {
+                        uint32_t shots_raw;
+                        memcpy(&shots_raw, scl402_args, sizeof(uint32_t));
+                        dc_shots = be32toh(shots_raw);
+                    }
+                    receipt_required_subunits = 160000000ULL + 32000000ULL * (((uint64_t)dc_shots + 9999) / 10000);
+                } else if (method_id == 0x000A && scl402_args_len > 36) {
+                    receipt_required_subunits = 160000000ULL; /* 1 SCL fee (parity with the gate below) */
+                }
             }
-            pthread_rwlock_unlock(&state->bc.rwlock);
 
-            if (!payment_verified) {
-                for (int i = 0; i < MAX_PENDING_OPS; i++) {
-                    Operation *pop = atomic_load_explicit(&state->pending_operations[i], memory_order_acquire);
-                    if (pop) {
-                        const uint8_t *tx_id = get_operation_tx_id(pop);
-                        if (tx_id && memcmp(tx_id, receipt_storage.tx_id, 32) == 0) {
-                            payment_verified = true;
-                            break;
+            /* Fee recipient the challenge demanded: SHA-256 of the node wallet's
+             * Dilithium5 pubkey (identical formula to the 402 challenge issuer). */
+            uint8_t scl402_fee_address[USER_ID_LEN];
+            pthread_mutex_lock(&state->wallet_mutex);
+            SHA256(state->user_wallet.dilithium_pubkey, DILITHIUM_PUBKEY_LEN, scl402_fee_address);
+            pthread_mutex_unlock(&state->wallet_mutex);
+
+            if (receipt_storage.payment_type == 0x02) { // OP_REDEEM_CENTINEL
+                /* Private redemption: amount and destination are sealed inside
+                 * BDLOP commitments by design, so only nullifier spentness is
+                 * enforceable on the transparent RPC surface. */
+                pthread_rwlock_rdlock(&state->bc.rwlock);
+                if (hash_table_lookup(state->bc.centinel.nullifier_set, receipt_storage.tx_id, true)) payment_verified = true;
+                pthread_rwlock_unlock(&state->bc.rwlock);
+            } else if (receipt_storage.payment_type == 0x01) { // OP_TRANSFER_POINTER
+                /* Bind the receipt: the referenced transfer must have paid at
+                 * least the required amount TO the node's fee address. Mempool
+                 * first, then — once confirmed — a tip-first bounded block
+                 * scan mirroring the GetTransaction pattern (challenges expire
+                 * after 5 minutes, so settlements are always recent). */
+                pthread_rwlock_rdlock(&state->bc.rwlock);
+                bool scl402_confirmed = hash_table_lookup(state->processed_txs, receipt_storage.tx_id, true) != NULL;
+                pthread_rwlock_unlock(&state->bc.rwlock);
+
+                if (!scl402_confirmed) {
+                    bool scl402_found = false;
+                    bool scl402_is_transfer = false;
+                    uint64_t scl402_paid_amount = 0;
+                    uint8_t scl402_paid_recipient[PUBKEY_LEN];
+
+                    for (int i = 0; i < MAX_PENDING_OPS; i++) {
+                        Operation *pop = atomic_load_explicit(&state->pending_operations[i], memory_order_acquire);
+                        if (pop) {
+                            const uint8_t *tx_id = get_operation_tx_id(pop);
+                            if (tx_id && memcmp(tx_id, receipt_storage.tx_id, 32) == 0) {
+                                scl402_found = true;
+                                scl402_is_transfer = (pop->type == OP_TRANSFER_POINTER);
+                                if (scl402_is_transfer) {
+                                    scl402_paid_amount = pop->data.transfer_pointer.amount;
+                                    memcpy(scl402_paid_recipient, pop->data.transfer_pointer.recipient_pubkey, PUBKEY_LEN);
+                                }
+                                break;
+                            }
                         }
                     }
+
+                    if (scl402_found) {
+                        if (receipt_required_subunits == 0) {
+                            payment_verified = true; /* Unmetered method: existence suffices */
+                        } else if (scl402_is_transfer) {
+                            uint8_t paid_address[USER_ID_LEN];
+                            SHA256(scl402_paid_recipient, PUBKEY_LEN, paid_address);
+                            payment_verified = (scl402_paid_amount >= receipt_required_subunits) &&
+                                               (memcmp(paid_address, scl402_fee_address, USER_ID_LEN) == 0);
+                        }
+                    }
+                } else if (receipt_required_subunits == 0) {
+                    payment_verified = true; /* Unmetered method: existence suffices */
+                } else {
+                    pthread_rwlock_rdlock(&state->bc.rwlock);
+                    uint64_t scan_limit = state->current_block_number + 1;
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
+                    if (scan_limit > 16) scan_limit = 16; /* Bounded search depth (parity with rpc.c) */
+#endif
+                    for (uint64_t b_idx = 0; b_idx < scan_limit && !payment_verified; b_idx++) {
+                        uint8_t *ser_block = NULL;
+                        size_t ser_len = 0;
+                        if (scl_db_get_block(state->current_block_number - b_idx, &ser_block, &ser_len) != 0) continue;
+
+                        Block *blk = calloc(1, sizeof(Block));
+                        if (!blk || deserialize_block(blk, ser_block, ser_len) != 0) {
+                            if (blk) free_block(blk);
+                            free(ser_block);
+                            continue;
+                        }
+                        free(ser_block);
+
+                        for (size_t op_idx = 0; op_idx < blk->operation_count; op_idx++) {
+                            const Operation *bop = &blk->operations[op_idx];
+                            const uint8_t *op_id = get_operation_tx_id(bop);
+                            if (!op_id || memcmp(op_id, receipt_storage.tx_id, COIN_ID_LEN) != 0) continue;
+                            if (bop->type == OP_TRANSFER_POINTER) {
+                                uint8_t paid_address[USER_ID_LEN];
+                                SHA256(bop->data.transfer_pointer.recipient_pubkey, PUBKEY_LEN, paid_address);
+                                payment_verified = (bop->data.transfer_pointer.amount >= receipt_required_subunits) &&
+                                                   (memcmp(paid_address, scl402_fee_address, USER_ID_LEN) == 0);
+                            }
+                            break;
+                        }
+                        free_block(blk);
+                    }
+                    pthread_rwlock_unlock(&state->bc.rwlock);
                 }
             }
 
@@ -1161,8 +1257,29 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                                 memcpy(resp_buf + 33, anchored_cert_tx_id, COIN_ID_LEN);
                                 actual_payload_len = 1 + COIN_ID_LEN;
                             } else if (dc_added == 2) {
+                                /* Inputs locked: persist the certificate identity
+                                 * core and let the background recreation worker
+                                 * re-anchor after the next block (mirrors the P2P
+                                 * engine's rpc.c auto-queue). */
+                                RecreateArgs *retry = calloc(1, sizeof(RecreateArgs));
+                                if (retry) {
+                                    const ApplyDriftCertData *dc = &op->data.apply_drift_cert;
+                                    retry->state = state;
+                                    retry->is_drift_cert = true;
+                                    retry->amount = dc->amount;
+                                    memcpy(retry->circuit_hash, dc->circuit_hash, 32);
+                                    retry->tvd_scaled = dc->tvd_scaled;
+                                    retry->shots = dc->shots;
+                                    retry->status = dc->status;
+                                    memcpy(retry->commitment_root, dc->commitment_root, 32);
+                                    retry->timestamp_us = dc->timestamp_us;
+                                    memcpy(retry->recipient_pubkey, dc->recipient_pubkey, PUBKEY_LEN);
+                                    atomic_fetch_add(&state->scheduled_consumed_subunits,
+                                                     dc->amount + calculate_fee(dc->amount, true));
+                                    spawn_recreation_thread(state, retry);
+                                }
                                 rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
-                                const char *err_msg = "Anchoring deferred: the node wallet's inputs are locked by a pending mempool operation. Retry after the next block.";
+                                const char *err_msg = "Anchoring deferred: the node wallet's inputs are locked by a pending mempool operation. The certificate has been queued for automatic background anchoring after the next block - do not resubmit.";
                                 size_t err_len = strlen(err_msg) + 1;
                                 rh->error_msg_len = htobe16((uint16_t)err_len);
                                 memcpy(resp_buf + 32, err_msg, err_len);
