@@ -44,7 +44,7 @@
         lastAudit: null,      // Parsed 0x000D certificate payload
         lastHistogram: null,  // Parsed 128-bin count array (for the deliverable)
         lastContext: null,    // { shots, beaconSeed, circuitText }
-        anchor: null,         // { txIdHex, reqId, fee, appliedAt, confirmed }
+        anchor: null,         // { txIdHex, reqId, fee, appliedAt, confirmed, confirmedAt, blockHeight }
         pollTimer: null,
         bound: false,
         auditWatchdog: null,  // Timeout handle flagging a silently missing 0x000D response
@@ -499,24 +499,72 @@
            attempts++;
            /* Read the target id dynamically: the node echoes the authoritative
             * cert_tx_id after the custodial re-anchor (adopted in the chained
-            * onTransactionAudited handler below), replacing the browser guess. */
-           const targetTxId = state.anchor ? state.anchor.txIdHex : null;
-           if (targetTxId && window.confirmedTxIds && window.confirmedTxIds.has(targetTxId)) {
-               clearInterval(state.pollTimer);
-               state.pollTimer = null;
-               state.anchor.confirmed = true;
-               const s = document.getElementById('drift-anchor-status');
-               s.textContent = 'CONFIRMED ON-CHAIN';
-               s.style.color = 'var(--accent-green)';
-               txEl.textContent = 'Anchored on-chain. Tx: ' + targetTxId;
-           } else if (attempts > 90) {
+            * onTransactionAudited handler below), replacing the browser guess.
+            * refreshAnchorConfirmation() is the single inclusion resolver and
+            * clears this interval itself the moment inclusion is observed. */
+           refreshAnchorConfirmation();
+           if (state.anchor && !state.anchor.confirmed && attempts > 90) {
                clearInterval(state.pollTimer);
                state.pollTimer = null;
                const s = document.getElementById('drift-anchor-status');
-               s.textContent = 'Still awaiting block inclusion after ~6 minutes — the anchor remains valid in the mempool. Keep the tab open, or search the tx id above in the explorer.';
+               /* Not a dead end: the chained onBlockReceived handler installed
+                * by bindClient() re-resolves inclusion on every applied block,
+                * and both export paths re-resolve on every click — this badge
+                * flips to CONFIRMED ON-CHAIN the moment the anchor lands,
+                * however long the mempool hold takes. */
+               s.textContent = 'Still awaiting block inclusion after ~6 minutes — the anchor remains valid in the mempool. This status flips to CONFIRMED ON-CHAIN automatically when an applied block includes it; any report exported afterwards reflects the confirmed on-chain state.';
                s.style.color = 'var(--text-muted)';
            }
        }, 4000);
+    }
+
+    /**
+     * @brief Re-resolves the anchor's block-inclusion state against live explorer
+     *        telemetry and updates state.anchor plus the on-page anchoring badge.
+     *        Idempotent; safe to call from any event path (poll tick, applied-block
+     *        arrival, view entry, export click).
+     *
+     * @details window.confirmedTxIds is grown by explorer_app.js onBlockReceived
+     *          for every applied block the 2 s chain-info pipeline downloads;
+     *          drift certificate anchors confirm by their authoritative on-chain
+     *          cert_tx_id — the same id the node echoes in the SubmitTx response
+     *          and the chained onTransactionAudited handler adopts. Routing every
+     *          confirmation through this one resolver guarantees the exported
+     *          report can never disagree with the live badge.
+     *
+     * @param {Object} [sourceBlock] BLOCK_RECEIVED payload when invoked from the
+     *        chained block handler; used ONLY to attribute the exact applied
+     *        block height when that block itself carries the anchor leaf.
+     */
+    function refreshAnchorConfirmation(sourceBlock) {
+        if (!state.anchor || !state.anchor.txIdHex || state.anchor.confirmed) return;
+        const targetTxId = state.anchor.txIdHex;
+        if (!window.confirmedTxIds || !window.confirmedTxIds.has(targetTxId)) return;
+
+        /* Attribute the block height only when the containing block was directly
+         * observed (its driftCertTxIds carry the authoritative cert_tx_id); a
+         * later block that merely triggered this re-check must never be credited
+         * as the inclusion block. */
+        const observedInBlock = !!(sourceBlock && Array.isArray(sourceBlock.driftCertTxIds) &&
+            sourceBlock.driftCertTxIds.indexOf(targetTxId) !== -1);
+        if (observedInBlock && sourceBlock.blockNumber !== undefined) {
+            state.anchor.blockHeight = Number(sourceBlock.blockNumber);
+        }
+        state.anchor.confirmed = true;
+        state.anchor.confirmedAt = Date.now();
+
+        if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+        const s = document.getElementById('drift-anchor-status');
+        if (s) {
+            s.textContent = 'CONFIRMED ON-CHAIN' +
+                (state.anchor.blockHeight !== undefined ? ' (block #' + state.anchor.blockHeight + ')' : '');
+            s.style.color = 'var(--accent-green)';
+        }
+        const txEl = document.getElementById('drift-anchor-tx');
+        if (txEl) {
+            txEl.style.display = 'block';
+            txEl.textContent = 'Anchored on-chain. Tx: ' + targetTxId;
+        }
     }
 
     /* ========================================================================
@@ -538,6 +586,11 @@
     function exportCertificate() {
         const a = state.lastAudit;
         if (!a) return;
+        /* Re-resolve block inclusion against live telemetry BEFORE rendering so a
+         * report viewed or downloaded again after the anchor landed in an applied
+         * block prints the confirmed state and the authoritative tx id — never a
+         * stale "Submitted / awaiting inclusion" snapshot. */
+        refreshAnchorConfirmation();
         const anchor = state.anchor || {};
         const certId = (a.circuitHash || '').substring(0, 16).toUpperCase() || '—';
         const issued = new Date(Number(a.timestamp) / 1000);
@@ -616,7 +669,8 @@
     <tr><td class="k">Anchoring Fee</td><td class="v">${fmtScl(ANCHOR_FEE_SUBUNITS)} (+ network fee)</td></tr>
     <tr><td class="k">Audit Fee (SCL402 settled)</td><td class="v">${fmtScl(fee)}</td></tr>
     <tr><td class="k">Transaction ID</td><td class="v">${esc(anchor.txIdHex || 'Not yet applied')}</td></tr>
-    <tr><td class="k">Ledger Status</td><td class="v">${anchor.confirmed ? 'CONFIRMED ON-CHAIN' : (anchor.txIdHex ? 'Submitted / awaiting inclusion' : 'Not applied')}</td></tr>
+    <tr><td class="k">Ledger Status</td><td class="v">${anchor.confirmed ? ('CONFIRMED ON-CHAIN' + (anchor.blockHeight !== undefined ? ' — applied block #' + esc(anchor.blockHeight) : '')) : (anchor.txIdHex ? 'Submitted / awaiting inclusion' : 'Not applied')}</td></tr>
+    <tr><td class="k">Ledger Status Resolved (UTC)</td><td class="v">${esc(new Date().toISOString())}</td></tr>
   </table>
 
   <h2>Independent Verification Protocol</h2>
@@ -651,6 +705,10 @@
     function exportJson() {
         const a = state.lastAudit;
         if (!a) return;
+        /* Same live re-resolution as the HTML export: the machine-readable bundle
+         * must carry the anchor's current inclusion state (confirmed, blockHeight,
+         * confirmedAt), not a submission-time snapshot. */
+        refreshAnchorConfirmation();
         const payload = {
             standard: 'centinel.drift-certificate/v1',
             issuedAt: new Date(Number(a.timestamp) / 1000).toISOString(),
@@ -741,6 +799,21 @@
                 }
             }
         };
+        /* Durable inclusion telemetry: explorer_app.js grows window.confirmedTxIds
+         * from every applied block the 2 s chain-info pipeline downloads (each
+         * OP_APPLY_DRIFT_CERT leaf contributes its authoritative cert_tx_id via
+         * driftCertTxIds). Chaining onBlockReceived — the same convention as
+         * onWireFrameReady above — re-resolves the anchor the instant its
+         * containing block arrives, even after the 4 s poll has retired, so the
+         * on-page badge and every subsequent export reflect the confirmed
+         * on-chain state. */
+        const upstreamBlockReceived = client.onBlockReceived;
+        client.onBlockReceived = (data) => {
+            if (typeof upstreamBlockReceived === 'function') upstreamBlockReceived(data);
+            if (state.anchor && !state.anchor.confirmed) {
+                refreshAnchorConfirmation(data);
+            }
+        };
         client.onPaymentRequired = (challenge) => {
             if (Number(challenge.methodId) === 0x000D) {
                 state.settlementInFlight = true;
@@ -829,14 +902,19 @@
     }
 
     /**
-    * @brief View entry point invoked by explorer_app.js switchPageView('drift').
-    */
+     * @brief View entry point invoked by explorer_app.js switchPageView('drift').
+     */
     function onEnter() {
-       bindClient();
-       refreshBalance();
-       updateFeeQuote();
-       const ready = !!(window.client && window.client.socket && window.client.socket.readyState === WebSocket.OPEN);
-       setStatus(ready ? 'PIPELINE CONNECTED' : 'PIPELINE DISCONNECTED', ready ? 'var(--accent-green)' : 'var(--accent-red)');
+        bindClient();
+        refreshBalance();
+        updateFeeQuote();
+        /* Catch-up: re-resolve inclusion on every entry so the anchoring badge and
+         * any subsequently exported report reflect the current chain state even if
+         * the containing block arrived while another view was active or after the
+         * 4 s poll retired. */
+        refreshAnchorConfirmation();
+        const ready = !!(window.client && window.client.socket && window.client.socket.readyState === WebSocket.OPEN);
+        setStatus(ready ? 'PIPELINE CONNECTED' : 'PIPELINE DISCONNECTED', ready ? 'var(--accent-green)' : 'var(--accent-red)');
     }
 
     /**
