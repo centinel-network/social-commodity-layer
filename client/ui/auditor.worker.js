@@ -2016,8 +2016,6 @@ function handleBuildQuantumTvdAudit(requestId, shots, beaconSeed, circuitBytes, 
     let outFramePtr = 0;
     let outLenPtr = 0;
     let builderPtr = 0;
-    let txIdPtr = 0;
-    let challengeHashPtr = 0;
     let argsPtr = 0;
 
     try {
@@ -2026,13 +2024,7 @@ function handleBuildQuantumTvdAudit(requestId, shots, beaconSeed, circuitBytes, 
         if (!builderPtr) throw new Error("WASM builder creation failed");
 
         if (receipt) {
-            const txIdBytes = hexToBytes(receipt.txIdHex, 32);
-            txIdPtr = wasmInstance._wasm_malloc(32);
-            getLiveHeapU8().set(txIdBytes, txIdPtr);
-            const challengeHashBytes = hexToBytes(receipt.challengeHashHex, 32);
-            challengeHashPtr = wasmInstance._wasm_malloc(32);
-            getLiveHeapU8().set(challengeHashBytes, challengeHashPtr);
-            wasmInstance._wasm_builder_set_payment_receipt(builderPtr, receipt.paymentType, txIdPtr, challengeHashPtr, BigInt(receipt.rateLockId));
+            appendPaymentReceiptWire(builderPtr, receipt.paymentType, receipt.txIdHex, receipt.challengeHashHex, receipt.rateLockId);
         }
 
         const bSeed = (beaconSeed && beaconSeed.length === 32) ? beaconSeed : new Uint8Array(32);
@@ -2069,8 +2061,6 @@ function handleBuildQuantumTvdAudit(requestId, shots, beaconSeed, circuitBytes, 
     } catch (e) {
         postMessage({ type: 'ERROR', message: 'Build quantum TVD audit failed: ' + e.message });
     } finally {
-        if (txIdPtr) wasmInstance._wasm_free(txIdPtr);
-        if (challengeHashPtr) wasmInstance._wasm_free(challengeHashPtr);
         if (argsPtr) wasmInstance._wasm_free(argsPtr);
         if (outFramePtr) wasmInstance._wasm_free(outFramePtr);
         if (outLenPtr) wasmInstance._wasm_free(outLenPtr);
@@ -2104,8 +2094,6 @@ function handleBuildDriftCertAudit(requestId, shots, beaconSeed, histogram, circ
     let outFramePtr = 0;
     let outLenPtr = 0;
     let builderPtr = 0;
-    let txIdPtr = 0;
-    let challengeHashPtr = 0;
     let argsPtr = 0;
 
     try {
@@ -2171,8 +2159,6 @@ function handleBuildDriftCertAudit(requestId, shots, beaconSeed, histogram, circ
     } catch (e) {
         postMessage({ type: 'ERROR', message: 'Build drift certificate audit failed: ' + e.message });
     } finally {
-        if (txIdPtr) wasmInstance._wasm_free(txIdPtr);
-        if (challengeHashPtr) wasmInstance._wasm_free(challengeHashPtr);
         if (argsPtr) wasmInstance._wasm_free(argsPtr);
         if (outFramePtr) wasmInstance._wasm_free(outFramePtr);
         if (outLenPtr) wasmInstance._wasm_free(outLenPtr);
@@ -4490,6 +4476,44 @@ function toUint8Array(input, expectedLen = null) {
         console.error("toUint8Array error:", e);
     }
     return expectedLen ? new Uint8Array(expectedLen) : new Uint8Array(0);
+}
+
+/**
+ * @brief Appends the 80-byte SclRpcPaymentReceipt wire struct to a builder
+ *        and flags the frame as carrying a payment receipt
+ *        (SCL_RPC_FLAG_PAYMENT_RECEIPT = 0x08).
+ * @details Byte-for-byte mirror of scl_rpc_builder_set_payment_receipt() in
+ *          common/network/scl_rpc_ffi.c: [0]=payment_type, [1..33]=tx_id,
+ *          [33..40]=natural-alignment padding (zero), [40..48]=price_rate_lock_id
+ *          (Big-Endian), [48..80]=challenge_hash. Built in JS because the shipped
+ *          libscl_rpc.wasm predates the challenge_hash parameter (its
+ *          wasm_builder_set_payment_receipt export has the legacy 4-argument
+ *          ABI); calling that export with 5 arguments throws
+ *          "TypeError: Cannot convert <ptr> to a BigInt" (the challenge_hash
+ *          heap pointer lands on the i64 rate_lock_id slot), which killed every
+ *          SCL402 receipt replay and left the drift audit stalled until the
+ *          120 s watchdog fired ("No drift certificate within 120s").
+ * @param {number} builderPtr Opaque SclRpcBuilder handle.
+ * @param {number} paymentType 0x01 = OP_TRANSFER_POINTER, 0x02 = OP_REDEEM_CENTINEL.
+ * @param {string} txIdHex 64-hex settlement transaction id echoed by the node.
+ * @param {string} challengeHashHex 64-hex challenge_hash of the settled 402 challenge.
+ * @param {bigint|string|number} rateLockId price_rate_lock_id from the challenge.
+ * @return {void}
+ */
+function appendPaymentReceiptWire(builderPtr, paymentType, txIdHex, challengeHashHex, rateLockId) {
+    const receiptBuf = new Uint8Array(80);
+    const rv = new DataView(receiptBuf.buffer);
+    receiptBuf[0] = paymentType & 0xFF;
+    receiptBuf.set(hexToBytes(txIdHex, 32), 1);
+    rv.setBigUint64(40, BigInt(rateLockId), false);
+    receiptBuf.set(hexToBytes(challengeHashHex, 32), 48);
+
+    wasmInstance._wasm_builder_set_flags(builderPtr, 8); // SCL_RPC_FLAG_PAYMENT_RECEIPT
+
+    const rPtr = wasmInstance._wasm_malloc(80);
+    getLiveHeapU8().set(receiptBuf, rPtr);
+    wasmInstance._wasm_builder_append_args(builderPtr, rPtr, 80);
+    wasmInstance._wasm_free(rPtr);
 }
 
 /**
