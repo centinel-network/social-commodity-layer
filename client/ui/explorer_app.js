@@ -1510,14 +1510,6 @@ document.addEventListener('DOMContentLoaded', () => {
         } = tvdData;
 
         const tvdMetric = Number.isFinite(tvdDouble) ? tvdDouble : 0;
-        /* Same beacon returns the same certificate. Do not extend the drift
-         * trace or rewrite the badges when nothing on the network changed. */
-        if (window._renderedTvdMetric !== undefined &&
-            Math.abs(window._renderedTvdMetric - tvdMetric) < 1e-12 &&
-            document.getElementById('tvd-double-val')) {
-            return;
-        }
-        window._renderedTvdMetric = tvdMetric;
         const tvdBadge = document.getElementById('quantum-tvd-val');
         const fidelityBadge = document.getElementById('noise-model-fidelity-val');
         if (tvdBadge) tvdBadge.textContent = tvdMetric.toFixed(4);
@@ -1526,9 +1518,13 @@ document.addEventListener('DOMContentLoaded', () => {
             fidelityBadge.textContent = `${fidelity.toFixed(2)}%`;
         }
 
-        tvdDriftHistory.push(tvdMetric);
-        if (tvdDriftHistory.length > 30) {
-            tvdDriftHistory.shift();
+        // Ingest new telemetry points into rolling history while avoiding duplicate pushes on theme re-renders
+        if (tvdData !== window._lastProcessedTvdData || tvdDriftHistory.length === 0) {
+            window._lastProcessedTvdData = tvdData;
+            tvdDriftHistory.push(tvdMetric);
+            if (tvdDriftHistory.length > 30) {
+                tvdDriftHistory.shift();
+            }
         }
 
         const isLight = document.documentElement.classList.contains('light-mode');
@@ -1657,48 +1653,57 @@ document.addEventListener('DOMContentLoaded', () => {
                 graphCtx.stroke();
                 graphCtx.setLineDash([]);
 
-                if (tvdDriftHistory.length > 1) {
+                if (tvdDriftHistory.length > 0) {
                     graphCtx.strokeStyle = statusColor;
                     graphCtx.lineWidth = 1.5;
                     graphCtx.beginPath();
                     const maxPoints = 30;
                     const xStep = graphCanvas.width / (maxPoints - 1);
 
-                    for (let i = 0; i < tvdDriftHistory.length; i++) {
-                        const x = i * xStep;
-                        const val = Math.min(1.0, Math.max(0.0, tvdDriftHistory[i]));
+                    if (tvdDriftHistory.length === 1) {
+                        const val = Math.min(1.0, Math.max(0.0, tvdDriftHistory[0]));
                         const y = graphCanvas.height - (val * graphCanvas.height * 0.9 + 2);
-                        if (i === 0) {
-                            graphCtx.moveTo(x, y);
-                        } else {
-                            graphCtx.lineTo(x, y);
+                        graphCtx.moveTo(0, y);
+                        graphCtx.lineTo(graphCanvas.width, y);
+                    } else {
+                        for (let i = 0; i < tvdDriftHistory.length; i++) {
+                            const x = i * xStep;
+                            const val = Math.min(1.0, Math.max(0.0, tvdDriftHistory[i]));
+                            const y = graphCanvas.height - (val * graphCanvas.height * 0.9 + 2);
+                            if (i === 0) {
+                                graphCtx.moveTo(x, y);
+                            } else {
+                                graphCtx.lineTo(x, y);
+                            }
                         }
                     }
                     graphCtx.stroke();
+                }
 
-                    // Attach hover inspection listener once
-                    if (!graphCanvas._hasHoverListener) {
-                        graphCanvas._hasHoverListener = true;
-                        graphCanvas.addEventListener('mousemove', (e) => {
-                            const rect = graphCanvas.getBoundingClientRect();
-                            const x = e.clientX - rect.left;
-                            const idx = Math.min(tvdDriftHistory.length - 1, Math.max(0, Math.round((x / rect.width) * (tvdDriftHistory.length - 1))));
-                            const val = tvdDriftHistory[idx];
-                            const tooltip = document.getElementById('tvd-graph-tooltip');
-                            if (tooltip) {
-                                const valColor = val <= 0.25 ? 'var(--accent-green)' : 'var(--accent-red)';
-                                tooltip.innerHTML = `<span style="color: ${valColor}; font-weight: bold;">&delta;: ${val.toFixed(5)}</span> <span style="color: var(--text-muted); font-weight: normal;">(T-${(tvdDriftHistory.length - 1 - idx) * 2}s)</span>`;
-                            }
-                        });
-                        graphCanvas.addEventListener('mouseleave', () => {
-                            const tooltip = document.getElementById('tvd-graph-tooltip');
-                            if (tooltip) {
-                                const isCurrentLight = document.documentElement.classList.contains('light-mode');
-                                tooltip.innerHTML = `Threshold &le;0.25 <span style="font-weight: normal; color: var(--text-muted); font-size: 0.68rem;">Hover to inspect</span>`;
-                                tooltip.style.color = isCurrentLight ? '#dc2626' : '#ef4444';
-                            }
-                        });
-                    }
+                // Attach hover inspection listener once directly to the canvas element
+                if (!graphCanvas._hasHoverListener) {
+                    graphCanvas._hasHoverListener = true;
+                    graphCanvas.addEventListener('mousemove', (e) => {
+                        if (!tvdDriftHistory.length) return;
+                        const rect = graphCanvas.getBoundingClientRect();
+                        const x = e.clientX - rect.left;
+                        const maxIdx = tvdDriftHistory.length - 1;
+                        const idx = maxIdx > 0 ? Math.min(maxIdx, Math.max(0, Math.round((x / rect.width) * maxIdx))) : 0;
+                        const val = tvdDriftHistory[idx];
+                        const tooltip = document.getElementById('tvd-graph-tooltip');
+                        if (tooltip) {
+                            const valColor = val <= 0.25 ? 'var(--accent-green)' : 'var(--accent-red)';
+                            tooltip.innerHTML = `<span style="color: ${valColor}; font-weight: bold;">&delta;: ${val.toFixed(5)}</span> <span style="color: var(--text-muted); font-weight: normal;">(T-${(maxIdx - idx) * 2}s)</span>`;
+                        }
+                    });
+                    graphCanvas.addEventListener('mouseleave', () => {
+                        const tooltip = document.getElementById('tvd-graph-tooltip');
+                        if (tooltip) {
+                            const isCurrentLight = document.documentElement.classList.contains('light-mode');
+                            tooltip.innerHTML = `threshold &le;0.25 <span style="font-weight: normal; color: var(--text-muted); font-size: 0.68rem;">Hover to inspect</span>`;
+                            tooltip.style.color = isCurrentLight ? '#dc2626' : '#ef4444';
+                        }
+                    });
                 }
             }
         }
