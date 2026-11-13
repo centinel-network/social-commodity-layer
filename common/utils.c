@@ -1971,7 +1971,8 @@ void *recreation_worker_loop(void *vargs) {
                     retry_cert->timestamp_us = args->timestamp_us;
                     memcpy(retry_cert->recipient_pubkey, args->recipient_pubkey, PUBKEY_LEN);
                     retry_cert->amount = args->amount;
-                    success = create_and_broadcast_apply_drift_cert(args->state, retry_cert, true, NULL);
+                    success = create_and_broadcast_apply_drift_cert(args->state, retry_cert, true, NULL,
+                                                                    args->has_anchor_nonce ? args->anchor_nonce : NULL);
                     free(retry_cert);
                 } else {
                     fprintf(stderr, "[Recreation] Memory allocation failed for drift certificate retry, aborting.\n");
