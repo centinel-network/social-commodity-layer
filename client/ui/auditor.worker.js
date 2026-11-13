@@ -2447,6 +2447,23 @@ function parseTransactionPayload(payloadBytes, methodId = 0) {
 
             const pointerIdHex = Array.from(pointerIdBytes).map(b => b.toString(16).padStart(2, '0')).join('');
 
+            /* MMR leaf identity for this mint: hash_leaf(coin_id || remaining_subunits)
+             * with the same host-order (little-endian) u64 memcpy the C engine's
+             * hash_leaf() performs, so the key matches the leaf hashes the block
+             * commitment extractor feeds the topography canvas. explorer_app.js
+             * indexes the embedded audit snapshot by this key. */
+            const leafPre = new Uint8Array(40);
+            leafPre.set(coinIdBytes, 0);
+            new DataView(leafPre.buffer).setBigUint64(32, view.getBigUint64(2697, false), true);
+            const leafInPtr = wasmInstance._wasm_malloc(40);
+            const leafOutPtr = wasmInstance._wasm_malloc(32);
+            getLiveHeapU8().subarray(leafInPtr, leafInPtr + 40).set(leafPre);
+            wasmInstance._wasm_sha256(leafInPtr, 40, leafOutPtr);
+            const leafHashBytes = getLiveHeapU8().subarray(leafOutPtr, leafOutPtr + 32).slice(0);
+            wasmInstance._wasm_free(leafInPtr);
+            wasmInstance._wasm_free(leafOutPtr);
+            const leafHashHex = Array.from(leafHashBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+
             const auditSnapshot = [];
             let snapOffset = 2745;
             for (let i = 0; i < 10 && snapOffset + 112 <= payloadBytes.length; i++) {
@@ -2482,6 +2499,7 @@ function parseTransactionPayload(payloadBytes, methodId = 0) {
                     staked: false
                 }],
                 auditSnapshot,
+                leafHashHex,
                 opLen: 3897
             };
         }
