@@ -1008,6 +1008,32 @@ cleanup:
 }
 
 /**
+ * @brief Computes the canonical drift-certificate identity pair: cert_digest and deterministic cert_tx_id.
+ *
+ * @details Single preimage source shared by the anchoring builder and the SubmitTx ingress
+ * deferred-echo path, guaranteeing a pre-registered id equals the id the background
+ * recreation worker lands on-chain for the same nonce.
+ */
+void compute_drift_cert_identity(const ApplyDriftCertData *cert, const uint8_t nonce[8], uint8_t *out_cert_digest, uint8_t *out_cert_tx_id) {
+    SHA256_CTX digest_ctx;
+    SHA256_Init(&digest_ctx);
+    SHA256_Update(&digest_ctx, cert->circuit_hash, 32);
+    uint64_t tvd_be = htobe64(cert->tvd_scaled);   SHA256_Update(&digest_ctx, &tvd_be, 8);
+    uint32_t shots_be = htobe32(cert->shots);      SHA256_Update(&digest_ctx, &shots_be, 4);
+    uint32_t status_be = htobe32(cert->status);    SHA256_Update(&digest_ctx, &status_be, 4);
+    SHA256_Update(&digest_ctx, cert->commitment_root, 32);
+    uint64_t ts_be = htobe64(cert->timestamp_us);  SHA256_Update(&digest_ctx, &ts_be, 8);
+    SHA256_Final(out_cert_digest, &digest_ctx);
+
+    uint8_t tx_id_input[48];
+    memcpy(tx_id_input, out_cert_digest, 32);
+    uint64_t amount_be = htobe64(cert->amount);
+    memcpy(tx_id_input + 32, &amount_be, 8);
+    memcpy(tx_id_input + 40, nonce, 8);
+    SHA256(tx_id_input, sizeof(tx_id_input), out_cert_tx_id);
+}
+
+/**
  * @brief Assembles, signs, and broadcasts a drift certificate anchoring transaction (@ref OP_APPLY_DRIFT_CERT).
  *
  * @details
@@ -1024,7 +1050,7 @@ cleanup:
  *
  * @complexity Time: O(inputs + Cost(Dilithium5)), Space: O(MAX_INPUTS * sizeof(Pointer)).
  */
-int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData *client_cert, bool is_recreation, uint8_t *out_cert_tx_id) {
+int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData *client_cert, bool is_recreation, uint8_t *out_cert_tx_id, const uint8_t *fixed_nonce) {
     int result = -1;
     Pointer *selected = NULL;
     ApplyDriftCertData *dc = NULL;
@@ -1093,7 +1119,12 @@ int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData
     memcpy(dc->sender_pubkey, state->user_wallet.dilithium_pubkey, PUBKEY_LEN);
     dc->amount = client_cert->amount;
 
-    if (RAND_bytes(dc->nonce, 8) != 1) {
+    if (fixed_nonce) {
+        /* Pre-registered nonce: the SubmitTx ingress already echoed the deterministic
+         * cert_tx_id derived from it, so the background re-anchor must land under the
+         * exact same on-chain identity. */
+        memcpy(dc->nonce, fixed_nonce, 8);
+    } else if (RAND_bytes(dc->nonce, 8) != 1) {
         fprintf(stderr, "[DriftCert] ERROR: Failed to generate nonce for %sanchoring\n", is_recreation ? "recreated " : "");
         pthread_mutex_unlock(&state->mutex);
         goto cleanup;
@@ -1127,33 +1158,14 @@ int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData
 
     compute_inputs_merkle_root(dc->inputs, dc->num_inputs, dc->inputs_merkle_root);
 
-    /* Canonical certificate digest: SHA-256 over the audited attestation core */
-    {
-        SHA256_CTX digest_ctx;
-        SHA256_Init(&digest_ctx);
-        SHA256_Update(&digest_ctx, dc->circuit_hash, 32);
-        uint64_t tvd_be = htobe64(dc->tvd_scaled);   SHA256_Update(&digest_ctx, &tvd_be, 8);
-        uint32_t shots_be = htobe32(dc->shots);      SHA256_Update(&digest_ctx, &shots_be, 4);
-        uint32_t status_be = htobe32(dc->status);    SHA256_Update(&digest_ctx, &status_be, 4);
-        SHA256_Update(&digest_ctx, dc->commitment_root, 32);
-        uint64_t ts_be = htobe64(dc->timestamp_us);  SHA256_Update(&digest_ctx, &ts_be, 8);
-        SHA256_Final(dc->cert_digest, &digest_ctx);
-    }
+    /* Canonical certificate digest + deterministic operation identity
+     * (shared preimage with the SubmitTx ingress deferred-echo path). */
+    compute_drift_cert_identity(dc, dc->nonce, dc->cert_digest, dc->cert_tx_id);
 
     /* Sign the certificate digest with the funding wallet's ML-DSA-87 key */
     if (dilithium_sign(dc->cert_digest, 32, local_privkey, dc->signature) != 1) {
         fprintf(stderr, "[DriftCert] ERROR: Failed to sign certificate digest for %sanchoring\n", is_recreation ? "recreated " : "");
         goto cleanup;
-    }
-
-    /* Deterministic operation identity: SHA-256(cert_digest || amount || nonce) */
-    {
-        uint8_t tx_id_input[48];
-        memcpy(tx_id_input, dc->cert_digest, 32);
-        uint64_t amount_be = htobe64(dc->amount);
-        memcpy(tx_id_input + 32, &amount_be, 8);
-        memcpy(tx_id_input + 40, dc->nonce, 8);
-        SHA256(tx_id_input, sizeof(tx_id_input), dc->cert_tx_id);
     }
 
     op->type = OP_APPLY_DRIFT_CERT;
