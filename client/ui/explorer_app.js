@@ -2606,16 +2606,26 @@ document.addEventListener('DOMContentLoaded', () => {
                 const leafNode = renderer.nodes.find(n => n.position === node.position);
                 if (leafNode && leafNode.height === 0) {
                     const leafHashHex = leafNode.hash ? Array.from(leafNode.hash).map(b => b.toString(16).padStart(2, '0')).join('') : '';
-                    const snapshot = (leafHashHex && window.leafAuditSnapshots && window.leafAuditSnapshots.get(leafHashHex)) ||
-                                     (leafHashHex && blockchainStore.coins.get(leafHashHex)?.auditSnapshot) ||
-                                     cachedValuations;
+                    /* Point-in-time resolution only: the leaf's own anchored snapshot,
+                     * never the live GetAudit matrix. The previous fallback to
+                     * cachedValuations painted the current audit state under a
+                     * leaf-scoped "Anchored ..." label, and the coins-by-leaf-hash
+                     * lookup was dead (the store is keyed by coin id). */
+                    const snapshot = (leafHashHex && window.leafAuditSnapshots && window.leafAuditSnapshots.get(leafHashHex)) || null;
                     
-                    if (snapshot && snapshot.length > 0) {
+                    if (node.opType === 1 && snapshot && snapshot.length > 0) {
                         _renderValuations(
                             snapshot,
                             false,
                             `[Leaf Node #${node.position} Audit Snapshot]`,
                             `Anchored 10x10 Valuation Matrix for Leaf ${leafHashHex ? leafHashHex.substring(0, 16) + '...' : '#' + node.position}:`
+                        );
+                    } else if (node.opType === 1) {
+                        _renderValuations(
+                            [],
+                            false,
+                            `[Leaf Node #${node.position} Audit Snapshot]`,
+                            `No anchored audit snapshot retained for Leaf ${leafHashHex ? leafHashHex.substring(0, 16) + '...' : '#' + node.position} — the mint was not observed through the mempool/audit pipeline this session.`
                         );
                     }
 
