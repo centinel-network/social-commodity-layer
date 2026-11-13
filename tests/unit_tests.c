@@ -1028,7 +1028,7 @@ static void test_integration_drift_cert_anchor_lifecycle(void) {
 
     // 1. SubmitTx-grade custodial anchor: build, sign, heavy-verify, mempool-admit
     uint8_t anchored_cert_tx_id[COIN_ID_LEN];
-    int anchor_res = create_and_broadcast_apply_drift_cert(state, &intent, false, anchored_cert_tx_id);
+    int anchor_res = create_and_broadcast_apply_drift_cert(state, &intent, false, anchored_cert_tx_id, NULL);
     ASSERT_EQUAL_INT(anchor_res, 0, "create_and_broadcast_apply_drift_cert failed");
     ASSERT_EQUAL_INT(atomic_load(&state->pending_operations_count), 1, "Drift-cert op should occupy one mempool slot");
 
