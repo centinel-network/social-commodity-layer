@@ -349,6 +349,17 @@ class SclAuditorClient {
     setTargetPubkey(pubkeyBytes) {
         if (pubkeyBytes && pubkeyBytes.length === 2592) {
             this.walletPubkeyBytes = pubkeyBytes;
+            /* Connect-push guarantee (bind-to-push): blank clients bind the
+             * shared testnet identity only when the first GetChainInfo
+             * response arrives — well AFTER onopen — and the manual-credential
+             * path binds on hot-swap. Both previously waited for the next
+             * 2-second poll tick (or indefinitely when hotSwapCredentials()
+             * returned early because WASM was still compiling), so 'Audited
+             * UTXO Validations' could linger at 0 right after a node connect.
+             * Fire the GetBalance query the instant a target binds; it is a
+             * guarded no-op unless the pipeline is OPEN, and the 2-second
+             * poll remains the retry safety net. */
+            this.requestBalance(pubkeyBytes);
         } else {
             this.walletPubkeyBytes = null;
         }
