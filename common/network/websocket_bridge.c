@@ -52,6 +52,7 @@
 #endif
 #include <openssl/sha.h>
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <lz4.h>
 #include "websocket_bridge.h"
 #include "constants.h"
@@ -1391,7 +1392,7 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                                 free(op);
                                 break;
                             }
-                            int dc_added = create_and_broadcast_apply_drift_cert(state, &op->data.apply_drift_cert, false, anchored_cert_tx_id);
+                            int dc_added = create_and_broadcast_apply_drift_cert(state, &op->data.apply_drift_cert, false, anchored_cert_tx_id, NULL);
                             if (dc_added == 0) {
                                 resp_buf[32] = 0x07;
                                 memcpy(resp_buf + 33, anchored_cert_tx_id, COIN_ID_LEN);
@@ -1401,10 +1402,17 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                                 /* Inputs locked: persist the certificate identity
                                  * core and let the background recreation worker
                                  * re-anchor after the next block (mirrors the P2P
-                                 * engine's rpc.c auto-queue). */
+                                 * engine's rpc.c auto-queue). The nonce is
+                                 * pre-registered so the deterministic cert_tx_id
+                                 * computed here is the exact identity the
+                                 * background re-anchor lands on-chain. */
+                                uint8_t anchor_nonce[8];
                                 RecreateArgs *retry = calloc(1, sizeof(RecreateArgs));
-                                if (retry) {
+                                if (retry && RAND_bytes(anchor_nonce, 8) == 1) {
                                     const ApplyDriftCertData *dc = &op->data.apply_drift_cert;
+                                    uint8_t deferred_cert_digest[32];
+                                    uint8_t deferred_cert_tx_id[COIN_ID_LEN];
+                                    compute_drift_cert_identity(dc, anchor_nonce, deferred_cert_digest, deferred_cert_tx_id);
                                     retry->state = state;
                                     retry->is_drift_cert = true;
                                     retry->amount = dc->amount;
@@ -1415,16 +1423,32 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                                     memcpy(retry->commitment_root, dc->commitment_root, 32);
                                     retry->timestamp_us = dc->timestamp_us;
                                     memcpy(retry->recipient_pubkey, dc->recipient_pubkey, PUBKEY_LEN);
+                                    retry->has_anchor_nonce = true;
+                                    memcpy(retry->anchor_nonce, anchor_nonce, 8);
                                     atomic_fetch_add(&state->scheduled_consumed_subunits,
                                                      dc->amount + calculate_fee(dc->amount, true));
                                     spawn_recreation_thread(state, retry);
+                                    /* Echo the pre-registered authoritative identity under
+                                     * OK status — [0x07][cert_tx_id], byte-identical to the
+                                     * immediate path — so the client adopts and later
+                                     * confirms the anchor by the id that actually lands
+                                     * on-chain. The previous INVALID_ARGS "Anchoring
+                                     * deferred" frame carried no id and the client rendered
+                                     * it as a terminal rejection, leaving the anchor
+                                     * unconfirmable. */
+                                    resp_buf[32] = 0x07;
+                                    memcpy(resp_buf + 33, deferred_cert_tx_id, COIN_ID_LEN);
+                                    actual_payload_len = 1 + COIN_ID_LEN;
+                                    settlement_memo_store(req_id, 0x07, deferred_cert_tx_id);
+                                } else {
+                                    if (retry) free(retry);
+                                    rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
+                                    const char *err_msg = "Anchoring deferred: the node wallet's inputs are locked by a pending mempool operation and the background anchoring queue could not be reserved. Retry after the next block.";
+                                    size_t err_len = strlen(err_msg) + 1;
+                                    rh->error_msg_len = htobe16((uint16_t)err_len);
+                                    memcpy(resp_buf + 32, err_msg, err_len);
+                                    actual_payload_len = err_len;
                                 }
-                                rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
-                                const char *err_msg = "Anchoring deferred: the node wallet's inputs are locked by a pending mempool operation. The certificate has been queued for automatic background anchoring after the next block - do not resubmit.";
-                                size_t err_len = strlen(err_msg) + 1;
-                                rh->error_msg_len = htobe16((uint16_t)err_len);
-                                memcpy(resp_buf + 32, err_msg, err_len);
-                                actual_payload_len = err_len;
                             } else {
                                 rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
                                 const char *err_msg = "Drift certificate anchoring failed: the node wallet cannot cover the anchor fee plus the halved network fee.";
