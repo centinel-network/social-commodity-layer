@@ -3125,6 +3125,96 @@ void scl_wallet_rescan_utxos(State *state) {
         }
         if ((idx & 0x1F) == 0) usleep(100);
     }
+
+    /* C-1 restart-resilience (testnet pass): historical claims minted under
+     * the shared testnet identity — the identity every blank-connecting
+     * browser audits — were never reconstructed here because the derivation
+     * used the operator key only. After a restart the pool lost every
+     * mirrored testnet UTXO (they existed solely in the minting seed's RAM),
+     * and GetBalance(testnet_pk) answered 0 until the next hourly
+     * grant_validation() mirror, so 'Audited UTXO Validations' stayed 0 on
+     * connect. Re-derive the testnet tag space against the same block claim
+     * set so all unspent historical mirrors are restored (for this seed and
+     * for every peer's mirrors) before the first client connects. */
+    if (!is_zeroed(state->testnet_identity_wallet.dilithium_privkey, DILITHIUM_SECRETKEY_LEN)) {
+        pthread_mutex_lock(&state->wallet_mutex);
+        memcpy(r_input, state->testnet_identity_wallet.dilithium_privkey, DILITHIUM_SECRETKEY_LEN);
+        pthread_mutex_unlock(&state->wallet_mutex);
+
+        for (size_t idx = 0; idx < scan_limit; idx++) {
+            int tag_len = snprintf((char *)(r_input + DILITHIUM_SECRETKEY_LEN), 32, "SCL_VAL_UTXO_%zu", idx);
+            uint8_t candidate_r[32];
+            SHA256(r_input, DILITHIUM_SECRETKEY_LEN + tag_len, candidate_r);
+
+            BdlopCommitment check_comm;
+            if (bdlop_commit((const uint8_t*)BDLOP_RHO_SEED, 0, candidate_r, &check_comm) != CRYPTO_SUCCESS) {
+                continue;
+            }
+
+            for (size_t c_i = 0; c_i < comm_count; c_i++) {
+                if (memcmp(check_comm.c1, block_comms[c_i].c1, BDLOP_COEFF_BYTES) != 0) {
+                    continue;
+                }
+
+                uint64_t amount = 0;
+                if (bdlop_decrypt((const uint8_t*)BDLOP_RHO_SEED, &block_comms[c_i], candidate_r, &amount) == CRYPTO_SUCCESS && amount > 0) {
+                    uint8_t commitment_hash[COIN_ID_LEN];
+                    SHA256((const uint8_t*)&block_comms[c_i], sizeof(BdlopCommitment), commitment_hash);
+
+                    pthread_rwlock_rdlock(&state->bc.rwlock);
+                    bool leaf_exists = (state->bc.centinel.validation_commitments != NULL) &&
+                                       (mmr_get_leaf_position(state->bc.centinel.validation_commitments, commitment_hash, 0) >= 0);
+                    pthread_rwlock_unlock(&state->bc.rwlock);
+
+                    if (leaf_exists) {
+                        PRFKey prf_key;
+                        prf_keygen(&prf_key, candidate_r, 32);
+                        uint8_t nullifier[NULLIFIER_LEN];
+                        prf_evaluate(nullifier, &prf_key, commitment_hash, COIN_ID_LEN, commitment_hash);
+
+                        pthread_rwlock_rdlock(&state->bc.rwlock);
+                        bool is_spent = hash_table_lookup(state->bc.centinel.nullifier_set, nullifier, true) != NULL ||
+                                       (nullifier_bloom_check(state->bc.centinel.nullifier_bloom, nullifier) &&
+                                        scl_db_has_nullifier(nullifier));
+                        pthread_rwlock_unlock(&state->bc.rwlock);
+
+                        if (!is_spent) {
+                            pthread_mutex_lock(&state->user_wallet.utxo_mutex);
+                            bool already_have = false;
+                            for (size_t h = 0; h < state->user_wallet.num_val_utxos; h++) {
+                                if (memcmp(&state->user_wallet.val_utxos[h].commitment, &block_comms[c_i], sizeof(BdlopCommitment)) == 0) {
+                                    already_have = true;
+                                    break;
+                                }
+                            }
+                            if (!already_have) {
+                                if (state->user_wallet.num_val_utxos >= state->user_wallet.cap_val_utxos) {
+                                    size_t new_cap = state->user_wallet.cap_val_utxos ? state->user_wallet.cap_val_utxos * 2 : 16;
+                                    ValidationUTXO *new_utxos = realloc(state->user_wallet.val_utxos, new_cap * sizeof(ValidationUTXO));
+                                    if (new_utxos) {
+                                        state->user_wallet.val_utxos = new_utxos;
+                                        state->user_wallet.cap_val_utxos = new_cap;
+                                    }
+                                }
+                                if (state->user_wallet.num_val_utxos < state->user_wallet.cap_val_utxos) {
+                                    ValidationUTXO *utxo = &state->user_wallet.val_utxos[state->user_wallet.num_val_utxos++];
+                                    memset(utxo, 0, sizeof(ValidationUTXO));
+                                    memcpy(&utxo->commitment, &block_comms[c_i], sizeof(BdlopCommitment));
+                                    utxo->amount = amount;
+                                    memcpy(utxo->blinding_factor, candidate_r, 32);
+                                    memcpy(utxo->pubkey, state->testnet_identity_wallet.dilithium_pubkey, PUBKEY_LEN);
+                                    utxo->prf_key = prf_key;
+                                    memcpy(utxo->nullifier, nullifier, NULLIFIER_LEN);
+                                }
+                            }
+                            pthread_mutex_unlock(&state->user_wallet.utxo_mutex);
+                        }
+                    }
+                }
+            }
+            if ((idx & 0x1F) == 0) usleep(100);
+        }
+    }
     free(block_comms);
 }
 
@@ -3146,7 +3236,30 @@ void scl_wallet_scan_claim_op(State *state, const Operation *op) {
 #endif
 
     const ClaimValidationData *cv = &op->data.claim_validation;
-    if (memcmp(cv->pubkey, state->user_wallet.dilithium_pubkey, PUBKEY_LEN) != 0) return;
+    /* C-1/LB parity: validation claims are minted under either the operator
+     * wallet or the shared testnet identity (the identity every blank-
+     * connecting browser audits via GetChainInfo). The operator-only guard
+     * below made every NON-minting node — the second seed behind the
+     * scl-url-map load balancer, or any peer syncing the claim blocks —
+     * drop the testnet claim from its wallet pool, so that node's
+     * GetBalance(testnet_pk) answered 0 and 'Audited UTXO Validations'
+     * intermittently stayed 0 depending on which backend accepted the
+     * WebSocket. Select the owning key pair and adopt the UTXO under the
+     * claim's true owner. */
+    const uint8_t *claim_owner_privkey = NULL;
+    const uint8_t *claim_owner_pubkey = NULL;
+    if (memcmp(cv->pubkey, state->user_wallet.dilithium_pubkey, PUBKEY_LEN) == 0) {
+        claim_owner_privkey = state->user_wallet.dilithium_privkey;
+        claim_owner_pubkey = state->user_wallet.dilithium_pubkey;
+    } else if (!is_zeroed(state->testnet_identity_wallet.dilithium_privkey, DILITHIUM_SECRETKEY_LEN) &&
+               memcmp(cv->pubkey, state->testnet_identity_wallet.dilithium_pubkey, PUBKEY_LEN) == 0) {
+        /* Shared testnet identity: immutable after startup (loaded once in
+         * client.c before consensus threads spawn); read directly, exactly
+         * as grant_validation()'s hourly mirror does. */
+        claim_owner_privkey = state->testnet_identity_wallet.dilithium_privkey;
+        claim_owner_pubkey = state->testnet_identity_wallet.dilithium_pubkey;
+    }
+    if (!claim_owner_privkey) return;
 
     pthread_mutex_lock(&state->user_wallet.utxo_mutex);
     
@@ -3166,9 +3279,13 @@ void scl_wallet_scan_claim_op(State *state, const Operation *op) {
     }
 
     uint8_t r_input[DILITHIUM_SECRETKEY_LEN + 32];
-    pthread_mutex_lock(&state->user_wallet.utxo_mutex);
-    memcpy(r_input, state->user_wallet.dilithium_privkey, DILITHIUM_SECRETKEY_LEN);
-    pthread_mutex_unlock(&state->user_wallet.utxo_mutex);
+    if (claim_owner_privkey == state->user_wallet.dilithium_privkey) {
+        pthread_mutex_lock(&state->user_wallet.utxo_mutex);
+        memcpy(r_input, state->user_wallet.dilithium_privkey, DILITHIUM_SECRETKEY_LEN);
+        pthread_mutex_unlock(&state->user_wallet.utxo_mutex);
+    } else {
+        memcpy(r_input, claim_owner_privkey, DILITHIUM_SECRETKEY_LEN);
+    }
     
     for (size_t idx = 0; idx < scan_limit; idx++) {
         int tag_len = snprintf((char *)(r_input + DILITHIUM_SECRETKEY_LEN), 32, "SCL_VAL_UTXO_%zu", idx);
@@ -3200,7 +3317,7 @@ void scl_wallet_scan_claim_op(State *state, const Operation *op) {
                 memcpy(&utxo->commitment, &cv->commitment, sizeof(BdlopCommitment));
                 utxo->amount = amount;
                 memcpy(utxo->blinding_factor, candidate_r, 32);
-                memcpy(utxo->pubkey, state->user_wallet.dilithium_pubkey, PUBKEY_LEN);
+                memcpy(utxo->pubkey, claim_owner_pubkey, PUBKEY_LEN);
                 prf_keygen(&utxo->prf_key, candidate_r, 32);
 
                 uint8_t commitment_hash[COIN_ID_LEN];
