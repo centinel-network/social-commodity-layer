@@ -1763,7 +1763,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 </div>
                 <div>
                     • Entropy Beacon Seed &mdash;
-                    <span style="color: var(--text-main);">GENERATING (60s block slots)</span>
+                    <span style="color: var(--text-main);">GENERATING</span>
                 </div>
             </div>
         `;
