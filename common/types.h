@@ -1951,6 +1951,8 @@ typedef struct {
     uint32_t shots;                       /** Measurement shot budget evaluated. */
     uint32_t status;                      /** Drift classification code (0..3). */
     uint64_t timestamp_us;                /** Microsecond attestation timestamp. */
+    bool has_anchor_nonce;                /** True when ingress pre-registered the deterministic anchor identity. */
+    uint8_t anchor_nonce[8];              /** Pre-registered nonce: cert_tx_id = SHA-256(cert_digest || amount || nonce) stays stable across the background re-anchor. */
 } RecreateArgs;
 
 /** @brief Generic worker thread initialization argument. */
