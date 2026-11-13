@@ -833,6 +833,31 @@ document.addEventListener('DOMContentLoaded', () => {
         const { methodId, status, version, error } = data;
         console.warn(`[ExplorerApp] RPC Error: Method 0x${methodId.toString(16).padStart(4, '0')} failed with status ${status} (Version: ${version}). Error Message: ${error || 'None'}`);
 
+        /* 'Audit Transaction by Hash' lookup failure: surface the node diagnostics as a
+         * report card inside the Blockchain PTXM Ledger Explorer instead of silently
+         * leaving the manual pin armed with no user feedback. */
+        if (methodId === 0x0007 && blockchainStore.pendingAuditTxId) {
+            blockchainStore.pendingAuditTxId = null;
+            blockchainStore.lastAuditedTx = {
+                txId: null,
+                typeString: 'AUDIT_LOOKUP_FAILED',
+                payloadLen: 0,
+                matchFound: false,
+                nullifier: null,
+                amount: 0,
+                numInputs: 0,
+                senderPubkeyHex: '',
+                recipientPubkeyHex: '',
+                parentCoinId: '',
+                inputPointerIds: [],
+                driftCert: null,
+                errorText: error || `status 0x${Number(status).toString(16).padStart(4, '0')}`
+            };
+            if (viewBlockchain && viewBlockchain.style.display !== 'none') {
+                renderBlockchainLedgerView();
+            }
+        }
+
         if (error && (error.includes('Double-spend') || error.includes('already redeemed'))) {
             const item = document.createElement('li');
             item.className = 'match-item';
@@ -2631,6 +2656,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     return;
                 }
                 console.log('[ExplorerApp] Auditing transaction by ID:', rawHex);
+                /* Pin the normalized hash so the onTransactionAudited telemetry chain can
+                 * attach this exact audit to the Blockchain PTXM Ledger Explorer report card.
+                 * (Parsed from the validated 32-byte id, never the raw input string.) */
+                blockchainStore.pendingAuditTxId = Array.from(txIdBytes).map(b => b.toString(16).padStart(2, '0')).join('');
                 client.requestTransaction(txIdBytes);
             }
         });
@@ -4587,7 +4616,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const blockchainStore = {
         coins: new Map(),       // coinId -> { coinId, totalSubunits, remainingSubunits, creationTxHash, ownerAddress }
         pointers: new Map(),    // pointerId -> { pointerId, parentCoinId, startSubunit, endSubunit, ownerAddress, prevTxHash, spent, staked }
-        transactions: []        // [{ txId, typeString, amount, recipientPubkeyHex, senderPubkeyHex, timestamp }]
+        transactions: [],       // [{ txId, typeString, inputPointerIds, amount, recipientPubkeyHex, senderPubkeyHex, timestamp }]
+        /* Manual 'Audit Transaction by Hash' pin: the normalized 32-byte hash the operator
+         * submitted, plus the audited report card rendered inside the Blockchain view. */
+        pendingAuditTxId: null,
+        lastAuditedTx: null
     };
 
     // 1. Page View Switcher
@@ -5438,6 +5471,29 @@ bootstrap_nodes=${cfg.bootstrap_nodes}
         const { txId, typeString, parsedTx } = data;
         const effectiveTxId = txId || (parsedTx ? parsedTx.txIdHex : null);
 
+        /* Pin the transaction audited via the 'Audit Transaction by Hash' control so the
+         * Blockchain PTXM Ledger Explorer renders the audit report card on-page. Only
+         * the hash the operator explicitly submitted may occupy the pin — the streamed
+         * mempool telemetry below must never displace a manual audit. */
+        if (blockchainStore.pendingAuditTxId && effectiveTxId &&
+            effectiveTxId.toLowerCase() === blockchainStore.pendingAuditTxId) {
+            blockchainStore.pendingAuditTxId = null;
+            blockchainStore.lastAuditedTx = {
+                txId: effectiveTxId,
+                typeString: typeString,
+                payloadLen: data.payloadLen,
+                matchFound: data.matchFound,
+                nullifier: data.nullifier,
+                amount: parsedTx ? parsedTx.amount : 0,
+                numInputs: parsedTx ? parsedTx.numInputs : 0,
+                senderPubkeyHex: parsedTx ? (parsedTx.senderPubkeyHex || '') : '',
+                recipientPubkeyHex: parsedTx ? (parsedTx.recipientPubkeyHex || '') : '',
+                parentCoinId: parsedTx ? (parsedTx.parentCoinIdHex || '') : '',
+                inputPointerIds: parsedTx ? (parsedTx.inputPointerIds || []) : [],
+                driftCert: (parsedTx && parsedTx.driftCert) ? { ...parsedTx.driftCert } : null
+            };
+        }
+
         // Ingest unique transaction samples into the active TPS window across all nodes
         if (effectiveTxId) {
             if (!window.seenTpsTxIds) window.seenTpsTxIds = new Set();
@@ -5455,6 +5511,7 @@ bootstrap_nodes=${cfg.bootstrap_nodes}
                 blockchainStore.transactions.push({
                     txId: txId || parsedTx.txIdHex,
                     typeString: typeString,
+                    inputPointerIds: parsedTx.inputPointerIds || [],
                     circuitHash: (parsedTx.driftCert ? parsedTx.driftCert.circuitHashHex : null),
                     certDigest: (parsedTx.driftCert ? parsedTx.driftCert.certDigestHex : null),
                     amount: parsedTx.amount,
@@ -5571,7 +5628,89 @@ bootstrap_nodes=${cfg.bootstrap_nodes}
         // Consolidate coins strictly from verified mint operations
         const allCoins = new Map(blockchainStore.coins);
 
+        /* Coins associated with operations of the selected transaction type(s): the
+         * authoritative association is the observed transaction itself (parentCoinId /
+         * minted coin id). This covers OP_APPLY_DRIFT_CERT anchors — the parent coin of
+         * the anchored input pointers — which carry no pointer-state signature at all,
+         * and OP_UNSTAKE releases, whose pointers only ever surface as consumed. */
+        const txAssociatedCoinIds = new Set();
+        const opInputPointerIds = new Set();
+        if (selectedTypes.size > 0) {
+            blockchainStore.transactions.forEach(tx => {
+                if (!selectedTypes.has(tx.typeString)) return;
+                if (tx.parentCoinId) txAssociatedCoinIds.add(tx.parentCoinId.toLowerCase());
+                (tx.inputPointerIds || []).forEach(pid => opInputPointerIds.add(pid));
+            });
+        }
+
         let html = '';
+
+        /* 0. Pinned 'Audit Transaction by Hash' report: rendered on-page so auditing a
+         * transaction — including OP_APPLY_DRIFT_CERT anchors — surfaces directly in
+         * the Blockchain PTXM Ledger Explorer instead of only the match viewport on
+         * the hidden Dashboard tab. */
+        const auditedTx = blockchainStore.lastAuditedTx;
+        if (auditedTx) {
+            const auditIsLight = document.documentElement.classList.contains('light-mode');
+            const auditOpColor = auditIsLight ? '#7c3aed' : '#a78bfa';
+            const auditIsDrift = auditedTx.typeString === 'OP_APPLY_DRIFT_CERT';
+            const auditIsFailed = auditedTx.typeString === 'AUDIT_LOOKUP_FAILED';
+            const auditBorderColor = auditIsDrift ? 'var(--accent-drift, #f43f5e)' : (auditIsFailed ? 'var(--accent-red)' : 'var(--accent-green)');
+            const driftStatusLabels = ['Fidelity Optimal', 'Drift Tolerable', 'Decoherence Exceeded', 'Tampering Suspected'];
+            let auditDetailsHtml = '';
+            if (auditIsFailed) {
+                auditDetailsHtml = `
+                    <div style="font-size: 0.75rem; margin-top: 4px; color: var(--accent-red);">
+                        Node lookup failed: ${escapeHTML(auditedTx.errorText || 'transaction not found on-chain or in mempool')}. Verify the 64-hex transaction hash and that the node has synchronized the containing block.
+                    </div>
+                `;
+            } else if (auditIsDrift && auditedTx.driftCert) {
+                const dc = auditedTx.driftCert;
+                auditDetailsHtml = `
+                    <div style="font-size: 0.75rem; margin-top: 4px; color: var(--text-main);">
+                        🛡️ Drift Certificate Anchor — Circuit SHA-256: <span style="font-family: monospace; color: var(--accent-drift, #f43f5e);">${escapeHTML(dc.circuitHashHex.substring(0, 32))}…</span>
+                    </div>
+                    <div style="font-size: 0.7rem; color: var(--text-muted); font-family: monospace; margin-top: 2px;">
+                        • TVD: ${(Number(dc.tvdScaled) / 1e9).toFixed(6)} | Shots: ${escapeHTML(String(dc.shots))} | Classification: ${escapeHTML(driftStatusLabels[dc.status] || ('code ' + dc.status))}
+                    </div>
+                    <div style="font-size: 0.7rem; color: var(--text-muted); font-family: monospace; margin-top: 1px;">
+                        • Certificate Digest: ${escapeHTML(dc.certDigestHex.substring(0, 32))}… | Commitment Root: ${escapeHTML((dc.commitmentRootHex || '').substring(0, 16))}… | Anchor Fee: ¢${formatScl(Number(auditedTx.amount) / 160000000, 4)} | Input Pointers: ${auditedTx.inputPointerIds.length}
+                    </div>
+                `;
+            } else if (auditIsDrift) {
+                auditDetailsHtml = `
+                    <div style="font-size: 0.75rem; margin-top: 4px; color: var(--text-main);">
+                        🛡️ Drift Certificate Anchor accepted into the mempool — awaiting block inclusion.
+                    </div>
+                `;
+            } else {
+                const auditAmtScl = formatScl(Number(auditedTx.amount) / 160000000, 4);
+                auditDetailsHtml = `
+                    <div style="font-size: 0.75rem; margin-top: 4px; color: var(--text-main);">
+                        Value: <span style="font-family: monospace; color: var(--accent-green); font-weight: bold;">¢${escapeHTML(auditAmtScl)}</span>
+                        | Inputs: <span style="font-family: monospace; color: ${auditOpColor};">${escapeHTML(String(auditedTx.numInputs))} UTXO(s)</span>
+                    </div>
+                    <div style="font-size: 0.7rem; color: var(--text-muted); font-family: monospace; margin-top: 2px;">
+                        • Sender PK (16B): ${escapeHTML((auditedTx.senderPubkeyHex || '').substring(0, 32))}...
+                    </div>
+                    <div style="font-size: 0.7rem; color: var(--text-muted); font-family: monospace; margin-top: 1px;">
+                        • Recipient PK (16B): ${escapeHTML((auditedTx.recipientPubkeyHex || '').substring(0, 32))}...
+                    </div>
+                `;
+            }
+            html += `
+                <div style="font-weight: 600; font-size: 0.9rem; color: var(--text-main); margin-bottom: -4px;">Audit Transaction Report</div>
+                <div class="blockchain-coin-card" style="border-left: 4px solid ${auditBorderColor};">
+                    <div style="display: flex; justify-content: space-between; font-family: monospace; font-size: 0.8rem; flex-wrap: wrap; gap: 8px;">
+                        <span>Audit Report — Op Type: <strong style="color: ${auditBorderColor};">${escapeHTML(auditedTx.typeString)}</strong></span>
+                        <span>Tx ID: <strong style="color: var(--text-main);">${escapeHTML(auditedTx.txId || '—')}</strong></span>
+                        <span>Wire Footprint: <strong style="color: var(--text-muted);">${escapeHTML(String(auditedTx.payloadLen))} bytes</strong></span>
+                    </div>
+                    ${auditDetailsHtml}
+                    ${auditedTx.nullifier ? `<div style="font-size: 0.7rem; color: var(--text-muted); font-family: monospace; margin-top: 1px;">Extracted PRF Nullifier: ${escapeHTML(auditedTx.nullifier.substring(0, 24))}...</div>` : ''}
+                </div>
+            `;
+        }
 
         // A. Filter and Render Transactions Matching Selected Checkboxes (Shown only when active filters exist)
         const isFiltering = selectedTypes.size > 0 || !!coinQuery || !!pointerQuery || !!userQuery;
@@ -5636,32 +5775,41 @@ bootstrap_nodes=${cfg.bootstrap_nodes}
                 if (!coinOwnerMatch && !hasMatchingPointer) return false;
             }
             if (selectedTypes.size > 0) {
-                const coinChildPointers = Array.from(allPointers.values()).filter(cp => cp.parentCoinId === coin.coinId);
-                const hasMatchingPointer = Array.from(allPointers.values()).some(p => {
-                    if (p.parentCoinId !== coin.coinId) return false;
-                    const isSpent = (p.spent === true || p.spent === 1 || p.spent === '1') ||
-                        coinChildPointers.some(other =>
-                            other.pointerId !== p.pointerId &&
-                            BigInt(other.startSubunit || 0) >= BigInt(p.startSubunit || 0) &&
-                            BigInt(other.endSubunit || 0) <= BigInt(p.endSubunit || 0) &&
-                            (BigInt(other.endSubunit || 0) - BigInt(other.startSubunit || 0) < BigInt(p.endSubunit || 0) - BigInt(p.startSubunit || 0))
-                        );
-                    if (isSpent) {
-                        return selectedTypes.has('SPENT');
-                    }
-                    if (selectedTypes.has('FEE_RECYCLED') && (p.spent === 2 || p.spent === '2')) return true;
-                    if (selectedTypes.has('OP_MINT_COIN') && (!p.spent && !p.staked)) return true;
-                    if (selectedTypes.has('OP_TRANSFER_POINTER') && (!p.spent && !p.staked)) return true;
-                    if (selectedTypes.has('OP_STAKE') && p.staked) return true;
-                    if (selectedTypes.has('OP_UNSTAKE') && !p.staked) return true;
-                    return false;
-                });
-                if (!hasMatchingPointer) return false;
+                /* (a) Coins authoritatively associated with operations of the selected
+                 *     type(s) via observed transactions: the parent coin of the operated
+                 *     input pointers (OP_TRANSFER_POINTER / OP_STAKE / OP_UNSTAKE /
+                 *     OP_APPLY_DRIFT_CERT) or the minted coin itself (OP_MINT_COIN —
+                 *     the mint parse resolves parentCoinId to the minted coin id). */
+                if (!txAssociatedCoinIds.has(coin.coinId.toLowerCase())) {
+                    /* (b) Pointer-state heuristic fallback for coins without a locally
+                     *     observed transaction of the selected type. OP_UNSTAKE and
+                     *     OP_APPLY_DRIFT_CERT carry no pointer-state signature and are
+                     *     resolved exclusively through (a). */
+                    const coinChildPointers = pointersByCoin.get(coin.coinId) || [];
+                    const hasMatchingPointer = coinChildPointers.some(p => {
+                        const isSpent = (p.spent === true || p.spent === 1 || p.spent === '1') ||
+                            coinChildPointers.some(other =>
+                                other.pointerId !== p.pointerId &&
+                                BigInt(other.startSubunit || 0) >= BigInt(p.startSubunit || 0) &&
+                                BigInt(other.endSubunit || 0) <= BigInt(p.endSubunit || 0) &&
+                                (BigInt(other.endSubunit || 0) - BigInt(other.startSubunit || 0) < BigInt(p.endSubunit || 0) - BigInt(p.startSubunit || 0))
+                            );
+                        if (isSpent) {
+                            return selectedTypes.has('SPENT');
+                        }
+                        if (selectedTypes.has('FEE_RECYCLED') && (p.spent === 2 || p.spent === '2')) return true;
+                        if (selectedTypes.has('OP_MINT_COIN') && (!p.spent && !p.staked)) return true;
+                        if (selectedTypes.has('OP_TRANSFER_POINTER') && (!p.spent && !p.staked)) return true;
+                        if (selectedTypes.has('OP_STAKE') && p.staked) return true;
+                        return false;
+                    });
+                    if (!hasMatchingPointer) return false;
+                }
             }
             return true;
         });
 
-        if (coinEntries.length === 0 && filteredTxs.length === 0) {
+        if (coinEntries.length === 0 && filteredTxs.length === 0 && !blockchainStore.lastAuditedTx) {
             ledgerOutputContainer.innerHTML = `
                 <div class="card" style="text-align: center; color: var(--text-muted); font-family: monospace; padding: 32px;">
                     No coins, pointers, or operations match the current filter criteria.
@@ -5696,14 +5844,19 @@ bootstrap_nodes=${cfg.bootstrap_nodes}
                         );
 
                     if (isSpent) {
-                        if (selectedTypes.size > 0 && !selectedTypes.has('SPENT')) return;
+                        /* Consumed pointers stay visible under SPENT, or when a consuming
+                         * operation of a selected type targeted exactly this pointer
+                         * (e.g. an OP_APPLY_DRIFT_CERT anchor or an OP_UNSTAKE release). */
+                        if (selectedTypes.size > 0 && !selectedTypes.has('SPENT') && !opInputPointerIds.has(ptr.pointerId)) return;
                     } else if (selectedTypes.size > 0) {
                         let matches = false;
                         if (selectedTypes.has('FEE_RECYCLED') && (ptr.spent === 2 || ptr.spent === '2')) matches = true;
                         if (selectedTypes.has('OP_MINT_COIN') && (!ptr.spent && !ptr.staked)) matches = true;
                         if (selectedTypes.has('OP_TRANSFER_POINTER') && (!ptr.spent && !ptr.staked)) matches = true;
                         if (selectedTypes.has('OP_STAKE') && ptr.staked) matches = true;
-                        if (selectedTypes.has('OP_UNSTAKE') && !ptr.staked) matches = true;
+                        /* Drift certificate anchors consume their input pointers; a
+                         * mempool-pending (unapplied) anchor input resolves here. */
+                        if (selectedTypes.has('OP_APPLY_DRIFT_CERT') && opInputPointerIds.has(ptr.pointerId)) matches = true;
                         if (!matches) return;
                     }
 
@@ -5798,6 +5951,8 @@ bootstrap_nodes=${cfg.bootstrap_nodes}
              if (searchPointerIdInput) searchPointerIdInput.value = '';
              if (searchUserIdInput) searchUserIdInput.value = '';
              txTypeCheckboxes.forEach(cb => cb.checked = false);
+             blockchainStore.pendingAuditTxId = null;
+             blockchainStore.lastAuditedTx = null;
              renderBlockchainLedgerView();
          });
      }
