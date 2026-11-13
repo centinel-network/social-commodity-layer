@@ -3285,14 +3285,18 @@
                         <input type="text" id="search-user-id" placeholder="Enter User ID...">
                     </div>
                     <div class="form-group">
-                        <label for="search-tx-hash">Audit Transaction by Hash (64 HEX chars)</label>
+                        <label for="search-tx-hash">
+                            Audit Transaction by Hash (HEX)<span class="info-pop"><i class="info-icon">i</i><span class="info-bubble">Queries the connected node for an exact 32-byte (64-hex-character) transaction ID in the mempool or on-chain blocks. Displays an Audit Transaction Report below and logs decryption details in the Dashboard's ZK-PRF Decrypted Viewport.</span></span>
+                        </label>
                         <div style="display: flex; gap: 8px;">
                             <input type="text" id="search-tx-hash" placeholder="Enter Tx Hash...">
                             <button id="btn-search-tx" class="btn" style="background-color: var(--bg-primary); border-color: var(--border-color); color: var(--text-main); white-space: nowrap;">Audit Tx</button>
                         </div>
                     </div>
                     <div class="form-group">
-                        <label for="search-block-height">Audit Block by Height</label>
+                        <label for="search-block-height">
+                            Audit Block by Height<span class="info-pop"><i class="info-icon">i</i><span class="info-bubble">Queries the connected node for a block at a non-negative integer height (e.g., 0+) to inspect its commitment count and hashes. Results appear in the ZK-PRF Decrypted Viewport on the Dashboard tab.</span></span>
+                        </label>
                         <div style="display: flex; gap: 8px;">
                             <input type="number" id="search-block-height" min="0" placeholder="e.g. 6">
                             <button id="btn-search-block" class="btn" style="background-color: var(--bg-primary); border-color: var(--border-color); color: var(--text-main); white-space: nowrap;">Audit Block</button>
