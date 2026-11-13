@@ -289,7 +289,23 @@ int create_and_broadcast_unstake(State *state, uint64_t amount_subunits, bool is
  * @thread_safety Synchronizes via `state->mutex` and `state->bc.rwlock`.
  * @complexity Time: O(inputs + Cost(Dilithium5)), Space: O(MAX_INPUTS * sizeof(Pointer)).
  */
-int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData *client_cert, bool is_recreation, uint8_t *out_cert_tx_id);
+int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData *client_cert, bool is_recreation, uint8_t *out_cert_tx_id, const uint8_t *fixed_nonce);
+
+/**
+ * @brief Computes the canonical drift-certificate identity pair (single source of truth).
+ *
+ * Derives cert_digest = SHA-256(circuit_hash || tvd_scaled_be || shots_be || status_be ||
+ * commitment_root || timestamp_us_be) and the deterministic operation identity
+ * cert_tx_id = SHA-256(cert_digest || amount_be || nonce). Shared by the anchoring builder
+ * and the SubmitTx ingress so a deferred (inputs-locked) anchor can pre-register and echo
+ * the exact id the background recreation will land on-chain.
+ *
+ * @param[in] cert Certificate identity core (digest fields + anchoring fee amount).
+ * @param[in] nonce 8-byte anchoring nonce (pre-registered or freshly generated).
+ * @param[out] out_cert_digest 32-byte canonical certificate digest.
+ * @param[out] out_cert_tx_id 32-byte deterministic on-chain operation identity.
+ */
+void compute_drift_cert_identity(const ApplyDriftCertData *cert, const uint8_t nonce[8], uint8_t *out_cert_digest, uint8_t *out_cert_tx_id);
 
 /**
  * @brief Interactive terminal routine guiding user through transfer recipient input, balance verification, and dispatch.
