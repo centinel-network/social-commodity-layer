@@ -46,6 +46,7 @@
 
 #include <unistd.h>
 #include <openssl/sha.h>
+#include <openssl/rand.h>
 #include <arpa/inet.h>
 #include <lz4.h>
 #include "rpc.h"
@@ -1225,7 +1226,7 @@ void handle_rpc_request(State *state, RpcTask *task) {
                              * computed id can never appear on-chain. */
                             uint8_t anchored_cert_tx_id[COIN_ID_LEN];
                             uint8_t anchor_echo[1 + COIN_ID_LEN];
-                            int added = create_and_broadcast_apply_drift_cert(state, &op->data.apply_drift_cert, false, anchored_cert_tx_id);
+                            int added = create_and_broadcast_apply_drift_cert(state, &op->data.apply_drift_cert, false, anchored_cert_tx_id, NULL);
                             if (added == 0) {
                                 anchor_echo[0] = 0x07;
                                 memcpy(anchor_echo + 1, anchored_cert_tx_id, COIN_ID_LEN);
@@ -1235,10 +1236,17 @@ void handle_rpc_request(State *state, RpcTask *task) {
                                  * core and let the background recreation worker
                                  * re-anchor after the next block (mirrors the CLI
                                  * transfer/stake auto-queue). The scheduled-subunit
-                                 * reservation prevents concurrent re-selection. */
+                                 * reservation prevents concurrent re-selection, and
+                                 * the pre-registered nonce pins the deterministic
+                                 * cert_tx_id echoed below to the exact identity the
+                                 * background re-anchor lands on-chain. */
+                                uint8_t anchor_nonce[8];
                                 RecreateArgs *retry = calloc(1, sizeof(RecreateArgs));
-                                if (retry) {
+                                if (retry && RAND_bytes(anchor_nonce, 8) == 1) {
                                     const ApplyDriftCertData *dc = &op->data.apply_drift_cert;
+                                    uint8_t deferred_cert_digest[32];
+                                    uint8_t deferred_cert_tx_id[COIN_ID_LEN];
+                                    compute_drift_cert_identity(dc, anchor_nonce, deferred_cert_digest, deferred_cert_tx_id);
                                     retry->state = state;
                                     retry->is_drift_cert = true;
                                     retry->amount = dc->amount;
@@ -1249,11 +1257,22 @@ void handle_rpc_request(State *state, RpcTask *task) {
                                     memcpy(retry->commitment_root, dc->commitment_root, 32);
                                     retry->timestamp_us = dc->timestamp_us;
                                     memcpy(retry->recipient_pubkey, dc->recipient_pubkey, PUBKEY_LEN);
+                                    retry->has_anchor_nonce = true;
+                                    memcpy(retry->anchor_nonce, anchor_nonce, 8);
                                     atomic_fetch_add(&state->scheduled_consumed_subunits,
                                                      dc->amount + calculate_fee(dc->amount, true));
                                     spawn_recreation_thread(state, retry);
+                                    /* Echo the pre-registered authoritative identity —
+                                     * [0x07][cert_tx_id], byte-identical to the immediate
+                                     * path — instead of an INVALID_ARGS error that carried
+                                     * no id and left the anchor unconfirmable client-side. */
+                                    anchor_echo[0] = 0x07;
+                                    memcpy(anchor_echo + 1, deferred_cert_tx_id, COIN_ID_LEN);
+                                    send_rpc_ok_with_payload(state, task->conn, hdr.method_id, hdr.request_id, anchor_echo, sizeof(anchor_echo));
+                                } else {
+                                    if (retry) free(retry);
+                                    send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id, SCL_RPC_STATUS_INVALID_ARGS, "Anchoring deferred: the node wallet's inputs are locked by a pending mempool operation and the background anchoring queue could not be reserved. Retry after the next block.");
                                 }
-                                send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id, SCL_RPC_STATUS_INVALID_ARGS, "Anchoring deferred: the node wallet's inputs are locked by a pending mempool operation. The certificate has been queued for automatic background anchoring after the next block - do not resubmit.");
                             } else {
                                 send_rpc_error(state, task->conn, hdr.method_id, hdr.request_id, SCL_RPC_STATUS_INVALID_ARGS, "Drift certificate anchoring failed: the node wallet cannot cover the anchor fee plus the halved network fee.");
                             }
