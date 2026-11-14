@@ -118,9 +118,19 @@ static void *blockchain_sync_worker(void *arg) {
     }
             
     // Perform the blocking sync operation with strict dependency gating
+    bool sync_segment_authentic = false;
     if (sync_blockchain(args->state, args->peer_pubkey) == 0) {
-        if (!atomic_load(&global_shutdown)) sync_audit(args->state, args->peer_pubkey);
-        if (!atomic_load(&global_shutdown)) sync_pending_operations(args->state, args->peer_pubkey);
+        /* C3 fix (post-sync re-verification): re-check proposer signatures and
+         * epoch beacon signatures across the freshly synced segment before the
+         * node trusts and extends the peer's chain. */
+        if (scl_reverify_synced_segment(args->state) != 0) {
+            fprintf(stderr, "[Network] CRITICAL: post-sync re-verification FAILED for peer (first 8 bytes): %02x%02x%02x%02x... — audit/mempool sync skipped and proposal gated\n",
+                    args->peer_pubkey[0], args->peer_pubkey[1], args->peer_pubkey[2], args->peer_pubkey[3]);
+        } else {
+            sync_segment_authentic = true;
+            if (!atomic_load(&global_shutdown)) sync_audit(args->state, args->peer_pubkey);
+            if (!atomic_load(&global_shutdown)) sync_pending_operations(args->state, args->peer_pubkey);
+        }
     } else {
         fprintf(stderr, "[Network] ERROR: Async blockchain sync failed. Skipping audit/mempool sync.\n");
     }
@@ -133,8 +143,9 @@ static void *blockchain_sync_worker(void *arg) {
                          args->state->current_block_number >= args->state->network_target_block_number);
     pthread_mutex_unlock(&args->state->mutex);
 
-    // Trigger proposal ONLY if we are fully synchronized and caught up with the network tip
-    if (!atomic_load(&global_shutdown) && is_caught_up) {
+    // Trigger proposal ONLY if we are fully synchronized, caught up with the network tip,
+    // and the synced segment passed post-sync re-verification
+    if (!atomic_load(&global_shutdown) && is_caught_up && sync_segment_authentic) {
         trigger_proposer_if_eligible(args->state);
     }
         
