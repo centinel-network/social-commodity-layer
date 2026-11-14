@@ -1644,7 +1644,10 @@ void handle_rpc_request(State *state, RpcTask *task) {
         }
         case 0x0008: { // GetChainInfo
             // Assemble consensus metrics, active committee count, DKG state, and wallet credentials
-            size_t payload_size = 44 + PUBKEY_LEN + PRIVKEY_LEN;
+            /* H-2 fix: matches the three key blocks actually written below — the
+             * previous value omitted the fee-recipient pubkey, a 2,592-byte arena
+             * heap overflow and an under-reported payload_len. */
+            size_t payload_size = 44 + PUBKEY_LEN + PRIVKEY_LEN + PUBKEY_LEN;
             size_t rpc_mark = arena_mark();
             Message *resp = (Message *)arena_alloc(offsetof(Message, payload) + sizeof(SclRpcHeader) + payload_size);
             if (resp) {
@@ -1696,9 +1699,30 @@ void handle_rpc_request(State *state, RpcTask *task) {
                 memcpy(resp->payload + sizeof(SclRpcHeader) + 26, &active_dkg_sessions_be, 2);
                 memcpy(resp->payload + sizeof(SclRpcHeader) + 28, &last_dkg_be, 8);
                 memcpy(resp->payload + sizeof(SclRpcHeader) + 36, &total_fees_be, 8);
+                /* H-2 completion (bidirectional key hygiene): the node's testnet
+                 * identity SECRET key is served to loopback peers only. Remote P2P
+                 * peers receive the same wire layout with a zero-filled private-key
+                 * region — offsets stay compatible, no secret ever leaves the node.
+                 * Loopback detection covers IPv4, IPv6 loopback, and v4-mapped
+                 * IPv6 loopback. */
+                bool rpc_peer_is_loopback = false;
+                if (task->conn->current_path.ss_family == AF_INET) {
+                    rpc_peer_is_loopback =
+                        (((struct sockaddr_in *)&task->conn->current_path)->sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+                } else if (task->conn->current_path.ss_family == AF_INET6) {
+                    const struct in6_addr *a6 = &((struct sockaddr_in6 *)&task->conn->current_path)->sin6_addr;
+                    rpc_peer_is_loopback = (memcmp(a6, &in6addr_loopback, sizeof(struct in6_addr)) == 0) ||
+                                           (IN6_IS_ADDR_V4MAPPED(a6) &&
+                                            ((const uint8_t *)a6)[12] == 127 && ((const uint8_t *)a6)[13] == 0 &&
+                                            ((const uint8_t *)a6)[14] == 0 && ((const uint8_t *)a6)[15] == 1);
+                }
                 pthread_mutex_lock(&state->wallet_mutex);
                 memcpy(resp->payload + sizeof(SclRpcHeader) + 44, state->testnet_identity_wallet.dilithium_pubkey, PUBKEY_LEN);
-                memcpy(resp->payload + sizeof(SclRpcHeader) + 44 + PUBKEY_LEN, state->testnet_identity_wallet.dilithium_privkey, PRIVKEY_LEN);
+                if (rpc_peer_is_loopback) {
+                    memcpy(resp->payload + sizeof(SclRpcHeader) + 44 + PUBKEY_LEN, state->testnet_identity_wallet.dilithium_privkey, PRIVKEY_LEN);
+                } else {
+                    memset(resp->payload + sizeof(SclRpcHeader) + 44 + PUBKEY_LEN, 0, PRIVKEY_LEN);
+                }
                 /* SCL402 parity with websocket_bridge.c: append the fee-recipient
                  * pubkey (user_wallet) whose SHA-256 address is the 402 challenge
                  * recipient, so non-browser clients can resolve the payee. */
