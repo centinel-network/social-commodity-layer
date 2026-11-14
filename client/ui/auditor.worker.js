@@ -3014,7 +3014,14 @@ function handleSubmitTransaction(requestId, opType, payload) {
 
     const isZeroKey = !dilithiumKeyPtr || getLiveHeapU8().subarray(dilithiumKeyPtr, dilithiumKeyPtr + DILITHIUM_KEY_SIZE).every(b => b === 0);
 
-    if (opType !== 'OP_REDEEM_CENTINEL' && isZeroKey) {
+    /* H-2 completion (custodial intent): an OP_TRANSFER_POINTER flagged
+     * `custodial` carries no client-side key material at all — the node executes
+     * it from its own testnet identity wallet and signs the on-chain operation
+     * itself. Used by the hosted demo wallet now that GetChainInfo no longer
+     * serves the node's private key to non-loopback clients. */
+    const custodialIntent = !!(payload && payload.custodial && opType === 'OP_TRANSFER_POINTER');
+
+    if (opType !== 'OP_REDEEM_CENTINEL' && isZeroKey && !custodialIntent) {
         postMessage({ type: 'ERROR', message: 'Dilithium private key missing for transaction signing' });
         return;
     }
@@ -3190,7 +3197,7 @@ function handleSubmitTransaction(requestId, opType, payload) {
             }
 
             const inputsMerkleRoot = computeInputsMerkleRoot(inputs);
-            const inputsRootSig = signBufferWithDilithium(inputsMerkleRoot);
+            const inputsRootSig = custodialIntent ? new Uint8Array(4595) : signBufferWithDilithium(inputsMerkleRoot);
 
             const intentBuf = new Uint8Array(8 + 4 + 32 + (numInputs * 48) + 2592 + 2592 + 8);
             intentBuf.set(nonce, 0);
@@ -3260,7 +3267,7 @@ function handleSubmitTransaction(requestId, opType, payload) {
             sigPayloadBuf.set(senderPubkeyBytes, 72 + 2592);
             new DataView(sigPayloadBuf.buffer, 72 + 5184, 8).setBigUint64(0, amountVal, false);
 
-            const txSignature = signBufferWithDilithium(sigPayloadBuf);
+            const txSignature = custodialIntent ? new Uint8Array(4595) : signBufferWithDilithium(sigPayloadBuf);
             const fullOpLen = 1 + 32 + 8 + 4 + 32 + totalInputsLen + 2592 + 2592 + 8 + 4595 + 32 + 4595 + 32 + 4 + zkProofBytes.length;
             const fullOp = new Uint8Array(fullOpLen);
             const viewFull = new DataView(fullOp.buffer);
@@ -3832,7 +3839,9 @@ function handleSubmitTransaction(requestId, opType, payload) {
             return;
         }
 
-        wasmInstance._wasm_builder_set_flags(builderPtr, 1); // SCL_RPC_FLAG_SIGNED
+        /* H-2 completion: custodial intents ship unsigned (flags = 0) — the node
+         * itself signs the on-chain settlement; no browser key material exists. */
+        wasmInstance._wasm_builder_set_flags(builderPtr, custodialIntent ? 0 : 1); // SCL_RPC_FLAG_SIGNED
 
         const argsPtr = wasmInstance._wasm_malloc(opPayloadBytes.length);
         const heapArgs = getLiveHeapU8().subarray(argsPtr, argsPtr + opPayloadBytes.length);
@@ -3841,11 +3850,13 @@ function handleSubmitTransaction(requestId, opType, payload) {
         wasmInstance._wasm_builder_append_args(builderPtr, argsPtr, opPayloadBytes.length);
         wasmInstance._wasm_free(argsPtr);
 
-        const signRes = wasmInstance._wasm_builder_sign(builderPtr, dilithiumKeyPtr);
-        if (signRes !== 0) {
-            wasmInstance._wasm_builder_destroy(builderPtr);
-            postMessage({ type: 'ERROR', message: 'Failed to sign RPC wire frame' });
-            return;
+        if (!custodialIntent) {
+            const signRes = wasmInstance._wasm_builder_sign(builderPtr, dilithiumKeyPtr);
+            if (signRes !== 0) {
+                wasmInstance._wasm_builder_destroy(builderPtr);
+                postMessage({ type: 'ERROR', message: 'Failed to sign RPC wire frame' });
+                return;
+            }
         }
 
         const maxLen = opPayloadBytes.length + 8192;
