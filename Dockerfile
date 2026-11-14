@@ -1,7 +1,6 @@
 # ==============================================================================
 # Satocialist Protocol: Production Multi-Stage Container Recipe
 # ==============================================================================
-#
 # File: Dockerfile
 # Architecture Role: Provisions a deterministic, isolated container image for
 #   the native validator node daemon (satocialist_client).
@@ -14,7 +13,10 @@
 # - Storage Isolation: Persistent blockchain state and append-only database logs
 #   are mounted via dedicated volume paths with constrained ownership permissions.
 # - Dependency Pinning: External cryptographic libraries (liboqs 0.11.0, libmdbx
-#   v0.12.8) are compiled deterministically from release tags.
+#   v0.13.10) and the qsim headers (v0.21.0) are compiled deterministically from
+#   release tags. Note: the previously documented libmdbx v0.12.8 tag no longer
+#   exists upstream (verified: only v0.13.10..v0.15.0 remain), so the pin was
+#   corrected to the oldest currently-available release tag.
 # ==============================================================================
 
 # ==============================================================================
@@ -35,7 +37,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Clone Google qsim C++ quantum simulator headers (header-only library)
-RUN git clone --depth 1 https://github.com/quantumlib/qsim.git /opt/qsim
+RUN git clone --depth 1 -b v0.21.0 https://github.com/quantumlib/qsim.git /opt/qsim
 
 # Build Open Quantum Safe library (liboqs) v0.11.0 with OpenSSL acceleration
 RUN git clone --depth 1 -b 0.11.0 https://github.com/open-quantum-safe/liboqs.git && \
@@ -46,7 +48,7 @@ RUN git clone --depth 1 -b 0.11.0 https://github.com/open-quantum-safe/liboqs.gi
     make install
 
 # Build libmdbx high-performance transactional database engine (stable release)
-RUN git clone --depth 1 https://github.com/erthink/libmdbx.git /opt/libmdbx && \
+RUN git clone --depth 1 -b v0.13.10 https://github.com/erthink/libmdbx.git /opt/libmdbx && \
     cd /opt/libmdbx && \
     make && \
     make install
