@@ -314,6 +314,18 @@ void free_block_vote_queue(void *data);
  * - `OP_TRANSFER_POINTER`: Verifies input pointer validity, unspent status, Merkle root signature, and fee totals.
  * - `OP_STAKE` / `OP_UNSTAKE`: Verifies threshold signature, input pointer validity, and halved fee deduction.
  *
+ * H-1 fix: `validate_operation` is now a thin wrapper around @ref validate_operation_ex
+ * with `vflags = 0` (full validation, no skips). The two flag-parameterized variants
+ * below serve the new two-pass validation in @ref apply_block:
+ * - @ref validate_operation_ex: flag-parameterized validator used by Pass 2
+ *   re-validation, where `VO_SKIP_MMR_PROOFS` and/or `VO_SKIP_MINT_ECONOMICS`
+ *   suppress checks that are only correct against the pre-block state root/game
+ *   state (already verified in Pass 1).
+ * - @ref validate_operation_auth: ledger-independent authorization-only
+ *   validator for intra-block chained operations whose input pointers do not
+ *   exist in the ledger yet (Pass 1 defers ledger checks to Pass 2, which runs
+ *   after the parent operation has been applied).
+ *
  * @param[in] state Pointer to global node state container.
  * @param[in] op Pointer to candidate @ref Operation structure to validate.
  * @return 1 if operation is valid and passes all consensus checks; 0 on failure.
@@ -322,6 +334,92 @@ void free_block_vote_queue(void *data);
  * @complexity Time: Dependent on operation type (O(1) to O(ZK_verify)), Space: O(1).
  */
 int validate_operation(State *state, const Operation *op);
+
+/* H-1 fix: validation mode flags for validate_operation_ex(). */
+#define VO_SKIP_MMR_PROOFS      0x1u  /* Skip H-4 MMR inclusion-proof checks. Used by the
+                                        * Pass 2 re-validation: proofs were already verified in
+                                        * Pass 1 against the pre-block state root (the root the
+                                        * wallet constructed them against); intra-block fee
+                                        * deductions can shift the live root mid-block
+                                        * (mmr_update_leaf_local in update_transfer_state). */
+#define VO_SKIP_MINT_ECONOMICS  0x2u  /* Skip validate_mint_using_audit_snapshot. Used by the
+                                        * Pass 2 re-validation: the deterministic reward/supply/
+                                        * stage recomputation is only correct against the
+                                        * pre-block game state that Pass 1 validated against. */
+
+/**
+ * @brief Flag-parameterized consensus validation variant for two-pass block application.
+ *
+ * @details
+ * Identical to @ref validate_operation, except that the caller may pass any
+ * combination of @ref VO_SKIP_MMR_PROOFS and @ref VO_SKIP_MINT_ECONOMICS to
+ * suppress checks that are only correct against the pre-block state (already
+ * verified in Pass 1). Used by the Pass 2 re-validation in @ref apply_block,
+ * which runs after intra-block operations have begun mutating the ledger.
+ *
+ * @param[in] state Pointer to global node state container.
+ * @param[in] op Pointer to candidate @ref Operation structure to validate.
+ * @param[in] vflags Bitwise-OR of @ref VO_SKIP_MMR_PROOFS / @ref VO_SKIP_MINT_ECONOMICS (0 for full validation).
+ * @return 1 if operation is valid under the given flag set; 0 on failure.
+ *
+ * @pre Caller must hold `state->bc.rwlock` (read or write mode).
+ * @complexity Time: Dependent on operation type (O(1) to O(ZK_verify)), Space: O(1).
+ */
+int validate_operation_ex(State *state, const Operation *op, unsigned vflags);
+
+/**
+ * @brief Ledger-independent cryptographic authorization validator for intra-block chained operations.
+ *
+ * @details
+ * Companion to @ref validate_operation_ex: an operation whose inputs are created
+ * by an earlier operation in the SAME block cannot run the ledger-dependent
+ * checks in Pass 1 (its input pointers do not exist yet), but it must never
+ * escape cryptographic validation. This function enforces every check that
+ * depends only on the operation's own bytes:
+ * - `OP_TRANSFER_POINTER`: inputs Merkle root recomputation, sender/owner
+ *   address binding, ML-DSA-87 signatures, fee solvency over declared ranges.
+ * - `OP_STAKE` / `OP_UNSTAKE`: deterministic transaction-id recomputation,
+ *   inputs Merkle root, owner binding, threshold joint signature, solvency.
+ * - `OP_APPLY_DRIFT_CERT`: certificate digest and tx-id recomputation, funding
+ *   wallet signature, inputs Merkle root, owner binding, solvency.
+ *
+ * Ledger-dependent checks (pointer existence, spent/staked flags, field match,
+ * MMR inclusion, replay tables) are deferred to the Pass 2 re-validation in
+ * @ref apply_block, which runs after the parent operation has been applied.
+ *
+ * @param[in] state Pointer to global node state container (unused by checks; passed for API symmetry).
+ * @param[in] op Pointer to candidate @ref Operation structure to validate.
+ * @return 1 if the operation is cryptographically self-consistent; 0 otherwise.
+ *
+ * @sync Thread Safety: Reentrant (thread-local arena only); safe inside the
+ * OpenMP Pass 1 loop.
+ */
+int validate_operation_auth(State *state, const Operation *op);
+
+/**
+ * @brief Post-sync cryptographic re-verification of the freshly synced segment.
+ *
+ * @details
+ * C3 fix (sync authentication). After a blockchain sync completes, the node
+ * re-verifies every block it just accepted, from the height after the last DKG
+ * key rotation (or genesis when no epoch key is known) up to the local tip:
+ *
+ * 1. The block's canonical hash is recomputed and its ML-DSA-87 proposer
+ *    signature verified — detecting any envelope whose authentication was
+ *    bypassed while in_blockchain_sync was set.
+ * 2. When an epoch threshold public key is known, the Fiat-Shamir beacon
+ *    signature mu = H(H(pk) || block_hash) is verified for blocks created
+ *    after the key rotation.
+ *
+ * On any failure the function reports the offending height and returns -1 so
+ * the sync orchestrator can refuse to declare the node caught up. Segments
+ * below the last DKG rotation cannot be beacon-verified (no epoch-key history
+ * is retained by the current protocol — stated limitation).
+ *
+ * @param[in,out] state Pointer to global node state container.
+ * @return 0 if every block in the segment authenticates; -1 on any failure.
+ */
+int scl_reverify_synced_segment(State *state);
 
 /**
  * @brief Applies all state transitions within a validated block to the ledger atomically.
