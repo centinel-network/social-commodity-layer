@@ -4175,6 +4175,56 @@ document.addEventListener('DOMContentLoaded', () => {
                 return;
             }
 
+            const { privKeyHex, pubKeyHex: senderPubHex } = resolveWalletCredentials();
+            const hasLocalSigningKey = privKeyHex && _hexToBytes(privKeyHex, 4864) !== null;
+
+            /* H-2 completion (custodial intent): without a locally held private
+             * key (the node no longer serves its testnet identity secret to
+             * non-loopback clients), the shared demo wallet submits an UNSIGNED
+             * transfer intent: the node executes it custodially from the testnet
+             * identity wallet and signs the on-chain operation itself. Input
+             * selection is advisory only — the node re-selects its own inputs —
+             * so an empty pointer cache cannot dead-end the hosted demo. */
+            const custodialPlaceholderInput = {
+                pointerId: '00'.repeat(32),
+                parentCoinId: '00'.repeat(32),
+                ownerAddress: '00'.repeat(32),
+                prevTxHash: '00'.repeat(32),
+                startSubunit: 0,
+                endSubunit: 0,
+                proof: { pathHashes: [], isLeft: [], leftPeaks: [], rightPeaks: [] }
+            };
+
+            if (!hasLocalSigningKey) {
+                if (!window.nodePubkeyHex) {
+                    alert('No local Dilithium private key and no shared testnet identity available. Generate or load a wallet first.');
+                    return;
+                }
+                if (!(client && client.socket && client.socket.readyState === WebSocket.OPEN)) {
+                    alert('Client not connected to SCL Node pipeline.');
+                    return;
+                }
+
+                const custodialSelected = selectUnspentPointers(targetSubunits, false);
+                const custodialInputs = custodialSelected ? [custodialSelected[0]] : [custodialPlaceholderInput];
+
+                btnExecuteTransfer.disabled = true;
+                btnExecuteTransfer.textContent = 'Submitting Custodial Transfer...';
+
+                client.submitTransaction(
+                    (BigInt(Date.now()) << 16n | BigInt(Math.floor(Math.random() * 65535))),
+                    'OP_TRANSFER_POINTER',
+                    {
+                        recipientPubkeyHex: recipientHex,
+                        senderPubkeyHex: window.nodePubkeyHex,
+                        custodial: true,
+                        amountSubunits: amountSubunits.toString(),
+                        inputs: custodialInputs
+                    }
+                );
+                return;
+            }
+
             const selectedInputs = selectUnspentPointers(targetSubunits, false);
             if (selectedInputs === null) {
                 alert('Insufficient unlocked balance or input pointers for this transfer.');
@@ -4182,13 +4232,6 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             if (client && client.socket && client.socket.readyState === WebSocket.OPEN) {
-                const { privKeyHex, pubKeyHex: senderPubHex } = resolveWalletCredentials();
-
-                if (!privKeyHex || _hexToBytes(privKeyHex, 4864) === null) {
-                    alert('Dilithium private key missing or invalid. Please enter or generate a valid 4864-byte Dilithium private key.');
-                    return;
-                }
-
                 btnExecuteTransfer.disabled = true;
                 btnExecuteTransfer.textContent = 'Signing & Generating ZK Proof...';
 
