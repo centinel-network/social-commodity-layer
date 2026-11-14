@@ -1140,30 +1140,15 @@ class SclAuditorClient {
      * @return {void}
      */
     _trySyncNodeWallet() {
-        /* SyncWalletKeys (0x0009) is categorically rejected with UNAUTHORIZED by
-         * both the WebSocket bridge and the P2P RPC handler (remote wallet
-         * mutation is disabled by design), and this.wsUrl can point at a remote
-         * wss:// endpoint. Never ship 8.5 KB of key material — including the
-         * 4,864-byte Dilithium private key — to a remote node just to receive a
-         * guaranteed rejection; restrict the sync to loopback dev sessions. */
-        if (!/^(ws|wss):\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/.test(this.wsUrl)) {
-            return;
-        }
-        if (this.socket && this.socket.readyState === WebSocket.OPEN &&
-            this.rawDilithiumPubkey && this.rawDilithiumPubkey.length === 2592 && !this.rawDilithiumPubkey.every(b => b === 0) &&
-            this.rawDilithiumKey && this.rawDilithiumKey.length === 4864 && !this.rawDilithiumKey.every(b => b === 0) &&
-            this.expandedPrfKey && this.expandedPrfKey.length === 1024) {
-
-            if (this._lastSyncedPubkey && this._lastSyncedPrivkey &&
-                this._arrayEquals(this._lastSyncedPubkey, this.rawDilithiumPubkey) &&
-                this._arrayEquals(this._lastSyncedPrivkey, this.rawDilithiumKey)) {
-                return;
-            }
-
-            this._lastSyncedPubkey = new Uint8Array(this.rawDilithiumPubkey).slice(0);
-            this._lastSyncedPrivkey = new Uint8Array(this.rawDilithiumKey).slice(0);
-            this.syncNodeWalletKeys(this.rawDilithiumPubkey, this.rawDilithiumKey, this.expandedPrfKey);
-        }
+        /* H-2 completion (bidirectional key hygiene): SyncWalletKeys (0x0009) is
+         * categorically rejected with UNAUTHORIZED by both the WebSocket bridge
+         * and the P2P RPC handler, and the node-side handlers now enforce
+         * loopback-only key serving themselves. This client therefore NEVER
+         * transmits key material — not even to loopback nodes: the 8.5 KB frame
+         * (4,864-byte Dilithium private key included) had no effect beyond a
+         * guaranteed rejection, and any future server-side regression would turn
+         * it into a live exfiltration path. */
+        return;
     }
 
     /**
@@ -1403,9 +1388,17 @@ class SclAuditorClient {
                 pubKeyHex = creds.pubKeyHex;
             }
 
-            if (!privKeyHex || !pubKeyHex) {
+            /* H-2 completion (custodial settlement): without a locally held
+             * private key, the shared testnet wallet settles SCL402 challenges
+             * custodially — the node funds and signs the paying transfer from its
+             * own testnet identity wallet (unsigned SubmitTx intent). */
+            const custodialSettlement = !privKeyHex && typeof window.nodePubkeyHex === 'string' && window.nodePubkeyHex.length === 5184;
+            if (!privKeyHex && !custodialSettlement) {
                 settleFail('cryptographic credentials unavailable — load or unlock the wallet (private key) on the Dashboard');
                 return;
+            }
+            if (custodialSettlement) {
+                pubKeyHex = window.nodePubkeyHex;
             }
 
             if (!this.worker) {
@@ -1462,7 +1455,8 @@ class SclAuditorClient {
             this.submitTransaction(reqIdStr, 'OP_TRANSFER_POINTER', {
                 recipientPubkeyHex: feeRecipientPubkeyHex,
                 senderPubkeyHex: pubKeyHex,
-                privkeyHex: privKeyHex,
+                privkeyHex: custodialSettlement ? undefined : privKeyHex,
+                custodial: !!custodialSettlement,
                 amountSubunits: challenge.amountSubunits,
                 inputs: settlementInputs
             });
