@@ -3636,7 +3636,7 @@
                             When your node daemon connects to the network, it communicates directly with peers over UDP. IP addresses are temporarily used in computer memory solely to route packets and prevent spam attacks. These network routing tables are routinely cleared every few minutes.
                         </p>
                         <p style="margin: 0;">
-                            The browser interface connects only to your local machine (<code>127.0.0.1:5554</code>). Your local connection data stays entirely on your device.
+                            When you run the wallet locally (opened from <code>localhost</code> or <code>127.0.0.1</code>), the browser interface connects only to your local node daemon (<code>127.0.0.1:5554</code>). If you use the hosted web explorer, your browser connects over an authenticated TLS WebSocket (<code>wss://node.centinel.network</code>) to a public seed node. Private key material is never transmitted to it: wallet-key synchronization is restricted to loopback connections, and the hosted demo wallet operates custodially (the node signs on-chain transfers itself). Math-rendering fonts and scripts are additionally loaded from the public <code>cdn.jsdelivr.net</code> CDN.
                         </p>
                     </section>
 
@@ -3759,9 +3759,9 @@
 
                     <!-- Section 7 -->
                     <section style="background-color: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 6px; padding: 16px 20px;">
-                        <h3 style="margin-top: 0; color: var(--accent-green); font-size: 1.05rem;">7. Open-Source Code and Copyleft</h3>
+                        <h3 style="margin-top: 0; color: var(--accent-green); font-size: 1.05rem;">7. Open-Source Code and License</h3>
                         <p style="margin: 0;">
-                            The Centinel protocol, documentation, and user interfaces are published as free and open-source software under distributed copyleft terms. You are free to inspect, audit, run, and build on the source code in accordance with the repository's open-source license.
+                            The Centinel protocol, documentation, and user interfaces are published as free and open-source software under the permissive MIT License (see the LICENSE file in the repository). You are free to inspect, audit, run, modify, and build on the source code, provided the original copyright notice and permission notice are preserved.
                         </p>
                     </section>
 
