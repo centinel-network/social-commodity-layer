@@ -4076,8 +4076,15 @@ int main(int argc, char *argv[]) {
         int mempool_sync = -1;
 
         if (bc_sync == 0) {
-            audit_sync = sync_audit(&state, sync_peer_pubkey);
-            mempool_sync = sync_pending_operations(&state, sync_peer_pubkey);
+            /* C3 fix (post-sync re-verification): re-check proposer signatures
+             * and epoch beacons across the freshly synced segment. */
+            if (scl_reverify_synced_segment(&state) != 0) {
+                fprintf(stderr, "[P2P] CRITICAL: post-sync re-verification FAILED — audit/mempool sync skipped\n");
+                bc_sync = -1;
+            } else {
+                audit_sync = sync_audit(&state, sync_peer_pubkey);
+                mempool_sync = sync_pending_operations(&state, sync_peer_pubkey);
+            }
         }
         
         // Tear down the sync lock globally only after all layers conclude
