@@ -71,6 +71,7 @@
 #include <math.h>
 #include <openssl/sha.h>
 #include <openssl/rand.h>
+#include <openssl/evp.h>
 #include <lz4.h>
 
 #include "constants.h"
@@ -1314,6 +1315,471 @@ static void test_integration_wasm_ffi_interface(void) {
     scl_rpc_parser_destroy(parser);
 }
 
+/* ============================================================================
+ * SECTION 5.1: SHAKE256 KNOWN-ANSWER TESTS (H-8 fix)
+ * ============================================================================
+ */
+
+static int shake256_xof(const uint8_t *msg, size_t msg_len, uint8_t *out, size_t out_len) {
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) return -1;
+    if (EVP_DigestInit_ex(ctx, EVP_shake256(), NULL) != 1 ||
+        (msg_len > 0 && EVP_DigestUpdate(ctx, msg, msg_len) != 1) ||
+        EVP_DigestFinalXOF(ctx, out, out_len) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return -1;
+    }
+    EVP_MD_CTX_free(ctx);
+    return 0;
+}
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int digest_matches_hex(const uint8_t *digest, size_t digest_len, const char *expect_hex) {
+    for (size_t i = 0; i < digest_len; i++) {
+        int hi = hex_nibble(expect_hex[i * 2]);
+        int lo = hex_nibble(expect_hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0 || (uint8_t)((hi << 4) | lo) != digest[i]) return 0;
+    }
+    return 1;
+}
+
+/**
+ * @brief SHAKE256 known-answer tests (NIST FIPS-202 reference vectors).
+ *
+ * Pins the OpenSSL XOF configuration used by the custom_shake256_inc_* sponge
+ * (EVP_shake256 absorb/squeeze in crypto.c — the root of nullifier PRF
+ * derivation, ZK Fiat-Shamir challenges, and threshold-signature challenges)
+ * against published reference digests, plus an incremental-absorb equivalence
+ * check mirroring the absorb/absorb/finalize/squeeze calling pattern. A
+ * tampered or misconfigured SHAKE256 (wrong rate, wrong domain separation,
+ * output truncation) fails here before it can silently corrupt nullifiers or
+ * challenges.
+ */
+static void test_shake256_known_answer_vectors(void) {
+    static const char *kat_empty =
+        "46b9dd2b0ba88d13233b3feb743eeb243fcd52ea62b81b82b50c27646ed5762f"
+        "d75dc4ddd8c0f200cb05019d67b592f6fc821c49479ab48640292eacb3b7c4be";
+    static const char *kat_abc =
+        "483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739"
+        "d5a15bef186a5386c75744c0527e1faa9f8726e462a12a4feb06bd8801e751e4";
+    static const char *kat_a1000 =
+        "e262331ad290c96ab1c0fa045470244b415ba6696a934d60f2999b8e92aaa24e"
+        "e8eb039abd7af7d64fde39fa73267b02fdd3a50e1b8651b846a9bb2cc4f344c5";
+
+    uint8_t out[100];
+
+    ASSERT_EQUAL_INT(shake256_xof(NULL, 0, out, 64), 0, "SHAKE256 KAT engine failure (empty)");
+    ASSERT_TRUE(digest_matches_hex(out, 64, kat_empty), "SHAKE256 KAT mismatch for empty message");
+
+    ASSERT_EQUAL_INT(shake256_xof((const uint8_t *)"abc", 3, out, 64), 0, "SHAKE256 KAT engine failure (abc)");
+    ASSERT_TRUE(digest_matches_hex(out, 64, kat_abc), "SHAKE256 KAT mismatch for \"abc\"");
+
+    uint8_t a1000[1000];
+    memset(a1000, 'a', sizeof(a1000));
+    ASSERT_EQUAL_INT(shake256_xof(a1000, sizeof(a1000), out, 64), 0, "SHAKE256 KAT engine failure (a x1000)");
+    ASSERT_TRUE(digest_matches_hex(out, 64, kat_a1000), "SHAKE256 KAT mismatch for 1000 x 'a'");
+
+    /* XOF stream-prefix property: squeezing 100 bytes shares its prefix with
+     * any longer squeeze of the same absorbed message. */
+    ASSERT_EQUAL_INT(shake256_xof((const uint8_t *)"abc", 3, out, 100), 0, "SHAKE256 KAT engine failure (100B)");
+    ASSERT_TRUE(digest_matches_hex(out, 100,
+        "483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739"
+        "d5a15bef186a5386c75744c0527e1faa9f8726e462a12a4feb06bd8801e751e4"
+        "1385141204f329979fd3047a13c5657724ada64d2470157b3cdc288620944d78"), "SHAKE256 100-byte squeeze KAT mismatch");
+
+    /* Incremental absorb equivalence: absorb("") then ("ab") then ("c") must
+     * equal the one-shot digest of "abc" — the exact calling pattern of
+     * custom_shake256_inc_absorb() in the PRF/Fiat-Shamir pipelines. */
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    ASSERT_TRUE(ctx != NULL, "EVP_MD_CTX_new failed");
+    ASSERT_EQUAL_INT(EVP_DigestInit_ex(ctx, EVP_shake256(), NULL), 1, "EVP_DigestInit_ex failed");
+    ASSERT_EQUAL_INT(EVP_DigestUpdate(ctx, (const uint8_t *)"", 0), 1, "EVP_DigestUpdate (empty chunk) failed");
+    ASSERT_EQUAL_INT(EVP_DigestUpdate(ctx, (const uint8_t *)"ab", 2), 1, "EVP_DigestUpdate (ab) failed");
+    ASSERT_EQUAL_INT(EVP_DigestUpdate(ctx, (const uint8_t *)"c", 1), 1, "EVP_DigestUpdate (c) failed");
+    ASSERT_EQUAL_INT(EVP_DigestFinalXOF(ctx, out, 64), 1, "EVP_DigestFinalXOF failed");
+    EVP_MD_CTX_free(ctx);
+    ASSERT_TRUE(digest_matches_hex(out, 64, kat_abc), "SHAKE256 incremental absorb diverges from one-shot digest");
+}
+
+/* ============================================================================
+ * SECTION 5.2: INTRA-BLOCK FORGERY NEGATIVE TESTS (H-1 fix regression tests)
+ * ============================================================================
+ */
+
+/**
+ * @brief Funds a coin and a full-range pointer owned by `wallet` (hermetic).
+ *
+ * Mirrors the funding block of test_integration_block_lifecycle so the
+ * forgery tests can arm two independent wallets (victim + attacker).
+ */
+static void forgery_fund_wallet(State *state, UserWallet *wallet, uint8_t tx_fill,
+                                uint64_t total_subunits, SCLCoin *out_coin, Pointer *out_ptr) {
+    uint8_t creation_hash[32];
+    memset(creation_hash, tx_fill, 32);
+    *out_coin = create_coin(creation_hash, wallet->dilithium_pubkey);
+    out_coin->total_subunits = total_subunits;
+    out_coin->remaining_subunits = total_subunits;
+
+    SCLCoin *coin_heap = malloc(sizeof(SCLCoin));
+    *coin_heap = *out_coin;
+    hash_table_insert(state->bc.coin_table, out_coin->coin_id, coin_heap, HASH_ENTRY_COIN);
+
+    memset(out_ptr, 0, sizeof(Pointer));
+    memcpy(out_ptr->parent_coin_id, out_coin->coin_id, COIN_ID_LEN);
+    out_ptr->start_subunit = 0;
+    out_ptr->end_subunit = total_subunits - 1;
+    out_ptr->staked = 0;
+    out_ptr->spent = 0;
+    memcpy(out_ptr->owner_address, out_coin->owner_address, USER_ID_LEN);
+    memcpy(out_ptr->prev_tx_hash, out_coin->creation_tx_hash, COIN_ID_LEN);
+
+    uint8_t pointer_data[COIN_ID_LEN + USER_ID_LEN + sizeof(uint64_t) * 2 + COIN_ID_LEN];
+    uint8_t *pd = pointer_data;
+    memcpy(pd, out_ptr->parent_coin_id, COIN_ID_LEN); pd += COIN_ID_LEN;
+    memcpy(pd, out_ptr->owner_address, USER_ID_LEN); pd += USER_ID_LEN;
+    uint64_t start_be = htobe64(out_ptr->start_subunit);
+    memcpy(pd, &start_be, sizeof(uint64_t)); pd += sizeof(uint64_t);
+    uint64_t end_be = htobe64(out_ptr->end_subunit);
+    memcpy(pd, &end_be, sizeof(uint64_t)); pd += sizeof(uint64_t);
+    memcpy(pd, out_ptr->prev_tx_hash, COIN_ID_LEN); pd += COIN_ID_LEN;
+    SHA256(pointer_data, sizeof(pointer_data), out_ptr->pointer_id);
+
+    hash_table_insert(state->bc.pointer_table, out_ptr->pointer_id, out_ptr, HASH_ENTRY_POINTER);
+    add_pointer_id_to_coin(state->bc.coin_pointers, out_ptr->parent_coin_id, out_ptr->pointer_id);
+
+    if (state->bc.insert_order_count < state->bc.insert_order_capacity) {
+        state->bc.insert_order[state->bc.insert_order_count++] = coin_heap;
+    }
+    mmr_add(state->bc.mmr, out_coin->coin_id, out_coin->remaining_subunits);
+}
+
+/**
+ * @brief Builds a fully signed OP_TRANSFER_POINTER spending `input`.
+ *
+ * All signatures are produced with `wallet` (ML-DSA-87 over the inputs Merkle
+ * root and the canonical transfer payload); the ZK-PRF proof and nullifier are
+ * generated with the wallet's PRF key, exactly as the wallet client does.
+ */
+static void forgery_build_transfer(State *state, UserWallet *wallet, const Pointer *input,
+                                   const SCLCoin *parent_coin, const uint8_t *recipient_pubkey,
+                                   uint64_t amount, uint8_t nonce_fill, bool attach_mmr_proof,
+                                   TransferData *tx) {
+    memset(tx, 0, sizeof(TransferData));
+    tx->num_inputs = 1;
+    tx->inputs[0] = *input;
+    memcpy(tx->recipient_pubkey, recipient_pubkey, PUBKEY_LEN);
+    memcpy(tx->sender_pubkey, wallet->dilithium_pubkey, PUBKEY_LEN);
+    tx->amount = amount;
+    memset(tx->nonce, nonce_fill, 8);
+    get_mmr_root(&state->bc, tx->client_root);
+
+    if (attach_mmr_proof) {
+        ssize_t leaf_pos = mmr_get_leaf_position(state->bc.mmr, parent_coin->coin_id, parent_coin->remaining_subunits);
+        ASSERT_TRUE(leaf_pos != -1, "Forgery test MMR leaf must exist");
+        mmr_generate_proof(state->bc.mmr, (size_t)leaf_pos, tx->proofs[0].path_hashes, tx->proofs[0].is_left,
+                           &tx->proofs[0].path_len, tx->proofs[0].left_peaks, &tx->proofs[0].left_peaks_len,
+                           tx->proofs[0].right_peaks, &tx->proofs[0].right_peaks_len);
+    }
+
+    compute_inputs_merkle_root(tx->inputs, tx->num_inputs, tx->inputs_merkle_root);
+    dilithium_sign(tx->inputs_merkle_root, COIN_ID_LEN, wallet->dilithium_privkey, tx->inputs_root_signature);
+
+    size_t payload_len;
+    uint8_t payload_buf[65536];
+    serialize_transfer_payload(tx, payload_buf, &payload_len);
+    SHA256(payload_buf, payload_len, tx->tx_id);
+
+    prf_evaluate(tx->prf_output, &wallet->prf_key, tx->tx_id, COIN_ID_LEN, tx->client_root);
+    size_t zk_len = ZK_PROOF_MAX_LEN;
+    generate_zk_prf_proof(tx->zk_proof, &zk_len, tx->tx_id, COIN_ID_LEN,
+                          (const uint8_t *)wallet->prf_key.k, sizeof(wallet->prf_key.k), tx->client_root);
+    tx->zk_proof_len = zk_len;
+
+    uint8_t sig_payload[65536];
+    size_t sig_payload_len;
+    serialize_transfer_for_signature(tx, sig_payload, &sig_payload_len);
+    dilithium_sign(sig_payload, sig_payload_len, wallet->dilithium_privkey, tx->signature);
+}
+
+/**
+ * @brief H-1 regression test: a block containing [legit transfer T] +
+ *        [forged transfer of a victim pointer with prev_tx_hash = T.tx_id]
+ *        MUST be rejected by apply_block.
+ *
+ * Pre-fix behavior: the forged child skipped validate_operation entirely in
+ * Pass 1 (parent_in_block bypass) and update_transfer_state only checked the
+ * spent flag in Pass 2, so the victim's pointer was reassigned to the
+ * attacker. Post-fix, the child fails the sender/owner address binding in
+ * Pass 1 (validate_operation_auth).
+ */
+static void test_intra_block_forgery_rejected(void) {
+    State *state = calloc(1, sizeof(State));
+    ASSERT_TRUE(state != NULL, "Failed to allocate State");
+    ASSERT_EQUAL_INT(client_state_init(state, 0), 0, "client_state_init failed");
+
+    scl_db_delete_blocks_after(0);
+    state->current_block_number = 0;
+    memset(state->current_block_hash, 0, COIN_ID_LEN);
+    state->bc.sync_epoch = 1;
+
+    ASSERT_EQUAL_INT(create_user_wallet(&state->user_wallet), 1, "create_user_wallet (victim) failed");
+
+    UserWallet attacker_wallet;
+    ASSERT_EQUAL_INT(create_user_wallet(&attacker_wallet), 1, "create_user_wallet (attacker) failed");
+
+    state->bc.insert_order_capacity = 4;
+    state->bc.insert_order = calloc(state->bc.insert_order_capacity, sizeof(SCLCoin *));
+    state->bc.insert_order_count = 0;
+
+    SCLCoin victim_coin, attacker_coin;
+    Pointer victim_ptr, attacker_ptr;
+    pthread_rwlock_wrlock(&state->bc.rwlock);
+    forgery_fund_wallet(state, &state->user_wallet, 0x55, 1000 * SUBUNITS_PER_COIN, &victim_coin, &victim_ptr);
+    forgery_fund_wallet(state, &attacker_wallet, 0x66, 1000 * SUBUNITS_PER_COIN, &attacker_coin, &attacker_ptr);
+    pthread_rwlock_unlock(&state->bc.rwlock);
+
+    const uint64_t transfer_amount = 100 * SUBUNITS_PER_COIN;
+
+    /* Op 0: the attacker's own legitimate transfer (spends the attacker's
+     * pointer, recipient = attacker). */
+    TransferData t_tx;
+    forgery_build_transfer(state, &attacker_wallet, &attacker_ptr, &attacker_coin,
+                           attacker_wallet.dilithium_pubkey, transfer_amount, 0x44, true, &t_tx);
+
+    /* Op 1: the forged child. Declares the VICTIM's pointer verbatim (so
+     * update_transfer_state would find and move it) EXCEPT prev_tx_hash is set
+     * to T's tx_id, which is what triggered the intra-block bypass. Signed by
+     * the ATTACKER — the theft attempt. */
+    TransferData f_tx;
+    forgery_build_transfer(state, &attacker_wallet, &victim_ptr, &victim_coin,
+                           attacker_wallet.dilithium_pubkey, transfer_amount, 0x77, false, &f_tx);
+    memcpy(f_tx.inputs[0].prev_tx_hash, t_tx.tx_id, COIN_ID_LEN);
+    /* Re-sign over the tampered input set: the attacker can and does produce
+     * internally consistent signatures — the theft is an authorization
+     * failure, not a signature-format failure. */
+    compute_inputs_merkle_root(f_tx.inputs, f_tx.num_inputs, f_tx.inputs_merkle_root);
+    dilithium_sign(f_tx.inputs_merkle_root, COIN_ID_LEN, attacker_wallet.dilithium_privkey, f_tx.inputs_root_signature);
+    {
+        size_t payload_len;
+        uint8_t payload_buf[65536];
+        serialize_transfer_payload(&f_tx, payload_buf, &payload_len);
+        SHA256(payload_buf, payload_len, f_tx.tx_id);
+    }
+    prf_evaluate(f_tx.prf_output, &attacker_wallet.prf_key, f_tx.tx_id, COIN_ID_LEN, f_tx.client_root);
+    {
+        size_t zk_len = ZK_PROOF_MAX_LEN;
+        generate_zk_prf_proof(f_tx.zk_proof, &zk_len, f_tx.tx_id, COIN_ID_LEN,
+                              (const uint8_t *)attacker_wallet.prf_key.k, sizeof(attacker_wallet.prf_key.k), f_tx.client_root);
+        f_tx.zk_proof_len = zk_len;
+    }
+    {
+        uint8_t sig_payload[65536];
+        size_t sig_payload_len;
+        serialize_transfer_for_signature(&f_tx, sig_payload, &sig_payload_len);
+        dilithium_sign(sig_payload, sig_payload_len, attacker_wallet.dilithium_privkey, f_tx.signature);
+    }
+
+    Operation ops[2];
+    memset(ops, 0, sizeof(ops));
+    ops[0].type = OP_TRANSFER_POINTER;
+    ops[0].data.transfer_pointer = t_tx;
+    ops[1].type = OP_TRANSFER_POINTER;
+    ops[1].data.transfer_pointer = f_tx;
+
+    /* Batch ZK-PRF data: 4-byte BE length prefix per proof (both proofs are
+     * genuinely valid — the block is otherwise fully legitimate). */
+    size_t batch_len = (4 + t_tx.zk_proof_len) + (4 + f_tx.zk_proof_len);
+    uint8_t *batch_zk_proof = malloc(batch_len);
+    uint8_t *batch_prf_outputs = malloc(2 * NULLIFIER_LEN);
+    ASSERT_TRUE(batch_zk_proof && batch_prf_outputs, "Failed to allocate forgery batch buffers");
+    {
+        uint32_t be = htobe32((uint32_t)t_tx.zk_proof_len);
+        memcpy(batch_zk_proof, &be, 4);
+        memcpy(batch_zk_proof + 4, t_tx.zk_proof, t_tx.zk_proof_len);
+        uint8_t *p2 = batch_zk_proof + 4 + t_tx.zk_proof_len;
+        be = htobe32((uint32_t)f_tx.zk_proof_len);
+        memcpy(p2, &be, 4);
+        memcpy(p2 + 4, f_tx.zk_proof, f_tx.zk_proof_len);
+        memcpy(batch_prf_outputs, t_tx.prf_output, NULLIFIER_LEN);
+        memcpy(batch_prf_outputs + NULLIFIER_LEN, f_tx.prf_output, NULLIFIER_LEN);
+    }
+
+    Block *block = create_block(1, state->current_block_hash, ops, 2,
+                                state->user_wallet.dilithium_pubkey,
+                                state->user_wallet.dilithium_privkey,
+                                12345, 2, batch_prf_outputs, batch_zk_proof, batch_len);
+    ASSERT_TRUE(block != NULL, "Failed to create forgery block");
+
+    /* The block is otherwise fully legitimate — exactly the stealth attack. */
+    ASSERT_EQUAL_INT(verify_block_heavy_crypto(block), 0, "verify_block_heavy_crypto failed on forgery block");
+
+    /* H-1 fix: the forged child must be rejected. */
+    int apply_res = apply_block(state, block);
+    ASSERT_EQUAL_INT(apply_res, -1, "apply_block MUST reject the intra-block forged transfer (fund-theft regression)");
+
+    /* The victim's pointer must be intact and unspent. */
+    Pointer *vp = hash_table_lookup(state->bc.pointer_table, victim_ptr.pointer_id, false);
+    ASSERT_TRUE(vp != NULL, "Victim pointer must still exist after rejected block");
+    ASSERT_TRUE(vp->spent == 0, "Victim pointer must remain unspent after rejected block");
+
+    free(batch_zk_proof);
+    free(batch_prf_outputs);
+    free_block(block);
+    for (size_t i = 0; i < state->bc.insert_order_count; i++) free(state->bc.insert_order[i]);
+    free(state->bc.insert_order);
+    client_state_destroy(state);
+    free(state);
+}
+
+/**
+ * @brief H-1 regression test: a chained child declaring ledger-mismatched
+ *        input fields (lying end_subunit) MUST be rejected by the Pass 2
+ *        re-validation.
+ *
+ * Pre-fix behavior: the chained child skipped validation and
+ * update_transfer_state used the LEDGER's subunit range while trusting the
+ * declared fields for nothing — a signed lie was silently accepted.
+ */
+static void test_pass2_revalidation_rejects_field_mismatch(void) {
+    State *state = calloc(1, sizeof(State));
+    ASSERT_TRUE(state != NULL, "Failed to allocate State");
+    ASSERT_EQUAL_INT(client_state_init(state, 0), 0, "client_state_init failed");
+
+    scl_db_delete_blocks_after(0);
+    state->current_block_number = 0;
+    memset(state->current_block_hash, 0, COIN_ID_LEN);
+    state->bc.sync_epoch = 1;
+
+    ASSERT_EQUAL_INT(create_user_wallet(&state->user_wallet), 1, "create_user_wallet failed");
+
+    state->bc.insert_order_capacity = 4;
+    state->bc.insert_order = calloc(state->bc.insert_order_capacity, sizeof(SCLCoin *));
+    state->bc.insert_order_count = 0;
+
+    SCLCoin coin;
+    Pointer ptr;
+    pthread_rwlock_wrlock(&state->bc.rwlock);
+    forgery_fund_wallet(state, &state->user_wallet, 0x55, 1000 * SUBUNITS_PER_COIN, &coin, &ptr);
+    pthread_rwlock_unlock(&state->bc.rwlock);
+
+    const uint64_t transfer_amount = 100 * SUBUNITS_PER_COIN;
+
+    /* Op 0: legitimate self-transfer (recipient = self, so the output pointer
+     * belongs to the same wallet and the chained child is properly signed by
+     * its true owner). */
+    TransferData t_tx;
+    forgery_build_transfer(state, &state->user_wallet, &ptr, &coin,
+                           state->user_wallet.dilithium_pubkey, transfer_amount, 0x11, true, &t_tx);
+
+    /* Op 1: chained child spending T's deterministic output pointer
+     * [0, amount-1], but declaring end_subunit = amount (one past the real
+     * end) while keeping the REAL pointer_id so the ledger lookup succeeds.
+     * Fully signed by the true owner — only the declared fields lie. */
+    Pointer child_input;
+    memset(&child_input, 0, sizeof(Pointer));
+    memcpy(child_input.parent_coin_id, coin.coin_id, COIN_ID_LEN);
+    child_input.start_subunit = 0;
+    child_input.end_subunit = transfer_amount - 1;
+    memcpy(child_input.owner_address, ptr.owner_address, USER_ID_LEN);
+    memcpy(child_input.prev_tx_hash, t_tx.tx_id, COIN_ID_LEN);
+    {
+        uint8_t pointer_data[COIN_ID_LEN + USER_ID_LEN + sizeof(uint64_t) * 2 + COIN_ID_LEN];
+        uint8_t *pd = pointer_data;
+        memcpy(pd, child_input.parent_coin_id, COIN_ID_LEN); pd += COIN_ID_LEN;
+        memcpy(pd, child_input.owner_address, USER_ID_LEN); pd += USER_ID_LEN;
+        uint64_t start_be = htobe64(child_input.start_subunit);
+        memcpy(pd, &start_be, sizeof(uint64_t)); pd += sizeof(uint64_t);
+        uint64_t end_be = htobe64(child_input.end_subunit);
+        memcpy(pd, &end_be, sizeof(uint64_t)); pd += sizeof(uint64_t);
+        memcpy(pd, child_input.prev_tx_hash, COIN_ID_LEN); pd += COIN_ID_LEN;
+        SHA256(pointer_data, sizeof(pointer_data), child_input.pointer_id);
+    }
+    /* The lie: declared range is [0, amount] while the real output ends at
+     * amount-1. pointer_id stays the REAL one so Pass 2 finds the entry. */
+    child_input.end_subunit = transfer_amount;
+
+    TransferData c_tx;
+    forgery_build_transfer(state, &state->user_wallet, &child_input, &coin,
+                           state->user_wallet.dilithium_pubkey, 1 * SUBUNITS_PER_COIN, 0x22, false, &c_tx);
+    /* prev_tx_hash must equal the parent's tx_id (the chaining trigger). */
+    memcpy(c_tx.inputs[0].prev_tx_hash, t_tx.tx_id, COIN_ID_LEN);
+    compute_inputs_merkle_root(c_tx.inputs, c_tx.num_inputs, c_tx.inputs_merkle_root);
+    dilithium_sign(c_tx.inputs_merkle_root, COIN_ID_LEN, state->user_wallet.dilithium_privkey, c_tx.inputs_root_signature);
+    {
+        size_t payload_len;
+        uint8_t payload_buf[65536];
+        serialize_transfer_payload(&c_tx, payload_buf, &payload_len);
+        SHA256(payload_buf, payload_len, c_tx.tx_id);
+    }
+    prf_evaluate(c_tx.prf_output, &state->user_wallet.prf_key, c_tx.tx_id, COIN_ID_LEN, c_tx.client_root);
+    {
+        size_t zk_len = ZK_PROOF_MAX_LEN;
+        generate_zk_prf_proof(c_tx.zk_proof, &zk_len, c_tx.tx_id, COIN_ID_LEN,
+                              (const uint8_t *)state->user_wallet.prf_key.k, sizeof(state->user_wallet.prf_key.k), c_tx.client_root);
+        c_tx.zk_proof_len = zk_len;
+    }
+    {
+        uint8_t sig_payload[65536];
+        size_t sig_payload_len;
+        serialize_transfer_for_signature(&c_tx, sig_payload, &sig_payload_len);
+        dilithium_sign(sig_payload, sig_payload_len, state->user_wallet.dilithium_privkey, c_tx.signature);
+    }
+
+    Operation ops[2];
+    memset(ops, 0, sizeof(ops));
+    ops[0].type = OP_TRANSFER_POINTER;
+    ops[0].data.transfer_pointer = t_tx;
+    ops[1].type = OP_TRANSFER_POINTER;
+    ops[1].data.transfer_pointer = c_tx;
+
+    size_t batch_len = (4 + t_tx.zk_proof_len) + (4 + c_tx.zk_proof_len);
+    uint8_t *batch_zk_proof = malloc(batch_len);
+    uint8_t *batch_prf_outputs = malloc(2 * NULLIFIER_LEN);
+    ASSERT_TRUE(batch_zk_proof && batch_prf_outputs, "Failed to allocate mismatch batch buffers");
+    {
+        uint32_t be = htobe32((uint32_t)t_tx.zk_proof_len);
+        memcpy(batch_zk_proof, &be, 4);
+        memcpy(batch_zk_proof + 4, t_tx.zk_proof, t_tx.zk_proof_len);
+        uint8_t *p2 = batch_zk_proof + 4 + t_tx.zk_proof_len;
+        be = htobe32((uint32_t)c_tx.zk_proof_len);
+        memcpy(p2, &be, 4);
+        memcpy(p2 + 4, c_tx.zk_proof, c_tx.zk_proof_len);
+        memcpy(batch_prf_outputs, t_tx.prf_output, NULLIFIER_LEN);
+        memcpy(batch_prf_outputs + NULLIFIER_LEN, c_tx.prf_output, NULLIFIER_LEN);
+    }
+
+    Block *block = create_block(1, state->current_block_hash, ops, 2,
+                                state->user_wallet.dilithium_pubkey,
+                                state->user_wallet.dilithium_privkey,
+                                54321, 2, batch_prf_outputs, batch_zk_proof, batch_len);
+    ASSERT_TRUE(block != NULL, "Failed to create mismatch block");
+    ASSERT_EQUAL_INT(verify_block_heavy_crypto(block), 0, "verify_block_heavy_crypto failed on mismatch block");
+
+    /* H-1 fix: Pass 2 re-validation must reject the lying declared fields. */
+    int apply_res = apply_block(state, block);
+    ASSERT_EQUAL_INT(apply_res, -1, "apply_block MUST reject chained op with ledger-mismatched declared fields");
+
+    /* H-7 rollback: the parent's application must have been undone — the
+     * original pointer is unspent again. */
+    Pointer *pp = hash_table_lookup(state->bc.pointer_table, ptr.pointer_id, false);
+    ASSERT_TRUE(pp != NULL, "Original pointer must be restored by rollback");
+    ASSERT_TRUE(pp->spent == 0, "Original pointer must be unspent after rollback");
+
+    free(batch_zk_proof);
+    free(batch_prf_outputs);
+    free_block(block);
+    for (size_t i = 0; i < state->bc.insert_order_count; i++) free(state->bc.insert_order[i]);
+    free(state->bc.insert_order);
+    client_state_destroy(state);
+    free(state);
+}
+
 /* ============================================================================ */
 /* SECTION 3: MAIN TEST EXECUTION ENTRYPOINT                                    */
 /* ============================================================================ */
@@ -1321,8 +1787,9 @@ static void test_integration_wasm_ffi_interface(void) {
  * @brief Primary entrypoint for the core unit and integration test suite (`unit_tests.c`).
  *
  * @details
- * Sequentially invokes all 16 component test cases spanning hash tables, MMR trees,
- * lattice cryptography, transaction utilities, block application, and WASM FFI bridges.
+ * Sequentially invokes all 22 component test cases spanning hash tables, MMR trees,
+ * lattice cryptography, SHAKE256 KATs, transaction utilities, block application,
+ * intra-block forgery regression, and WASM FFI bridges.
  * Terminates via `exit(1)` immediately if any assertion fails.
  *
  * @return int Returns 0 on unconditional pass of all test suites.
@@ -1346,6 +1813,7 @@ int main(void) {
 
     /* Unit Tests - Section 3: Post-Quantum & Lattice Cryptography */
     RUN_TEST(test_crypto_dilithium_keypair_locks);
+    RUN_TEST(test_shake256_known_answer_vectors);
     RUN_TEST(test_poly_uniform_with_bound);
     RUN_TEST(test_poly_mul_sparse);
     RUN_TEST(test_decompose_math);
@@ -1358,6 +1826,8 @@ int main(void) {
 
     /* Integration Tests - Section 5: Ledger Lifecycle & WebAssembly Bridges */
     RUN_TEST(test_integration_block_lifecycle);
+    RUN_TEST(test_intra_block_forgery_rejected);
+    RUN_TEST(test_pass2_revalidation_rejects_field_mismatch);
     RUN_TEST(test_integration_drift_cert_anchor_lifecycle);
     RUN_TEST(test_integration_supply_reward_invariant);
     RUN_TEST(test_integration_wasm_ffi_interface);
