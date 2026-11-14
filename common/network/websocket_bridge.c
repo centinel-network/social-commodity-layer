@@ -1497,7 +1497,89 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                     rh->status_code = htobe16(SCL_RPC_STATUS_RATE_LIMITED);
                 }
             } else {
-                rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
+                /* H-2 completion (custodial intent): unsigned SubmitTx frames are
+                 * accepted ONLY as OP_TRANSFER_POINTER intents whose sender is the
+                 * node's disposable testnet identity wallet (a zeroed sender_pubkey
+                 * is also accepted and normalized to it). The node executes the
+                 * intent custodially — it re-selects inputs, re-signs, and
+                 * broadcasts the on-chain transfer itself, so no secret key ever
+                 * needs to reach the browser. This preserves the hosted
+                 * shared-wallet demo now that GetChainInfo no longer serves the
+                 * private key to non-loopback clients. Every other unsigned
+                 * operation is rejected: staking/unstaking custodially moves
+                 * OPERATOR funds and must stay behind ML-DSA-87 frame
+                 * authentication. */
+                Operation *op = calloc(1, sizeof(Operation));
+                if (op && final_payload_len > 0 &&
+                    deserialize_operation(final_payload, final_payload_len, op, 1) > 0) {
+                    if (op->type == OP_TRANSFER_POINTER) {
+                        pthread_mutex_lock(&state->wallet_mutex);
+                        bool custodial_sender = is_zeroed(op->data.transfer_pointer.sender_pubkey, PUBKEY_LEN) ||
+                            memcmp(op->data.transfer_pointer.sender_pubkey,
+                                   state->testnet_identity_wallet.dilithium_pubkey, PUBKEY_LEN) == 0;
+                        pthread_mutex_unlock(&state->wallet_mutex);
+
+                        if (custodial_sender) {
+                            uint8_t memo_op_type = 0;
+                            uint8_t memo_tx_id[COIN_ID_LEN];
+                            if (settlement_memo_lookup(req_id, &memo_op_type, memo_tx_id) && memo_op_type == 0x02) {
+                                resp_buf[32] = 0x02;
+                                memcpy(resp_buf + 33, memo_tx_id, COIN_ID_LEN);
+                                actual_payload_len = 1 + COIN_ID_LEN;
+                                free(op);
+                                break;
+                            }
+
+                            UserWallet funding_snapshot;
+                            pthread_mutex_lock(&state->wallet_mutex);
+                            funding_snapshot = state->testnet_identity_wallet;
+                            pthread_mutex_unlock(&state->wallet_mutex);
+
+                            uint8_t settled_tx_id[COIN_ID_LEN];
+                            int added = create_and_broadcast_transfer_as(state, &funding_snapshot,
+                                        op->data.transfer_pointer.recipient_pubkey,
+                                        op->data.transfer_pointer.amount, false,
+                                        NULL, 0, NULL, settled_tx_id);
+                            if (added == 0) {
+                                resp_buf[32] = 0x02;
+                                memcpy(resp_buf + 33, settled_tx_id, COIN_ID_LEN);
+                                actual_payload_len = 1 + COIN_ID_LEN;
+                                settlement_memo_store(req_id, 0x02, settled_tx_id);
+                            } else if (added == 2) {
+                                rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
+                                const char *err_msg = "Settlement deferred: the funding wallet's inputs are locked by a pending mempool operation. Retry after the next block.";
+                                size_t err_len = strlen(err_msg) + 1;
+                                rh->error_msg_len = htobe16((uint16_t)err_len);
+                                memcpy(resp_buf + 32, err_msg, err_len);
+                                actual_payload_len = err_len;
+                            } else {
+                                rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
+                                const char *err_msg = "Settlement failed: the funding wallet cannot cover the payment plus network fee.";
+                                size_t err_len = strlen(err_msg) + 1;
+                                rh->error_msg_len = htobe16((uint16_t)err_len);
+                                memcpy(resp_buf + 32, err_msg, err_len);
+                                actual_payload_len = err_len;
+                            }
+                        } else {
+                            rh->status_code = htobe16(SCL_RPC_STATUS_UNAUTHORIZED);
+                            const char *err_msg = "Unsigned transfers are only accepted for the shared testnet identity wallet";
+                            size_t err_len = strlen(err_msg) + 1;
+                            rh->error_msg_len = htobe16((uint16_t)err_len);
+                            memcpy(resp_buf + 32, err_msg, err_len);
+                            actual_payload_len = err_len;
+                        }
+                    } else {
+                        rh->status_code = htobe16(SCL_RPC_STATUS_UNAUTHORIZED);
+                        const char *err_msg = "Unsigned operations are not accepted (custodial intents are limited to testnet transfers)";
+                        size_t err_len = strlen(err_msg) + 1;
+                        rh->error_msg_len = htobe16((uint16_t)err_len);
+                        memcpy(resp_buf + 32, err_msg, err_len);
+                        actual_payload_len = err_len;
+                    }
+                } else {
+                    rh->status_code = htobe16(SCL_RPC_STATUS_INVALID_ARGS);
+                }
+                if (op) free(op);
             }
             break;
         }
@@ -1803,9 +1885,36 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
             memcpy(resp_buf + 32 + 28, &last_dkg_be, 8);
             memcpy(resp_buf + 32 + 36, &total_fees_be, 8);
             
+            /* H-2 completion (bidirectional key hygiene): the shared testnet
+             * identity SECRET key is served to loopback browsers only (local dev
+             * flows are unchanged). Remote/hosted explorer clients receive the
+             * identical wire layout with a zero-filled private-key region, so
+             * every downstream offset (fee-recipient pubkey) stays compatible and
+             * the worker's length-guarded parser needs no changes; the hosted demo
+             * wallet submits custodial transfer intents instead (see the unsigned
+             * SubmitTx path). */
+            bool bridge_client_is_loopback = false;
+            struct sockaddr_storage bridge_peer_addr;
+            socklen_t bridge_peer_len = sizeof(bridge_peer_addr);
+            if (getpeername(tcp_fd, (struct sockaddr *)&bridge_peer_addr, &bridge_peer_len) == 0) {
+                if (bridge_peer_addr.ss_family == AF_INET) {
+                    bridge_client_is_loopback =
+                        (((struct sockaddr_in *)&bridge_peer_addr)->sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+                } else if (bridge_peer_addr.ss_family == AF_INET6) {
+                    const struct in6_addr *a6 = &((struct sockaddr_in6 *)&bridge_peer_addr)->sin6_addr;
+                    bridge_client_is_loopback = (memcmp(a6, &in6addr_loopback, sizeof(struct in6_addr)) == 0) ||
+                                               (IN6_IS_ADDR_V4MAPPED(a6) &&
+                                                ((const uint8_t *)a6)[12] == 127 && ((const uint8_t *)a6)[13] == 0 &&
+                                                ((const uint8_t *)a6)[14] == 0 && ((const uint8_t *)a6)[15] == 1);
+                }
+            }
             pthread_mutex_lock(&state->wallet_mutex);
             memcpy(resp_buf + 32 + 44, state->testnet_identity_wallet.dilithium_pubkey, PUBKEY_LEN);
-            memcpy(resp_buf + 32 + 44 + PUBKEY_LEN, state->testnet_identity_wallet.dilithium_privkey, PRIVKEY_LEN);
+            if (bridge_client_is_loopback) {
+                memcpy(resp_buf + 32 + 44 + PUBKEY_LEN, state->testnet_identity_wallet.dilithium_privkey, PRIVKEY_LEN);
+            } else {
+                memset(resp_buf + 32 + 44 + PUBKEY_LEN, 0, PRIVKEY_LEN);
+            }
             /* SCL402: append the fee-recipient pubkey (user_wallet — the wallet
              * whose SHA-256 address is SclRpcPaymentChallenge.recipient_address).
              * Public key only; the operator secret never leaves the node. Browsers
