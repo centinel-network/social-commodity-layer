@@ -1885,11 +1885,6 @@
             width: 100%;
         }
 
-        .copyleft {
-            display: inline-block;
-            transform: scaleX(-1); /* Flips the copyright symbol horizontally */
-        }
-
         @media (max-width: 1200px) {
             .control-panel {
                 grid-template-columns: 1fr;
@@ -3636,7 +3631,7 @@
                             When your node daemon connects to the network, it communicates directly with peers over UDP. IP addresses are temporarily used in computer memory solely to route packets and prevent spam attacks. These network routing tables are routinely cleared every few minutes.
                         </p>
                         <p style="margin: 0;">
-                            When you run the wallet locally (opened from <code>localhost</code> or <code>127.0.0.1</code>), the browser interface connects only to your local node daemon (<code>127.0.0.1:5554</code>). If you use the hosted web explorer, your browser connects over an authenticated TLS WebSocket (<code>wss://node.centinel.network</code>) to a public seed node. Private key material is never transmitted to it: wallet-key synchronization is restricted to loopback connections, and the hosted demo wallet operates custodially (the node signs on-chain transfers itself). Math-rendering fonts and scripts are additionally loaded from the public <code>cdn.jsdelivr.net</code> CDN.
+                            When you run the wallet locally (opened from <code>localhost</code> or <code>127.0.0.1</code>), the browser interface connects only to your local node daemon (<code>127.0.0.1:5554</code>). If you use the hosted web explorer, your browser connects over an authenticated TLS WebSocket (<code>wss://node.centinel.network</code>) to a public seed node. Private key material and PRF seeds are never transmitted from the browser to any node over the WebSocket bridge; credentials remain strictly client-side, while the hosted demo wallet operates custodially (the node signs on-chain transfers using its own server-side identity). Math-rendering fonts and scripts are additionally loaded from the public <code>cdn.jsdelivr.net</code> CDN.
                         </p>
                     </section>
 
@@ -5236,10 +5231,10 @@ end Satocialist.Quantum.TVD</code></pre>
                     </div>
                     <div class="faq-answer-container">
                         <div class="faq-answer faq-answer-eli5">
-                            The Web Wallet serves as a visual remote control for your validator node program. Because regular web browsers cannot connect directly to low-level peer-to-peer network ports, you run the validator node software on your computer. When you generate or load your wallet credentials in the browser and connect, the Web Wallet securely sends your keys to the node program. Your node immediately adopts this identity to validate transactions, stake coins, and propose blocks.
+                            The Web Wallet serves as a visual client interface for your validator node program over a WebSocket connection. Because regular web browsers cannot connect directly to low-level peer-to-peer network ports, the node software handles network communication separately. By design, the Web Wallet never sends your private keys or secret seeds to the node—they stay strictly inside your browser, while only your public identity is used to query balances and decrypt your private viewports locally.
                         </div>
                         <div class="faq-answer faq-answer-tech" style="display: none;">
-                            The Web Wallet acts as an isolated client-side interface communicating with your local node program over a secure WebSocket bridge. Because browser environments cannot bind raw transport sockets for peer-to-peer gossip, the local daemon manages network-layer consensus and threshold ceremonies. Establishing a connection triggers an internal key synchronization routine that updates the daemon's active signing keys, transport encryption keys, and evaluation seeds in memory and updates local storage.
+                            The Web Wallet acts as an isolated client-side interface communicating with a node daemon over a WebSocket bridge. Because browser environments cannot bind raw transport sockets for peer-to-peer gossip, the node daemon manages network-layer consensus and threshold ceremonies using its own configured identity. By design, the browser client never transmits private ML-DSA-87 signing keys or private PRF seeds to the node; credentials remain strictly in client-side memory (and optionally in your AES-GCM-256 encrypted IndexedDB vault), while only public keys/identifiers and client-authorized payloads are sent over the bridge.
                         </div>
                     </div>
                 </div>
@@ -5511,7 +5506,7 @@ end Satocialist.Quantum.TVD</code></pre>
     <!-- Footer -->
     <footer style="margin-top: 24px; padding-top: 18px; border-top: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; color: var(--text-muted); font-size: 0.8rem; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
         <div>
-            <span class="copyleft">&copy;</span> <span id="current-year">2026</span> Centinel Labs, Inc. All rights distributed.
+            &copy; <span id="current-year">2026</span> Centinel Labs, Inc. All rights distributed.
         </div>
         <div style="display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px 14px;">
             <a href="javascript:void(0)" id="footer-link-vision" style="color: var(--accent-green); text-decoration: none; font-weight: 600; cursor: pointer;">Vision</a>
