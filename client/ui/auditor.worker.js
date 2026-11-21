@@ -1198,7 +1198,10 @@ function handleProcessFrame(wireBytes) {
                             wasmInstance._wasm_free(rhoPtr);
                             wasmInstance._wasm_free(checkCommPtr);
                             wasmInstance._wasm_free(candPrfKeyPtr);
-                            return { matchNulHex, amt };
+                            /* Propagate the discovered blinding factor so the
+                             * credited change/output UTXO can be burned later
+                             * without the arbitrary-r fallback scan. */
+                            return { matchNulHex, amt, r: foundR ? Array.from(foundR) : null };
                         };
 
                         const transCheck = checkCommitment(cTransferBytes);
@@ -1209,13 +1212,13 @@ function handleProcessFrame(wireBytes) {
                             isIncoming = true;
                             incomingCTransfer = true;
                             decryptedTransferAmount += transCheck.amt;
-                            newNullifiers.push({ hex: transCheck.matchNulHex, amount: transCheck.amt });
+                            newNullifiers.push({ hex: transCheck.matchNulHex, amount: transCheck.amt, r: transCheck.r || null });
                         }
                         if (changeCheck.matchNulHex) {
                             isIncoming = true;
                             incomingCChange = true;
                             decryptedTransferAmount += changeCheck.amt;
-                            newNullifiers.push({ hex: changeCheck.matchNulHex, amount: changeCheck.amt });
+                            newNullifiers.push({ hex: changeCheck.matchNulHex, amount: changeCheck.amt, r: changeCheck.r || null });
                         }
                         
                         if (isOutgoing || isIncoming) {
@@ -1352,7 +1355,7 @@ function handleProcessFrame(wireBytes) {
                                 postMessage({
                                     type: 'TRANSACTION_MATCH',
                                     nullifier: hexToBytes(computedNullifierHex),
-                                    newNullifiers: [{ hex: computedNullifierHex, amount: decryptedClaimAmount }],
+                                    newNullifiers: [{ hex: computedNullifierHex, amount: decryptedClaimAmount, r: foundR ? Array.from(foundR) : null }],
                                     cTransfer: Array.from(cClaimBytes.subarray(0, 16)),
                                     decryptedTransferAmount: decryptedClaimAmount,
                                     methodId: methodId,
