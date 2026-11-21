@@ -3652,11 +3652,20 @@ int apply_block(State *state, Block *block) {
                         ApplyDriftCertData *dc = &op->data.apply_drift_cert;
                         cache_pubkey(state, dc->sender_pubkey);
                         cache_pubkey(state, dc->recipient_pubkey);
-                        uint64_t fee = calculate_fee(dc->amount, true);
-                        /* Spend funding inputs: anchor fee principal to the enterprise
-                         * recipient, halved network fee burned, change to the funder. */
+                        uint64_t network_fee = calculate_fee(dc->amount, true);
+                        /* Spend funding inputs: the anchor fee principal plus the
+                         * halved network fee are BOTH burned through the fee-recycle
+                         * path (spent = 2 pointers attributed to the funder as fees
+                         * paid, mirroring invariants.lean's totalFeesSubunits fee
+                         * pool); change returns to the funder. Crediting the principal
+                         * to dc->recipient_pubkey made an anchor cost its submitter
+                         * nothing but the network fee - and minted free liquid
+                         * balance whenever the funding wallet differed from the
+                         * recipient. The certificate stays attributed to the
+                         * recipient through the cert digest and the
+                         * validation-commitments MMR leaf below. */
                         if (!update_transfer_state(&state->bc, dc->inputs, dc->proofs, dc->num_inputs, dc->recipient_pubkey,
-                                                   dc->amount, dc->cert_tx_id, false, fee)) {
+                                                   0, dc->cert_tx_id, false, dc->amount + network_fee)) {
                             fprintf(stderr, "[Consensus] ERROR: Failed to apply drift certificate anchor\n");
                             success = -1;
                             break;
