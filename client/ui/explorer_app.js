@@ -1110,6 +1110,18 @@ document.addEventListener('DOMContentLoaded', () => {
     // Register Error Updates
     client.onError = (errorMsg) => {
         console.error('[ExplorerApp] Error:', errorMsg);
+        /* Burn-failure rollback: a valuation burn is optimistically decremented
+         * before the worker generates the ZK proof. If the worker rejects the
+         * burn (double-spend guard) or proof generation fails, restore the
+         * single validation so 'Audited UTXO Validations' stays truthful. */
+        if (window.pendingBurnNullifiers && window.pendingBurnNullifiers.size > 0 &&
+            errorMsg && (errorMsg.includes('Centinel proof') || errorMsg.includes('Double-spend'))) {
+            const rollbackNullifier = window.pendingBurnNullifiers.values().next().value;
+            window.pendingBurnNullifiers.delete(rollbackNullifier);
+            window.privateUtxoBalance = (window.privateUtxoBalance || 0) + 1;
+            const rollbackEl = document.getElementById('decrypted-utxo-val');
+            if (rollbackEl) rollbackEl.textContent = Number(window.privateUtxoBalance).toLocaleString('en-US');
+        }
         if (errorMsg && (errorMsg.includes('Double-spend') || errorMsg.includes('already redeemed'))) {
             const item = document.createElement('li');
             item.className = 'match-item';
@@ -1149,6 +1161,9 @@ document.addEventListener('DOMContentLoaded', () => {
         const isReplay = window.seenNullifiers.has(hexNullifier);
         if (isReplay) return;
         window.seenNullifiers.add(hexNullifier);
+        /* The authoritative burn echo landed: clear the pending-burn marker so
+         * the optimistic tally and the splice + change credit below reconcile. */
+        if (window.pendingBurnNullifiers) window.pendingBurnNullifiers.delete(hexNullifier);
 
         if (!window.loadedUTXOs) window.loadedUTXOs = [];
 
@@ -2124,6 +2139,18 @@ document.addEventListener('DOMContentLoaded', () => {
         if (driftCertTxIds && driftCertTxIds.length > 0) {
             if (!window.confirmedTxIds) window.confirmedTxIds = new Set();
             driftCertTxIds.forEach(hexId => window.confirmedTxIds.add(hexId));
+            /* Retain the leaf-hash -> cert_tx_id mapping (commitments[i] is the
+             * MMR leaf hash of operation i; driftCertTxIds lists the drift ids
+             * in encounter order) so clicking a drift leaf in the MMR canvas can
+             * resolve and audit the anchored certificate's workflow detail. */
+            if (!window.leafDriftCertTxIds) window.leafDriftCertTxIds = new Map();
+            let driftLeafIdx = 0;
+            (commitments || []).forEach((c, i) => {
+                if (opTypes && opTypes[i] === 7 && driftLeafIdx < driftCertTxIds.length) {
+                    const hexLeaf = c.map(b => b.toString(16).padStart(2, '0')).join('');
+                    window.leafDriftCertTxIds.set(hexLeaf, driftCertTxIds[driftLeafIdx++]);
+                }
+            });
         }
 
         // Reset the block-sync watchdog timer to prevent premature timeouts during active stream ingestion
@@ -2136,9 +2163,18 @@ document.addEventListener('DOMContentLoaded', () => {
             item.style.borderLeftColor = 'var(--accent-green)';
             item.style.backgroundColor = 'rgba(16, 185, 129, 0.05)';
              
+            const driftLeafCount = (opTypes || []).filter(t => t === 7).length;
             let commsHtml = commitments.map((c, i) => {
                 const hexComm = c.map(b => b.toString(16).padStart(2, '0')).join('');
-                return `<div style="font-size: 0.7rem; color: var(--text-muted); font-family: monospace;">  • commitment ${i+1}: ${hexComm.substring(0, 32)}...</div>`;
+                /* opTypes[i] (delivered per leaf by the worker's block parser)
+                 * distinguishes drift certificate anchors (opType 7) from UTXO
+                 * commitments so the inclusion audit reflects the drift workflow. */
+                const isDriftLeaf = (opTypes && opTypes[i] === 7);
+                const leafLabel = isDriftLeaf
+                    ? `drift certificate anchor ${i+1} (leaf = hash_leaf(cert_tx_id, tvd_scaled))`
+                    : `commitment ${i+1}`;
+                const leafColor = isDriftLeaf ? 'var(--accent-drift, #f43f5e); ' : '';
+                return `<div style="font-size: 0.7rem; color: ${leafColor}var(--text-muted); font-family: monospace;">  • ${leafLabel}: ${hexComm.substring(0, 32)}...</div>`;
             }).join('');
             if (commitments.length === 0) {
                 commsHtml = `<div style="font-size: 0.75rem; color: var(--text-muted);">No unspent UTXO commitments in this block (Empty block).</div>`;
@@ -2152,6 +2188,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 <span class="match-hash" style="font-weight: bold;">Mined Block Height: #${blockNumber}</span>
                 <div style="font-size: 0.75rem; margin-top: 4px; color: var(--text-main);">
                     Total commitments in block: <span style="font-family: monospace; color: ${commColor}; font-weight: 600;">${commitments.length}</span>
+                    ${driftLeafCount > 0 ? ` | Drift certificate anchors: <span style="font-family: monospace; color: var(--accent-drift, #f43f5e); font-weight: 600;">${driftLeafCount}</span>` : ''}
                 </div>
                 <div style="margin-top: 4px;">
                     ${commsHtml}
@@ -2290,7 +2327,14 @@ document.addEventListener('DOMContentLoaded', () => {
              * case instead of zeroing the display. */
             const localAuditedTally = (window.loadedUTXOs || [])
                 .filter(u => u && !window.seenNullifiers.has(u.nullifier))
-                .reduce((sum, u) => sum + (u.amount || 0), 0);
+                .reduce((sum, u) => {
+                    /* An in-flight burn consumes exactly ONE validation from this
+                     * UTXO; the vOld - 1 change output is credited by the echo. */
+                    if (window.pendingBurnNullifiers && window.pendingBurnNullifiers.has(u.nullifier)) {
+                        return sum + Math.max(0, (u.amount || 0) - 1);
+                    }
+                    return sum + (u.amount || 0);
+                }, 0);
             if (recentSubmission && utxoValidations > (window.privateUtxoBalance || 0)) {
                 /* UTXO-stat stability fix: the node has not applied our burn yet; do not
                  * let the pre-burn echo reset the locally decremented tally. */
@@ -2627,6 +2671,46 @@ document.addEventListener('DOMContentLoaded', () => {
                             `[Leaf Node #${node.position} Audit Snapshot]`,
                             `No anchored audit snapshot retained for Leaf ${leafHashHex ? leafHashHex.substring(0, 16) + '...' : '#' + node.position} — the mint was not observed through the mempool/audit pipeline this session.`
                         );
+                    } else if (node.opType === 7) {
+                        /* Drift certificate anchor leaf: resolve the anchored
+                         * certificate through its authoritative cert_tx_id and
+                         * audit it - the pinned 'Audit Transaction Report' in
+                         * the Blockchain PTXM Ledger Explorer renders the full
+                         * workflow detail (TVD, shots, classification, digest,
+                         * anchor fee). When this session already holds the full
+                         * parsed operation, surface it inline immediately. */
+                        const driftCertId = (leafHashHex && window.leafDriftCertTxIds)
+                            ? window.leafDriftCertTxIds.get(leafHashHex) : null;
+                        const driftTx = driftCertId && blockchainStore.transactions
+                            ? blockchainStore.transactions.find(t => t.txId && t.txId.toLowerCase() === driftCertId.toLowerCase())
+                            : null;
+                        if (driftTx && driftTx.driftCert) {
+                            const dc = driftTx.driftCert;
+                            const driftLabels = ['Fidelity Optimal', 'Drift Tolerable', 'Decoherence Exceeded', 'Tampering Suspected'];
+                            const driftItem = document.createElement('li');
+                            driftItem.className = 'match-item';
+                            driftItem.style.borderLeftColor = 'var(--accent-drift, #f43f5e)';
+                            driftItem.innerHTML = `
+                                <span class="match-method" style="color: var(--accent-drift, #f43f5e);">[Drift Certificate Anchor]</span>
+                                <span class="match-hash">cert_tx_id: ${escapeHTML(driftCertId)}</span>
+                                <div style="font-size: 0.75rem; margin-top: 4px; color: var(--text-main);">
+                                    TVD: <strong>${(Number(dc.tvdScaled) / 1e9).toFixed(6)}</strong> | Shots: <strong>${escapeHTML(String(dc.shots))}</strong> | Classification: <strong>${escapeHTML(driftLabels[dc.status] || ('code ' + dc.status))}</strong>
+                                </div>
+                                <div style="font-size: 0.7rem; color: var(--text-muted); font-family: monospace; margin-top: 2px;">
+                                    • Circuit SHA-256: ${escapeHTML((dc.circuitHashHex || '').substring(0, 32))}… | Certificate Digest: ${escapeHTML((dc.certDigestHex || '').substring(0, 32))}…
+                                </div>
+                                <div style="font-size: 0.7rem; color: var(--text-muted); font-family: monospace; margin-top: 1px;">
+                                    • Anchor Fee: ¢${formatScl(Number(driftTx.amount || 0) / 160000000, 4)} | Input Pointers: ${(driftTx.inputPointerIds || []).length}
+                                </div>
+                            `;
+                            matchesList.prepend(driftItem);
+                        } else if (driftCertId && client.socket && client.socket.readyState === WebSocket.OPEN) {
+                            /* Not observed this session: pin the id so the
+                             * audited response lands on the Ledger Explorer's
+                             * report card, and fetch the full operation. */
+                            blockchainStore.pendingAuditTxId = driftCertId.toLowerCase();
+                            client.requestTransaction(_hexToBytes(driftCertId, 32));
+                        }
                     }
 
                     if (leafNode.hash) {
@@ -2683,6 +2767,9 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             if (window.seenNullifiers) {
                 window.seenNullifiers.clear();
+            }
+            if (window.pendingBurnNullifiers) {
+                window.pendingBurnNullifiers.clear();
             }
         });
     }
@@ -4388,24 +4475,36 @@ document.addEventListener('DOMContentLoaded', () => {
                 btnSubmitValuation.disabled = true;
                 btnSubmitValuation.textContent = 'Signing & Submitting...';
 
-                const unspentUtxos = (window.loadedUTXOs || []).filter(u => u && !window.seenNullifiers.has(u.nullifier));
+                const unspentUtxos = (window.loadedUTXOs || []).filter(u => u && !window.seenNullifiers.has(u.nullifier) &&
+                    !(window.pendingBurnNullifiers && window.pendingBurnNullifiers.has(u.nullifier)));
                 let currentUtxo = (unspentUtxos.length > 0) ? unspentUtxos[0] : null;
                 let vOld = currentUtxo ? (currentUtxo.amount || 10) : 10;
                 let amountToTake = 1;
                 let vChange = vOld - amountToTake;
 
+                /* Burn-echo credit fix (mirrors the redeem-echo fix in the ticket
+                 * redemption flow below): do NOT pre-mark the spent UTXO nullifier
+                 * in window.seenNullifiers and do NOT splice the whole UTXO here.
+                 * onTransactionMatch treats any seenNullifiers entry as a replay
+                 * and returns before crediting newNullifiers, so the vOld - 1
+                 * change output was never re-added to the audited set and one
+                 * submission permanently consumed the ENTIRE vOld-credit UTXO
+                 * (typically 10 validations) instead of exactly 1. The burn echo
+                 * itself performs the reconciliation (marks the nullifier, splices
+                 * the spent UTXO, credits the change), and the worker's
+                 * utxoNullifiers set already blocks double-burning. */
                 if (currentUtxo && currentUtxo.nullifier) {
-                    window.seenNullifiers.add(currentUtxo.nullifier);
-                    const spentIdx = (window.loadedUTXOs || []).findIndex(u => u.nullifier === currentUtxo.nullifier);
-                    if (spentIdx !== -1) {
-                        window.loadedUTXOs.splice(spentIdx, 1);
-                    }
+                    if (!window.pendingBurnNullifiers) window.pendingBurnNullifiers = new Set();
+                    window.pendingBurnNullifiers.add(currentUtxo.nullifier);
                 }
 
                 /* UTXO-stat stability fix: remember the submission instant and reflect the
-                 * burn locally so 'Audited UTXO Validations' steps down instead of resetting. */
+                 * burn locally so 'Audited UTXO Validations' steps down instead of resetting.
+                 * Decrement by exactly amountToTake (1 validation): the burn echo replaces
+                 * the spent vOld UTXO with the vOld - 1 change output and reconciles this
+                 * tally to the same value. */
                 window.lastValuationSubmissionAt = Date.now();
-                window.privateUtxoBalance = (window.loadedUTXOs || []).reduce((sum, u) => sum + (u.amount || 0), 0);
+                window.privateUtxoBalance = Math.max(0, (window.privateUtxoBalance || 0) - amountToTake);
                 const utxoStatEl = document.getElementById('decrypted-utxo-val');
                 if (utxoStatEl) {
                     utxoStatEl.textContent = Number(window.privateUtxoBalance).toLocaleString('en-US');
@@ -5560,7 +5659,16 @@ bootstrap_nodes=${cfg.bootstrap_nodes}
             window.tpsTxTimestamps.push(Date.now());
         }
         if (parsedTx) {
-            if (!blockchainStore.transactions.some(t => t.txId === txId)) {
+            /* First-insert-wins dedup poisoned drift anchors submitted from this
+             * browser: the node answers SubmitTx with a 33-byte echo stub
+             * ([0x07][cert_tx_id] - driftCert: null, amount: 0), which occupied
+             * the store record; the full operation returned later by the mempool
+             * walk (GetTransaction 0x0007) was then skipped, so the Ledger
+             * Explorer permanently rendered the user's own anchors with a null
+             * amount and no circuit hash or certificate digest. Merge-enrich
+             * instead: a fuller parse replaces the stale stub in place. */
+            const existingTxIdx = blockchainStore.transactions.findIndex(t => t.txId === txId);
+            if (existingTxIdx === -1) {
                 blockchainStore.transactions.push({
                     txId: txId || parsedTx.txIdHex,
                     typeString: typeString,
@@ -5572,8 +5680,21 @@ bootstrap_nodes=${cfg.bootstrap_nodes}
                     senderPubkeyHex: parsedTx.senderPubkeyHex,
                     pointerId: (parsedTx.generatedPointers && parsedTx.generatedPointers.length > 0) ? parsedTx.generatedPointers[0].pointerIdHex : null,
                     parentCoinId: parsedTx.parentCoinIdHex,
+                    driftCert: (parsedTx.driftCert ? { ...parsedTx.driftCert } : null),
                     timestamp: Date.now()
                 });
+            } else if (parsedTx.driftCert || (parsedTx.amount || 0) > 0 || (parsedTx.inputPointerIds || []).length > 0) {
+                const existingTx = blockchainStore.transactions[existingTxIdx];
+                existingTx.typeString = typeString;
+                existingTx.inputPointerIds = (parsedTx.inputPointerIds && parsedTx.inputPointerIds.length > 0) ? parsedTx.inputPointerIds : existingTx.inputPointerIds;
+                existingTx.circuitHash = (parsedTx.driftCert ? parsedTx.driftCert.circuitHashHex : existingTx.circuitHash);
+                existingTx.certDigest = (parsedTx.driftCert ? parsedTx.driftCert.certDigestHex : existingTx.certDigest);
+                existingTx.driftCert = (parsedTx.driftCert ? { ...parsedTx.driftCert } : existingTx.driftCert);
+                existingTx.amount = (parsedTx.amount !== undefined && parsedTx.amount !== null) ? parsedTx.amount : existingTx.amount;
+                existingTx.recipientPubkeyHex = parsedTx.recipientPubkeyHex || existingTx.recipientPubkeyHex;
+                existingTx.senderPubkeyHex = parsedTx.senderPubkeyHex || existingTx.senderPubkeyHex;
+                existingTx.pointerId = (parsedTx.generatedPointers && parsedTx.generatedPointers.length > 0) ? parsedTx.generatedPointers[0].pointerIdHex : existingTx.pointerId;
+                existingTx.parentCoinId = parsedTx.parentCoinIdHex || existingTx.parentCoinId;
             }
 
             if (typeString === 'OP_MINT_COIN' && parsedTx.parentCoinIdHex) {
@@ -5792,9 +5913,9 @@ bootstrap_nodes=${cfg.bootstrap_nodes}
                 html += `
                     <div class="blockchain-coin-card" style="border-left: 4px solid var(--accent-green);">
                         <div style="display: flex; justify-content: space-between; font-family: monospace; font-size: 0.8rem; flex-wrap: wrap; gap: 8px;">
-                            <span>Op Type: <strong style="color: ${tx.typeString === 'OP_APPLY_DRIFT_CERT' ? 'var(--accent-drift, #f43f5e)' : opTypeColor};">${tx.typeString}</strong></span>
-                            <span>Tx ID: <strong style="color: var(--text-main);">${tx.txId}</strong></span>
-                            <span>Amount: <strong style="color: var(--accent-green);">¢${sclAmt}</strong></span>
+                             <span>Op Type: <strong style="color: ${tx.typeString === 'OP_APPLY_DRIFT_CERT' ? 'var(--accent-drift, #f43f5e)' : opTypeColor};">${tx.typeString}</strong></span>
+                             <span>Tx ID: <strong style="color: var(--text-main);">${tx.txId}</strong></span>
+                             <span>${tx.typeString === 'OP_APPLY_DRIFT_CERT' ? 'Anchor Fee' : 'Amount'}: <strong style="color: var(--accent-green);">¢${sclAmt}</strong></span>
                         </div>
                     </div>
                 `;
