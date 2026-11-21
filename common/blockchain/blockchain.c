@@ -1079,12 +1079,30 @@ int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData
 
     uint8_t local_privkey[DILITHIUM_SECRETKEY_LEN];
 
+    /* Custodial funding-wallet resolution (mirrors the SCL402 settlement path
+     * in the SubmitTx ingress and create_and_broadcast_transfer_as): when the
+     * authenticated client intent was signed by the shared testnet identity
+     * wallet, fund - and debit - the anchor from THAT wallet instead of
+     * silently re-funding it from the node operator wallet, which left the
+     * submitting user's balance untouched. Keys that are not held by this node
+     * keep the operator-wallet custodial fallback. */
+    UserWallet funding_snapshot;
+    const UserWallet *funding_wallet = &state->user_wallet;
+    pthread_mutex_lock(&state->wallet_mutex);
+    if (!is_zeroed(state->testnet_identity_wallet.dilithium_privkey, DILITHIUM_SECRETKEY_LEN) &&
+        memcmp(client_cert->sender_pubkey,
+               state->testnet_identity_wallet.dilithium_pubkey, PUBKEY_LEN) == 0) {
+        funding_snapshot = state->testnet_identity_wallet;
+        funding_wallet = &funding_snapshot;
+    }
+    pthread_mutex_unlock(&state->wallet_mutex);
+
     pthread_mutex_lock(&state->mutex);
     size_t num_selected = 0;
 
-    selected = select_pointers(state, state->user_wallet.dilithium_pubkey, total_subunits, &num_selected, false, true);
+    selected = select_pointers(state, funding_wallet->dilithium_pubkey, total_subunits, &num_selected, false, true);
     if (!selected || num_selected == 0) {
-        selected = select_pointers(state, state->user_wallet.dilithium_pubkey, total_subunits, &num_selected, false, false);
+        selected = select_pointers(state, funding_wallet->dilithium_pubkey, total_subunits, &num_selected, false, false);
         if (!selected || num_selected == 0) {
             fprintf(stderr, "[DriftCert] ERROR: Failed to select pointers for %sanchoring: insufficient balance\n", is_recreation ? "recreated " : "");
             pthread_mutex_unlock(&state->mutex);
@@ -1098,7 +1116,7 @@ int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData
         goto cleanup;
     }
 
-    if (has_insufficient_balance_locked(state, state->user_wallet.dilithium_pubkey, selected, num_selected, total_subunits, false)) {
+    if (has_insufficient_balance_locked(state, funding_wallet->dilithium_pubkey, selected, num_selected, total_subunits, false)) {
         fprintf(stderr, "[DriftCert] ERROR: Insufficient balance (considering pending) for %sanchoring\n", is_recreation ? "recreated " : "");
         pthread_mutex_unlock(&state->mutex);
         goto cleanup;
@@ -1116,7 +1134,7 @@ int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData
     memcpy(dc->commitment_root, client_cert->commitment_root, 32);
     dc->timestamp_us = client_cert->timestamp_us;
     memcpy(dc->recipient_pubkey, client_cert->recipient_pubkey, PUBKEY_LEN);
-    memcpy(dc->sender_pubkey, state->user_wallet.dilithium_pubkey, PUBKEY_LEN);
+    memcpy(dc->sender_pubkey, funding_wallet->dilithium_pubkey, PUBKEY_LEN);
     dc->amount = client_cert->amount;
 
     if (fixed_nonce) {
@@ -1153,7 +1171,7 @@ int create_and_broadcast_apply_drift_cert(State *state, const ApplyDriftCertData
         }
     }
 
-    memcpy(local_privkey, state->user_wallet.dilithium_privkey, DILITHIUM_SECRETKEY_LEN);
+    memcpy(local_privkey, funding_wallet->dilithium_privkey, DILITHIUM_SECRETKEY_LEN);
     pthread_mutex_unlock(&state->mutex);
 
     compute_inputs_merkle_root(dc->inputs, dc->num_inputs, dc->inputs_merkle_root);
@@ -1877,7 +1895,11 @@ int initiate_unstake(User *user, State *state) {
 int update_transfer_state(Blockchain *bc, Pointer *input_pointers, MMRProof *proofs, size_t num_inputs,
                          const uint8_t *recipient_pubkey, uint64_t amount, uint8_t tx_hash[COIN_ID_LEN],
                          bool set_stake_flag, uint64_t fee) {
-    if (!bc || !input_pointers || num_inputs == 0 || !recipient_pubkey || !tx_hash || amount == 0) {
+    /* amount == 0 is valid for fee-only spends (drift certificate anchors burn
+     * their full principal through the fee-recycle path); reject only when
+     * neither a principal nor a fee is being settled. */
+    if (!bc || !input_pointers || num_inputs == 0 || !recipient_pubkey || !tx_hash ||
+        (amount == 0 && fee == 0)) {
         fprintf(stderr, "[Blockchain] Invalid parameters in update_transfer_state\n");
         return 0;
     }
