@@ -860,6 +860,15 @@ void handle_rpc_request(State *state, RpcTask *task) {
                 uint64_t balance = calculate_balance_subunits(&state->bc, target_pk, false);
                 uint64_t staked_balance = calculate_staked_subunits_by_owner(state, target_pk);
                 uint64_t fees_paid = calculate_fees_paid_subunits(&state->bc, target_pk);
+                /* Pending-spend deduction (mirror of the websocket bridge's
+                 * GetBalance): mempool operations consume their funding pointers
+                 * on admission; subtract them so in-flight drift-certificate
+                 * anchors and SCL402 settlements immediately reduce the audited
+                 * balance instead of waiting for block inclusion. */
+                uint64_t pending_liquid = calculate_pending_consumed_subunits(state, target_pk, false);
+                balance = (balance > pending_liquid) ? (balance - pending_liquid) : 0;
+                uint64_t pending_unstake = calculate_pending_consumed_subunits(state, target_pk, true);
+                staked_balance = (staked_balance > pending_unstake) ? (staked_balance - pending_unstake) : 0;
                 
                 // Scan and sum active, unspent Centinel validation UTXOs
                 uint64_t utxo_validations = 0;
@@ -1896,7 +1905,10 @@ void handle_rpc_request(State *state, RpcTask *task) {
             const uint8_t *dc_payload = msg->payload + sizeof(SclRpcHeader) + hdr.error_msg_len + sig_len;
             size_t dc_payload_len = hdr.payload_len - sig_len;
 
-            if (!payment_verified && state->config.is_daemon) {
+            /* Always metered: enterprise audits quote and settle this fee over
+             * any transport; the is_daemon gate left creation free on default
+             * (is_daemon=false) deployments. */
+            if (!payment_verified) {
                 uint32_t dc_shots = 15000;
                 if (dc_payload_len >= 4) {
                     uint32_t shots_raw;
