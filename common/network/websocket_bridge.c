@@ -892,7 +892,12 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
      * commenced 10,000 shots. */
     bool tvd_custom_circuit = (final_payload_len > 36);
     uint64_t scl402_required_subunits = 0;
-    if (!payment_verified && state->config.is_daemon) {
+    /* Enterprise drift-certificate audits (0x000D) are always metered (see the
+     * comment above): the browser quotes and auto-settles this fee, so gating
+     * it on is_daemon left certificate creation free on nodes running the
+     * default is_daemon=false configuration. Custom-circuit 0x000A telemetry
+     * keeps its daemon-only gate. */
+    if (!payment_verified && (method_id == 0x000D || state->config.is_daemon)) {
         if (method_id == 0x000D) {
             uint32_t dc_shots = 15000;
             if (final_payload_len >= 4) {
@@ -966,6 +971,20 @@ static void handle_local_rpc_request(State *state, const uint8_t *req_buf, size_
                 uint64_t balance = calculate_balance_subunits(&state->bc, target_pk, false);
                 uint64_t staked_balance = calculate_staked_subunits_by_owner(state, target_pk);
                 uint64_t fees_paid = calculate_fees_paid_subunits(&state->bc, target_pk);
+                /* Pending-spend deduction: transfers, stakes, drift-certificate
+                 * anchors and SCL402 fee settlements consume their funding
+                 * pointers the moment they enter the mempool, but the confirmed
+                 * ledger still reports those pointers as unspent until block
+                 * inclusion. Mirror the CLI/autopilot solvency checks
+                 * (has_insufficient_balance_locked) so the audited balance the
+                 * explorer renders already reflects in-flight debits - otherwise
+                 * drift-certificate creation and anchoring never appear to
+                 * reduce the balance until the next block (or ever, on a frozen
+                 * testnet). */
+                uint64_t pending_liquid = calculate_pending_consumed_subunits(state, target_pk, false);
+                balance = (balance > pending_liquid) ? (balance - pending_liquid) : 0;
+                uint64_t pending_unstake = calculate_pending_consumed_subunits(state, target_pk, true);
+                staked_balance = (staked_balance > pending_unstake) ? (staked_balance - pending_unstake) : 0;
                 
                 uint64_t utxo_validations = 0;
                 size_t u_idx = 0;
