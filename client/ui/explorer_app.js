@@ -743,9 +743,18 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // Default Node Coordinates & Persistent Testnet Wallet Initialization
+    // Derive the node WS host from the page host so each deployment talks to its
+    // own matching node endpoint (centinel.network -> node.centinel.network,
+    // centinelnetwork.tech -> node.centinelnetwork.tech) instead of always
+    // falling back to node.centinel.network. window.SCL_BRIDGE_HOST still wins
+    // as an explicit override for staging/custom hosts.
     const host = window.location.hostname || 'localhost';
     const isLocal = ['localhost', '127.0.0.1'].includes(host);
-    const wsHost = isLocal ? 'localhost:5554' : (window.SCL_BRIDGE_HOST || 'node.centinel.network');
+    // Strip a leading "www." and a known "explore."/"node." prefix to get the apex.
+    const apexHost = host.replace(/^www\./, '').replace(/^(?:explore|node)\./, '');
+    const wsHost = isLocal
+        ? 'localhost:5554'
+        : (window.SCL_BRIDGE_HOST || `node.${apexHost}`);
     const defaultWsUrl = (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + wsHost;
     if (nodeUrlInput) nodeUrlInput.value = defaultWsUrl;
 
